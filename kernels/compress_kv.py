@@ -81,7 +81,9 @@ def compress_kv_python(
 
     # 5. QJL sketch: sign(S @ r^T), result (seq_len, k)
     projections = r @ S.T                            # (seq_len, k)
-    qjl_bits = torch.sign(projections).to(torch.int8)
+    qjl_bits = torch.where(projections >= 0.0,
+                            torch.ones_like(projections, dtype=torch.int8),
+                            -torch.ones_like(projections, dtype=torch.int8))
 
     return idx_all, qjl_bits, gamma
 
@@ -142,18 +144,17 @@ if _TRITON_AVAILABLE:
         """
         token_id = tl.program_id(0)
         offs = tl.arange(0, BLOCK_D)                 # [0 .. head_dim-1]
+        mask = offs < head_dim                        # guard for BLOCK_D > head_dim
 
         # ------------------------------------------------------------------
         # Load x[token, :] from global memory — THE ONLY READ OF x
         # ------------------------------------------------------------------
         x_base = x_ptr + token_id * head_dim
-        x_vec = tl.load(x_base + offs).to(tl.float32)  # (BLOCK_D,) in SRAM
+        x_vec = tl.load(x_base + offs, mask=mask, other=0.0).to(tl.float32)  # (BLOCK_D,) in SRAM
 
         # ------------------------------------------------------------------
         # Load tiny centroid arrays into registers (12 floats total)
         # ------------------------------------------------------------------
-        c2_offs = tl.arange(0, 4)
-        c3_offs = tl.arange(0, 8)
         c2_0 = tl.load(c2_ptr + 0)
         c2_1 = tl.load(c2_ptr + 1)
         c2_2 = tl.load(c2_ptr + 2)
@@ -180,7 +181,7 @@ if _TRITON_AVAILABLE:
 
         for j in tl.static_range(0, BLOCK_D):
             # Load Pi row j from global memory
-            pi_row = tl.load(Pi_ptr + j * head_dim + offs)   # (BLOCK_D,)
+            pi_row = tl.load(Pi_ptr + j * head_dim + offs, mask=mask, other=0.0)   # (BLOCK_D,)
             y_j = tl.sum(pi_row * x_vec)                      # scalar dot product
 
             # Check is_outlier[j]
@@ -271,7 +272,7 @@ if _TRITON_AVAILABLE:
 
         for i in tl.static_range(0, BLOCK_D):
             # Load Pi column i — Pi[j, i] for j in 0..head_dim-1
-            pi_col = tl.load(Pi_ptr + offs * head_dim + i)   # (BLOCK_D,)
+            pi_col = tl.load(Pi_ptr + offs * head_dim + i, mask=mask, other=0.0)   # (BLOCK_D,)
             x_mse_i = tl.sum(pi_col * y_hat_vec)             # scalar
             x_mse_vec = tl.where(offs == i, x_mse_i, x_mse_vec)
 
@@ -287,7 +288,7 @@ if _TRITON_AVAILABLE:
         qjl_base = qjl_ptr + token_id * k
 
         for m in tl.static_range(0, k):
-            s_row = tl.load(S_ptr + m * head_dim + offs)    # (BLOCK_D,)
+            s_row = tl.load(S_ptr + m * head_dim + offs, mask=mask, other=0.0)    # (BLOCK_D,)
             proj = tl.sum(s_row * r_vec)                     # scalar
             bit = tl.where(proj >= 0.0, tl.full([], 1, dtype=tl.int8),
                            tl.full([], -1, dtype=tl.int8))
@@ -297,7 +298,7 @@ if _TRITON_AVAILABLE:
         # Write outputs to global memory (ONLY writes in the kernel)
         # ------------------------------------------------------------------
         # idx_all[token, :]
-        tl.store(idx_all_ptr + token_id * head_dim + offs, idx_vec)
+        tl.store(idx_all_ptr + token_id * head_dim + offs, idx_vec, mask=mask)
         # gamma[token]
         tl.store(gamma_ptr + token_id, gamma_val)
         # (qjl_bits written inside the loop above)

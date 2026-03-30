@@ -1,0 +1,109 @@
+"""
+Unit tests for TurboQuant compression/decompression kernels (Python reference).
+Run: pytest scripts/test_kernels.py -v
+"""
+import pytest
+import torch
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from utils.math_utils import generate_rotation_matrix, generate_qjl_matrix, get_centroids_2bit, get_centroids_3bit
+from kernels.compress_kv import compress_kv_python, build_outlier_mask
+
+
+def test_build_outlier_mask_shape():
+    d, seq = 128, 16
+    x = torch.randn(seq, d)
+    mask = build_outlier_mask(x, n_outliers=32)
+    assert mask.shape == (d,)
+    assert mask.dtype == torch.bool
+    assert mask.sum().item() == 32
+
+
+def test_build_outlier_mask_no_duplicates():
+    d, seq = 128, 16
+    x = torch.randn(seq, d)
+    mask = build_outlier_mask(x, n_outliers=32)
+    # Verify high-variance channels are selected
+    var = x.float().var(dim=0)
+    # All False channels should have lower variance than all True channels
+    min_outlier_var = var[mask].min().item()
+    max_normal_var = var[~mask].max().item()
+    assert min_outlier_var >= max_normal_var
+
+
+def test_compress_kv_python_output_shapes():
+    d, seq, k = 128, 10, 128
+    Pi = generate_rotation_matrix(d)
+    S = generate_qjl_matrix(d, k)
+    c2 = get_centroids_2bit(d)
+    c3 = get_centroids_3bit(d)
+    x = torch.randn(seq, d)
+    x = x / x.norm(dim=-1, keepdim=True)
+    mask = build_outlier_mask(x)
+    idx_all, qjl_bits, gamma = compress_kv_python(x, Pi, S, c2, c3, mask)
+    assert idx_all.shape == (seq, d), f"Expected ({seq},{d}), got {idx_all.shape}"
+    assert qjl_bits.shape == (seq, k), f"Expected ({seq},{k}), got {qjl_bits.shape}"
+    assert gamma.shape == (seq,), f"Expected ({seq},), got {gamma.shape}"
+
+
+def test_compress_kv_python_output_dtypes():
+    d, seq, k = 128, 10, 128
+    Pi = generate_rotation_matrix(d)
+    S = generate_qjl_matrix(d, k)
+    c2 = get_centroids_2bit(d)
+    c3 = get_centroids_3bit(d)
+    x = torch.randn(seq, d)
+    x = x / x.norm(dim=-1, keepdim=True)
+    mask = build_outlier_mask(x)
+    idx_all, qjl_bits, gamma = compress_kv_python(x, Pi, S, c2, c3, mask)
+    assert idx_all.dtype == torch.int8
+    assert qjl_bits.dtype == torch.int8
+    assert gamma.dtype == torch.float32
+
+
+def test_compress_kv_python_idx_ranges():
+    """Normal channels: indices in [0,3]; outlier channels: indices in [0,7]."""
+    d, seq, k = 128, 10, 128
+    Pi = generate_rotation_matrix(d)
+    S = generate_qjl_matrix(d, k)
+    c2 = get_centroids_2bit(d)
+    c3 = get_centroids_3bit(d)
+    x = torch.randn(seq, d)
+    x = x / x.norm(dim=-1, keepdim=True)
+    mask = build_outlier_mask(x)
+    idx_all, qjl_bits, gamma = compress_kv_python(x, Pi, S, c2, c3, mask)
+    # Normal channels: 4 levels (0-3)
+    normal_idx = idx_all[:, ~mask]
+    assert (normal_idx >= 0).all() and (normal_idx <= 3).all(), "Normal channel indices out of [0,3]"
+    # Outlier channels: 8 levels (0-7)
+    outlier_idx = idx_all[:, mask]
+    assert (outlier_idx >= 0).all() and (outlier_idx <= 7).all(), "Outlier channel indices out of [0,7]"
+
+
+def test_compress_qjl_bits_are_plus_minus_one():
+    """qjl_bits must contain only +1 and -1 (no zeros)."""
+    d, seq, k = 128, 10, 128
+    Pi = generate_rotation_matrix(d)
+    S = generate_qjl_matrix(d, k)
+    c2 = get_centroids_2bit(d)
+    c3 = get_centroids_3bit(d)
+    x = torch.randn(seq, d)
+    x = x / x.norm(dim=-1, keepdim=True)
+    mask = build_outlier_mask(x)
+    _, qjl_bits, _ = compress_kv_python(x, Pi, S, c2, c3, mask)
+    unique_vals = qjl_bits.unique().tolist()
+    assert set(unique_vals).issubset({-1, 1}), f"qjl_bits contains unexpected values: {unique_vals}"
+
+
+def test_compress_gamma_positive():
+    """gamma (residual norm) must be positive for non-trivial input."""
+    d, seq, k = 128, 10, 128
+    Pi = generate_rotation_matrix(d)
+    S = generate_qjl_matrix(d, k)
+    c2 = get_centroids_2bit(d)
+    c3 = get_centroids_3bit(d)
+    x = torch.randn(seq, d)
+    x = x / x.norm(dim=-1, keepdim=True)
+    mask = build_outlier_mask(x)
+    _, _, gamma = compress_kv_python(x, Pi, S, c2, c3, mask)
+    assert (gamma > 0).all(), "Some gamma values are <= 0"
