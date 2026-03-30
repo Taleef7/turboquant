@@ -23,7 +23,6 @@ ENV/
 *.gguf
 
 # Hugging Face cache
-~/.cache/huggingface/
 
 # Jupyter
 .ipynb_checkpoints/
