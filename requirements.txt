@@ -1,0 +1,7 @@
+torch>=2.2.0
+transformers>=4.40.0
+triton>=2.2.0
+bitsandbytes>=0.43.0
+datasets>=2.18.0
+einops>=0.7.0
+accelerate>=0.28.0
