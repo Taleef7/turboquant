@@ -2,6 +2,7 @@
 Unit tests for TurboQuant math primitives.
 Run: pytest scripts/test_math.py -v
 """
+import math
 import pytest
 import torch
 import sys, os
@@ -54,7 +55,6 @@ def test_centroids_2bit_values():
     """2-bit centroids must be ±0.453/√d and ±1.510/√d."""
     d = 128
     centroids = get_centroids_2bit(d)
-    import math
     expected = sorted([
         -1.510 / math.sqrt(d),
         -0.453 / math.sqrt(d),
@@ -71,6 +71,21 @@ def test_centroids_3bit_count():
     d = 128
     centroids = get_centroids_3bit(d)
     assert len(centroids) == 8
+
+
+def test_centroids_3bit_values():
+    """3-bit centroids must be ±0.245/√d, ±0.756/√d, ±1.344/√d, ±2.152/√d."""
+    d = 128
+    centroids = get_centroids_3bit(d)
+    expected = sorted([
+        -2.152 / math.sqrt(d), -1.344 / math.sqrt(d),
+        -0.756 / math.sqrt(d), -0.245 / math.sqrt(d),
+         0.245 / math.sqrt(d),  0.756 / math.sqrt(d),
+         1.344 / math.sqrt(d),  2.152 / math.sqrt(d),
+    ])
+    actual = sorted(centroids.tolist())
+    for e, a in zip(expected, actual):
+        assert abs(e - a) < 1e-6, f"3-bit centroid mismatch: expected {e:.6f}, got {a:.6f}"
 
 
 def test_quantize_dequantize_roundtrip_mse():

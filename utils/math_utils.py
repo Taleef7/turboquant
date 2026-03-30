@@ -33,7 +33,7 @@ def generate_rotation_matrix(d: int, dtype=torch.float32, device="cpu") -> torch
     Q, R = torch.linalg.qr(A)
     # Fix sign ambiguity so distribution is truly Haar-uniform
     signs = torch.sign(torch.diag(R))
-    Q = Q * signs.unsqueeze(0)
+    Q = Q * signs.unsqueeze(0)  # (1, d) broadcast scales each column j by sign(R[j,j])
     return Q
 
 
@@ -51,7 +51,7 @@ def generate_qjl_matrix(d: int, k: int, dtype=torch.float32, device="cpu") -> to
     return torch.randn(k, d, dtype=dtype, device=device)
 
 
-def get_centroids_2bit(d: int, dtype=torch.float32) -> torch.Tensor:
+def get_centroids_2bit(d: int, dtype=torch.float32, device="cpu") -> torch.Tensor:
     """
     Optimal 4-level (2-bit) Lloyd-Max centroids for Beta-distributed coordinates
     after random rotation in dimension d.
@@ -69,10 +69,10 @@ def get_centroids_2bit(d: int, dtype=torch.float32) -> torch.Tensor:
     return torch.tensor(
         [-1.510 * scale, -0.453 * scale, 0.453 * scale, 1.510 * scale],
         dtype=dtype,
-    )
+    ).to(device)
 
 
-def get_centroids_3bit(d: int, dtype=torch.float32) -> torch.Tensor:
+def get_centroids_3bit(d: int, dtype=torch.float32, device="cpu") -> torch.Tensor:
     """
     Optimal 8-level (3-bit) Lloyd-Max centroids for Beta-distributed coordinates
     after random rotation in dimension d.
@@ -94,7 +94,7 @@ def get_centroids_3bit(d: int, dtype=torch.float32) -> torch.Tensor:
              0.245 * scale,  0.756 * scale,  1.344 * scale,  2.152 * scale,
         ],
         dtype=dtype,
-    )
+    ).to(device)
 
 
 def quantize_to_centroids(y: torch.Tensor, centroids: torch.Tensor) -> torch.Tensor:
