@@ -1,8 +1,8 @@
 # TurboQuant Implementation — Testing Results
 
-**Date:** 2026-03-30  
-**Status:** ✓ All 25 unit tests passing on CPU  
-**Hardware:** RTX 5070 Ti (12GB VRAM), CUDA 13.1 installed  
+**Date:** 2026-03-30
+**Status:** ✓ All 25 unit tests passing on CPU
+**Hardware:** RTX 5070 Ti (12GB VRAM), CUDA 13.1 installed
 **Blocker:** Python 3.14 has no CUDA-enabled PyTorch wheels (wheels available for Py3.11-3.13)
 
 ---
@@ -63,7 +63,7 @@ Compression ratio: 0.94× (int8 storage)
   Compressed:   46.69 KB
 ```
 
-**Note:** Ratio is ~0.94× because we use int8 storage (1 byte/index, 1 byte/QJL sign, 4 bytes/gamma).  
+**Note:** Ratio is ~0.94× because we use int8 storage (1 byte/index, 1 byte/QJL sign, 4 bytes/gamma).
 True ~4.4× compression requires bit-packing (2-3 bits/index + 1 bit/sign), marked as future work.
 
 ---
@@ -107,13 +107,13 @@ python scripts/run_baseline.py
 
 ## What's Shipped
 
-✓ **Math Primitives:** Rotation (Π), QJL (S), Lloyd-Max centroids  
-✓ **Compression:** Fully fused Triton kernel (SRAM-only intermediates)  
-✓ **Decompression:** Fully fused Triton kernel with JIT integration  
-✓ **HuggingFace Integration:** `TurboQuantCache` subclass of `DynamicCache`  
-✓ **Unit Tests:** 25 comprehensive tests (10 math + 15 kernels)  
-✓ **Benchmarking Scripts:** Baseline, TurboQuant, NIAH evaluation  
-✓ **Documentation:** README with algorithm diagram, results table, quickstart  
+✓ **Math Primitives:** Rotation (Π), QJL (S), Lloyd-Max centroids
+✓ **Compression:** Fully fused Triton kernel (SRAM-only intermediates)
+✓ **Decompression:** Fully fused Triton kernel with JIT integration
+✓ **HuggingFace Integration:** `TurboQuantCache` subclass of `DynamicCache`
+✓ **Unit Tests:** 25 comprehensive tests (10 math + 15 kernels)
+✓ **Benchmarking Scripts:** Baseline, TurboQuant, NIAH evaluation
+✓ **Documentation:** README with algorithm diagram, results table, quickstart
 ✓ **GitHub Publishing:** Repo published with 7 topics (turboquant, kv-cache, quantization, etc.)
 
 ---
@@ -129,6 +129,6 @@ python scripts/run_baseline.py
 
 ## Repository
 
-**GitHub:** https://github.com/Taleef7/turboquant-qwen-showcase  
-**License:** MIT  
+**GitHub:** https://github.com/Taleef7/turboquant-qwen-showcase
+**License:** MIT
 **Reference:** arXiv:2504.19874 (Zandieh et al., 2025)

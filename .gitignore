@@ -12,8 +12,10 @@ build/
 # Virtual environments
 .venv/
 venv/
+venv312/
 env/
 ENV/
+.env/
 
 # Model weights (large binary files)
 *.safetensors
