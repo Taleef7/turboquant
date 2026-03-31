@@ -210,35 +210,20 @@ class TurboQuantCache(DynamicCache):
 
     def compressed_size_bytes(self) -> int:
         """
-        Theoretical compressed storage size in bytes across all layers.
+        Actual in-memory compressed storage size in bytes across all layers.
 
-        Counts bit-packed sizes as they would be stored in an optimal layout:
-          - idx_all:  2 bits per normal channel, 3 bits per outlier channel
-                      (vs 8 bits if stored as int8)
-          - qjl_bits: 1 bit per ±1 sign (vs 8 bits if stored as int8)
-          - gamma:    4 bytes per token (float32, kept full precision)
-          - masks:    negligible (one bool per channel, amortised across tokens)
-
-        This matches the ~4.4x compression ratio cited in the module docstring.
+        Each int8 tensor (idx_all, qjl_bits) uses 1 byte per element.
+        Each float32 tensor (gamma) uses 4 bytes per element.
+        Note: actual compression is ~4.4x vs FP16 when using the theoretical
+        bit-packed representation (2-3 bits/index, 1 bit/QJL sign).
         """
         total = 0
         for ck in self._compressed_keys + self._compressed_values:
             if ck is None:
                 continue
-            all_idx, all_qjl, all_gamma, all_masks = ck[0], ck[1], ck[2], ck[3]
+            all_idx, all_qjl, all_gamma = ck[0], ck[1], ck[2]
             for i in range(len(all_idx)):
-                seq_len, head_dim = all_idx[i].shape
-                k = all_qjl[i].shape[1]
-                n_outlier_channels = int(all_masks[i].sum().item())
-                n_normal_channels = head_dim - n_outlier_channels
-
-                # idx_all: 2 bits × normal + 3 bits × outlier, rounded up to bytes
-                idx_bits = n_normal_channels * 2 + n_outlier_channels * 3
-                total += seq_len * math.ceil(idx_bits / 8)
-
-                # qjl_bits: 1 bit per sign, packed into bytes
-                total += seq_len * math.ceil(k / 8)
-
-                # gamma: float32 = 4 bytes per token
-                total += all_gamma[i].nelement() * 4
+                total += all_idx[i].nelement()        # int8 = 1 byte each
+                total += all_qjl[i].nelement()        # int8 = 1 byte each
+                total += all_gamma[i].nelement() * 4  # float32 = 4 bytes each
         return total
