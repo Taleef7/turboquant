@@ -107,3 +107,59 @@ def test_compress_gamma_positive():
     mask = build_outlier_mask(x)
     _, _, gamma = compress_kv_python(x, Pi, S, c2, c3, mask)
     assert (gamma > 0).all(), "Some gamma values are <= 0"
+
+
+# ---------------------------------------------------------------------------
+# Decompression kernel tests
+# ---------------------------------------------------------------------------
+
+from kernels.decompress_kv import decompress_kv_python
+
+
+def test_decompress_output_shape():
+    d, seq, k = 128, 10, 128
+    torch.manual_seed(1)
+    Pi = generate_rotation_matrix(d)
+    S = generate_qjl_matrix(d, k)
+    c2 = get_centroids_2bit(d)
+    c3 = get_centroids_3bit(d)
+    x = torch.randn(seq, d)
+    x = x / x.norm(dim=-1, keepdim=True)
+    mask = build_outlier_mask(x)
+    idx_all, qjl_bits, gamma = compress_kv_python(x, Pi, S, c2, c3, mask)
+    x_hat = decompress_kv_python(idx_all, qjl_bits, gamma, Pi, S, c2, c3, mask, torch.float32)
+    assert x_hat.shape == (seq, d)
+
+
+def test_roundtrip_mse():
+    """Round-trip MSE should be < 0.05 for unit-norm vectors."""
+    d, seq, k = 128, 16, 128
+    torch.manual_seed(0)
+    Pi = generate_rotation_matrix(d)
+    S = generate_qjl_matrix(d, k)
+    c2 = get_centroids_2bit(d)
+    c3 = get_centroids_3bit(d)
+    x = torch.randn(seq, d)
+    x = x / x.norm(dim=-1, keepdim=True)
+    mask = build_outlier_mask(x)
+    idx_all, qjl_bits, gamma = compress_kv_python(x, Pi, S, c2, c3, mask)
+    x_hat = decompress_kv_python(idx_all, qjl_bits, gamma, Pi, S, c2, c3, mask, torch.float32)
+    mse = ((x - x_hat)**2).mean().item()
+    assert mse < 0.05, f"Round-trip MSE too high: {mse}"
+
+
+def test_inner_product_preservation():
+    """Inner product error should be < 0.1 on average."""
+    d, seq, k = 128, 16, 128
+    torch.manual_seed(2)
+    Pi = generate_rotation_matrix(d)
+    S = generate_qjl_matrix(d, k)
+    c2 = get_centroids_2bit(d)
+    c3 = get_centroids_3bit(d)
+    x = torch.randn(seq, d)
+    x = x / x.norm(dim=-1, keepdim=True)
+    mask = build_outlier_mask(x)
+    idx_all, qjl_bits, gamma = compress_kv_python(x, Pi, S, c2, c3, mask)
+    x_hat = decompress_kv_python(idx_all, qjl_bits, gamma, Pi, S, c2, c3, mask, torch.float32)
+    ip_error = ((x @ x.T) - (x_hat @ x.T)).abs().mean().item()
+    assert ip_error < 0.1, f"Inner product error too high: {ip_error}"
