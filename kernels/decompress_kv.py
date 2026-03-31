@@ -45,7 +45,9 @@ def decompress_kv_python(
     Steps:
       1. Centroid lookup: y_hat[:, j] = centroids_3bit[idx_all[:,j]] if is_outlier[j]
                                         else centroids_2bit[idx_all[:,j]]
-      2. x_mse = y_hat @ Pi   (Pi orthogonal: Pi^T = Pi^{-1}, so Pi^T @ y_hat = y_hat @ Pi)
+      2. x_mse = y_hat @ Pi
+         In row-vector convention, Π^T·ŷ (column-vector form) = ŷ @ Π (row-vector form)
+         Valid because Π is orthogonal: Π^T = Π^{-1}
       3. correction = qjl_bits.float() @ S   shape: (seq_len, head_dim)
       4. scale = sqrt(pi/2) / k
       5. x_tilde = x_mse + scale * gamma[:,None] * correction
@@ -245,17 +247,24 @@ def triton_decompress_kv(
             "Use decompress_kv_python for CPU testing."
         )
 
+    if idx_all.device != Pi.device:
+        raise ValueError(f"idx_all device ({idx_all.device}) must match Pi device ({Pi.device})")
+    if qjl_bits.device != Pi.device:
+        raise ValueError(f"qjl_bits device ({qjl_bits.device}) must match Pi device ({Pi.device})")
+    if gamma.device != Pi.device:
+        raise ValueError(f"gamma device ({gamma.device}) must match Pi device ({Pi.device})")
+
     seq_len, head_dim = idx_all.shape
     k = S.shape[0]
     BLOCK_D = triton.next_power_of_2(head_dim)
 
     out = torch.empty(seq_len, head_dim, dtype=torch.float16, device=Pi.device)
-    is_outlier_i8 = is_outlier.to(torch.int8).to(Pi.device)
+    is_outlier_i8 = is_outlier.to(torch.int8)
 
     _turboquant_decompress_fused[(seq_len,)](
-        idx_all.contiguous().to(Pi.device),
-        qjl_bits.contiguous().to(Pi.device),
-        gamma.contiguous().to(Pi.device),
+        idx_all.contiguous(),
+        qjl_bits.contiguous(),
+        gamma.contiguous(),
         Pi.contiguous(),
         S.contiguous(),
         is_outlier_i8,

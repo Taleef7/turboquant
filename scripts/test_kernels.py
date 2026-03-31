@@ -8,6 +8,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from utils.math_utils import generate_rotation_matrix, generate_qjl_matrix, get_centroids_2bit, get_centroids_3bit
 from kernels.compress_kv import compress_kv_python, build_outlier_mask
+from kernels.decompress_kv import decompress_kv_python
 
 
 def test_build_outlier_mask_shape():
@@ -113,8 +114,6 @@ def test_compress_gamma_positive():
 # Decompression kernel tests
 # ---------------------------------------------------------------------------
 
-from kernels.decompress_kv import decompress_kv_python
-
 
 def test_decompress_output_shape():
     d, seq, k = 128, 10, 128
@@ -129,10 +128,11 @@ def test_decompress_output_shape():
     idx_all, qjl_bits, gamma = compress_kv_python(x, Pi, S, c2, c3, mask)
     x_hat = decompress_kv_python(idx_all, qjl_bits, gamma, Pi, S, c2, c3, mask, torch.float32)
     assert x_hat.shape == (seq, d)
+    assert x_hat.dtype == torch.float32, f"Expected float32, got {x_hat.dtype}"
 
 
 def test_roundtrip_mse():
-    """Round-trip MSE should be < 0.05 for unit-norm vectors."""
+    """Round-trip MSE should be < 0.01 for unit-norm vectors."""
     d, seq, k = 128, 16, 128
     torch.manual_seed(0)
     Pi = generate_rotation_matrix(d)
@@ -145,11 +145,11 @@ def test_roundtrip_mse():
     idx_all, qjl_bits, gamma = compress_kv_python(x, Pi, S, c2, c3, mask)
     x_hat = decompress_kv_python(idx_all, qjl_bits, gamma, Pi, S, c2, c3, mask, torch.float32)
     mse = ((x - x_hat)**2).mean().item()
-    assert mse < 0.05, f"Round-trip MSE too high: {mse}"
+    assert mse < 0.01, f"Round-trip MSE too high: {mse}"
 
 
 def test_inner_product_preservation():
-    """Inner product error should be < 0.1 on average."""
+    """Inner product error should be < 0.05 on average."""
     d, seq, k = 128, 16, 128
     torch.manual_seed(2)
     Pi = generate_rotation_matrix(d)
@@ -162,4 +162,4 @@ def test_inner_product_preservation():
     idx_all, qjl_bits, gamma = compress_kv_python(x, Pi, S, c2, c3, mask)
     x_hat = decompress_kv_python(idx_all, qjl_bits, gamma, Pi, S, c2, c3, mask, torch.float32)
     ip_error = ((x @ x.T) - (x_hat @ x.T)).abs().mean().item()
-    assert ip_error < 0.1, f"Inner product error too high: {ip_error}"
+    assert ip_error < 0.05, f"Inner product error too high: {ip_error}"
