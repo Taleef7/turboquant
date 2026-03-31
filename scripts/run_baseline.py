@@ -14,6 +14,9 @@ Usage:
 Hardware requirement: NVIDIA GPU with ≥8GB VRAM
 """
 
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='torch')
+
 import time
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig

@@ -14,6 +14,9 @@ Usage:
 Hardware requirement: NVIDIA GPU with ≥8GB VRAM
 """
 
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='torch')
+
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 

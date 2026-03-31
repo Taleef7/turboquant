@@ -42,6 +42,14 @@ try:
 except (ImportError, AttributeError):
     _USE_TRITON = False
 
+if not _USE_TRITON:
+    import warnings
+    warnings.warn(
+        "WARNING: Triton not found. Falling back to slow PyTorch implementation.",
+        UserWarning,
+        stacklevel=2
+    )
+
 
 class TurboQuantCache(DynamicCache):
     """
