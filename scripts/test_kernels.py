@@ -163,3 +163,70 @@ def test_inner_product_preservation():
     x_hat = decompress_kv_python(idx_all, qjl_bits, gamma, Pi, S, c2, c3, mask, torch.float32)
     ip_error = ((x @ x.T) - (x_hat @ x.T)).abs().mean().item()
     assert ip_error < 0.05, f"Inner product error too high: {ip_error}"
+
+
+# ---------------------------------------------------------------------------
+# TurboQuantCache integration tests
+# ---------------------------------------------------------------------------
+
+from core.turboquant_cache import TurboQuantCache
+
+def test_cache_update_first_token():
+    """cache.update() on first call returns correct shapes."""
+    cache = TurboQuantCache(head_dim=64, n_qjl=64, n_outliers=8,
+                             device=torch.device('cpu'))
+    b, h, s, d = 1, 4, 8, 64
+    k = torch.randn(b, h, s, d)
+    v = torch.randn(b, h, s, d)
+    k_out, v_out = cache.update(k, v, layer_idx=0)
+    assert k_out.shape == (b, h, s, d)
+    assert v_out.shape == (b, h, s, d)
+
+def test_cache_update_appends_tokens():
+    """Second update appends new tokens and returns extended sequence."""
+    cache = TurboQuantCache(head_dim=64, n_qjl=64, n_outliers=8,
+                             device=torch.device('cpu'))
+    b, h, s, d = 1, 4, 8, 64
+    k = torch.randn(b, h, s, d)
+    v = torch.randn(b, h, s, d)
+    cache.update(k, v, layer_idx=0)
+
+    k2 = torch.randn(b, h, 1, d)
+    v2 = torch.randn(b, h, 1, d)
+    k_out, v_out = cache.update(k2, v2, layer_idx=0)
+    assert k_out.shape == (b, h, s + 1, d)
+    assert v_out.shape == (b, h, s + 1, d)
+
+def test_cache_get_seq_length():
+    cache = TurboQuantCache(head_dim=64, n_qjl=64, n_outliers=8,
+                             device=torch.device('cpu'))
+    assert cache.get_seq_length(layer_idx=0) == 0
+    k = torch.randn(1, 4, 10, 64)
+    v = torch.randn(1, 4, 10, 64)
+    cache.update(k, v, layer_idx=0)
+    assert cache.get_seq_length(layer_idx=0) == 10
+
+def test_cache_compression_ratio():
+    """Compressed KV must be at least 2x smaller than FP16."""
+    cache = TurboQuantCache(head_dim=64, n_qjl=64, n_outliers=8,
+                             device=torch.device('cpu'))
+    b, h, s, d = 1, 4, 16, 64
+    k = torch.randn(b, h, s, d)
+    v = torch.randn(b, h, s, d)
+    cache.update(k, v, layer_idx=0)
+    compressed = cache.compressed_size_bytes()
+    fp16_size = b * h * s * d * 2 * 2  # keys + values, 2 bytes per fp16
+    assert fp16_size / compressed > 2.0, \
+        f"Compression ratio too low: {fp16_size/compressed:.2f}x"
+
+def test_cache_multiple_layers():
+    """Each layer gets its own independent cache slot."""
+    cache = TurboQuantCache(head_dim=64, n_qjl=64, n_outliers=8,
+                             device=torch.device('cpu'))
+    k = torch.randn(1, 4, 8, 64)
+    v = torch.randn(1, 4, 8, 64)
+    cache.update(k, v, layer_idx=0)
+    cache.update(k, v, layer_idx=1)
+    assert cache.get_seq_length(layer_idx=0) == 8
+    assert cache.get_seq_length(layer_idx=1) == 8
+    assert cache.get_seq_length(layer_idx=2) == 0
