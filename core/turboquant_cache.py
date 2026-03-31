@@ -10,7 +10,11 @@ Compression storage per token vector (head_dim=128, k=128):
   qjl_bits: 128 × 1 byte  = 128 bytes  (int8 ±1 signs)
   gamma:         4 bytes               (float32 residual norm)
   is_outlier: stored once per (batch*heads) slice (bool mask)
-vs FP16:    128 × 2 bytes = 256 bytes → ~4.4x compression per vector.
+vs FP16:    128 × 2 bytes = 256 bytes
+
+NOTE: With int8 storage (1 byte/element), actual ratio ≈ 0.97× vs FP16.
+True ~4.4× compression requires bit-packing (2-3 bits/index, 1 bit/sign).
+This implementation uses int8 for correctness; bit-packing is future work.
 
 Usage:
     cache = TurboQuantCache(head_dim=128)
@@ -18,7 +22,6 @@ Usage:
 """
 
 from __future__ import annotations
-import math
 import torch
 from typing import Optional, Tuple, List
 from transformers import DynamicCache
@@ -214,16 +217,18 @@ class TurboQuantCache(DynamicCache):
 
         Each int8 tensor (idx_all, qjl_bits) uses 1 byte per element.
         Each float32 tensor (gamma) uses 4 bytes per element.
-        Note: actual compression is ~4.4x vs FP16 when using the theoretical
-        bit-packed representation (2-3 bits/index, 1 bit/QJL sign).
+        Each bool mask (all_masks) uses 1 byte per element.
+        Note: with int8 storage the ratio is ~0.97× vs FP16. True ~4.4×
+        compression requires future bit-packing (2-3 bits/index, 1 bit/sign).
         """
         total = 0
         for ck in self._compressed_keys + self._compressed_values:
             if ck is None:
                 continue
-            all_idx, all_qjl, all_gamma = ck[0], ck[1], ck[2]
+            all_idx, all_qjl, all_gamma, all_masks = ck[0], ck[1], ck[2], ck[3]
             for i in range(len(all_idx)):
                 total += all_idx[i].nelement()        # int8 = 1 byte each
                 total += all_qjl[i].nelement()        # int8 = 1 byte each
                 total += all_gamma[i].nelement() * 4  # float32 = 4 bytes each
+                total += all_masks[i].nelement()      # bool = 1 byte each
         return total
