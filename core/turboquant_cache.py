@@ -36,10 +36,10 @@ from kernels.compress_kv import compress_kv_python, build_outlier_mask
 from kernels.decompress_kv import decompress_kv_python
 
 try:
-    from kernels.compress_kv import triton_compress_kv
-    from kernels.decompress_kv import triton_decompress_kv
-    _USE_TRITON = torch.cuda.is_available()
-except ImportError:
+    from kernels.compress_kv import triton_compress_kv, _TRITON_AVAILABLE as _TRITON_COMPRESS_AVAILABLE
+    from kernels.decompress_kv import triton_decompress_kv, _TRITON_AVAILABLE as _TRITON_DECOMPRESS_AVAILABLE
+    _USE_TRITON = torch.cuda.is_available() and _TRITON_COMPRESS_AVAILABLE and _TRITON_DECOMPRESS_AVAILABLE
+except (ImportError, AttributeError):
     _USE_TRITON = False
 
 
