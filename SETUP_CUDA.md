@@ -1,232 +1,241 @@
 # TurboQuant CUDA Setup Guide
 
-## Status: Python 3.12 Virtual Environment Ready
+## Status: WSL2 GPU Setup Complete
 
-**Created:** 2026-03-30
-**Python:** 3.12.10
-**PyTorch:** 2.7.0.dev20250310+cu124 (nightly)
-**CUDA:** 13.1 (system), 12.4 (PyTorch)
-**RTX 5070 Ti:** 12.8 GB VRAM available
+**Updated:** 2026-03-31
+**Platform:** Ubuntu 24.04 (WSL2)
+**Python:** 3.12.3
+**PyTorch:** 2.12.0.dev20260330+cu128 (nightly)
+**Triton:** 3.6.0
+**CUDA:** 13.1 (driver), 12.8 (PyTorch runtime)
+**RTX 5070 Ti:** 12.8 GB VRAM, sm_120 (Blackwell)
 
 ---
 
-## Current Limitation: Blackwell (sm_120) Support
+## Current Status: GPU Fully Working
 
-The RTX 5070 Ti uses the **Blackwell architecture (sm_120)**, released in early 2025. Unfortunately:
-
-- **PyTorch 2.6.0**: Supports sm_50-sm_90 (Ada Lovelace is latest)
-- **PyTorch 2.7.0 nightly**: Still supports sm_50-sm_90
-- **Official PyTorch wheels**: No sm_120 support yet
-
-### Status Check
+The RTX 5070 Ti (Blackwell architecture, sm_120) is now **fully supported** using PyTorch nightly with CUDA 12.8:
 
 ```
+PyTorch: 2.12.0.dev20260330+cu128
+CUDA available: True
 GPU: NVIDIA GeForce RTX 5070 Ti Laptop GPU
-Compute capability: sm_120 ❌ NOT SUPPORTED
-CUDA available: True (but kernels won't run)
+Compute Capability: sm_120
+VRAM: 12.8 GB
+Simple CUDA matmul: SUCCESS
+Triton: 3.6.0
 ```
 
-### Workaround: CPU Execution
+### Tests Passing
 
-**The good news:** All code works perfectly on CPU!
-
-```bash
-# Verify CPU works
-cd "C:/Users/talee/OneDrive - Higher Education Commission/projects/TurboQuant/turboquant-qwen-showcase"
-source venv312/Scripts/activate
-python -m pytest scripts/test_math.py -v
 ```
-
-**Result:** ✓ 10/10 math tests passing on CPU
+✓ 25/25 tests passing (math + kernels)
+✓ Triton GPU kernels compiling and running
+✓ TurboQuantCache working on both CPU and GPU
+```
 
 ---
 
-## Virtual Environment Setup
+## Quick Start (WSL2)
 
-A Python 3.12 virtual environment has been created at:
-```
-./venv312/
-```
+### 1. Activate the Virtual Environment
 
-### Activate the Environment
-
-**Windows (Git Bash/WSL):**
 ```bash
-source venv312/Scripts/activate
+cd ~/projects/turboquant
+source venv312/bin/activate
 ```
 
-**Windows (PowerShell):**
-```powershell
-.\venv312\Scripts\Activate.ps1
+### 2. Verify GPU
+
+```bash
+python -c "
+import torch
+print(f'PyTorch: {torch.__version__}')
+print(f'CUDA available: {torch.cuda.is_available()}')
+print(f'GPU: {torch.cuda.get_device_name(0)}')
+"
 ```
 
-**Windows (cmd.exe):**
-```cmd
-venv312\Scripts\activate.bat
+### 3. Run Tests
+
+```bash
+# Full test suite
+python -m pytest scripts/test_math.py scripts/test_kernels.py -v
+
+# GPU benchmark
+python scripts/run_baseline.py
 ```
+
+---
+
+## Installation from Scratch (WSL2)
+
+### Prerequisites
+
+1. **WSL2 with Ubuntu 24.04** installed
+2. **NVIDIA drivers 591.86+** installed on Windows
+3. **Python 3.12** with venv support:
+   ```bash
+   sudo apt update
+   sudo apt install -y python3.12 python3.12-venv python3.12-dev build-essential
+   ```
+
+### Setup Steps
+
+```bash
+# 1. Clone repo (if not already done)
+cd ~
+git clone https://github.com/Taleef7/turboquant.git
+cd turboquant
+
+# 2. Create virtual environment
+python3.12 -m venv venv312
+source venv312/bin/activate
+
+# 3. Install PyTorch nightly with CUDA 12.8 (required for sm_120)
+pip install --upgrade pip
+pip install torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+
+# 4. Install project dependencies
+pip install -r requirements.txt
+pip install pytest
+
+# 5. Verify setup
+python -m pytest scripts/test_math.py scripts/test_kernels.py -v
+```
+
+---
+
+## Key Discovery: sm_120 Support
+
+**RTX 5070 Ti (Blackwell, sm_120) requires PyTorch nightly with CUDA 12.8**
+
+| PyTorch Version | CUDA | sm_120 Support |
+|-----------------|------|----------------|
+| 2.6.0 stable | cu124 | ❌ No |
+| 2.7.0 nightly | cu124 | ❌ No |
+| 2.12.0 nightly | cu126 | ❌ No |
+| **2.12.0 nightly** | **cu128** | ✅ **Yes** |
+
+Install the correct version:
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+```
+
+---
+
+## Virtual Environment Details
+
+Location: `./venv312/`
 
 ### Installed Packages
 
 ```
-✓ PyTorch 2.7.0.dev20250310+cu124
-✓ NumPy 2.4.3
-✓ Transformers 5.4.0
-✓ BitsAndBytes 0.49.2
-✓ PEFT 0.18.1
-✓ Accelerate 1.13.0
-✓ Pytest 9.0.2
+✓ torch 2.12.0.dev20260330+cu128
+✓ triton 3.6.0
+✓ transformers 5.4.0
+✓ bitsandbytes 0.49.2
+✓ accelerate 1.13.0
+✓ datasets 4.8.4
+✓ einops 0.8.2
+✓ pytest 9.0.2
+```
+
+### Activate
+
+**WSL2 / Linux:**
+```bash
+source venv312/bin/activate
 ```
 
 ---
 
 ## Running Tests
 
-### CPU-Based Tests (Recommended Now)
+### Unit Tests
 
 ```bash
-source venv312/Scripts/activate
-
-# Math primitives only (no GPU)
+# Math primitives (10 tests)
 python -m pytest scripts/test_math.py -v
 
-# All tests (math + kernels, CPU fallback)
-python -m pytest scripts/test_kernels.py scripts/test_math.py -v
+# Kernel tests (15 tests)  
+python -m pytest scripts/test_kernels.py -v
+
+# Full suite (25 tests)
+python -m pytest scripts/test_math.py scripts/test_kernels.py -v
 ```
 
-**Expected:** ✓ 25/25 passing
-
-### GPU-Based Benchmarks (Blocked Until sm_120 Support)
-
-These scripts are ready but will fail on GPU computation:
+### GPU Benchmarks
 
 ```bash
-source venv312/Scripts/activate
-
-# Will fail: CUDA kernel not available for sm_120
+# Baseline (standard DynamicCache)
 python scripts/run_baseline.py
-```
 
-**Error expected:**
-```
-RuntimeError: CUDA error: no kernel image is available for execution on the device
-```
+# TurboQuant (compressed KV cache)
+python scripts/run_turboquant.py
 
----
-
-## Future: PyTorch sm_120 Support
-
-Once PyTorch officially supports Blackwell (sm_120), you can:
-
-1. Update PyTorch:
-   ```bash
-   source venv312/Scripts/activate
-   pip install --upgrade torch --index-url https://download.pytorch.org/whl/cu124
-   ```
-
-2. Verify GPU support:
-   ```bash
-   python -c "import torch; print(torch.cuda.is_available())"
-   ```
-
-3. Run benchmarks:
-   ```bash
-   python scripts/run_baseline.py
-   python scripts/run_turboquant.py
-   python scripts/eval_niah.py --both
-   ```
-
-**Check PyTorch roadmap:** https://github.com/pytorch/pytorch/issues
-
----
-
-## Alternative: Build PyTorch from Source (Advanced)
-
-If you need GPU support immediately, you can build PyTorch from source with sm_120 support:
-
-```bash
-# Clone PyTorch
-git clone --recursive https://github.com/pytorch/pytorch
-cd pytorch
-
-# Activate venv
-source ../venv312/Scripts/activate
-
-# Set CUDA architecture for sm_120
-export TORCH_CUDA_ARCH_LIST="5.0;6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0;12.0"
-
-# Build (takes 30-60 minutes)
-python setup.py install
-```
-
-**This is advanced and not recommended unless you're familiar with C++/CUDA builds.**
-
----
-
-## Environment Variables
-
-If building from source, set:
-
-```bash
-# CUDA paths
-export CUDA_HOME="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1"
-export PATH="$CUDA_HOME/bin:$PATH"
-
-# PyTorch build flags
-export TORCH_CUDA_ARCH_LIST="12.0"
-export CUDA_VISIBLE_DEVICES=0
+# NIAH evaluation
+python scripts/eval_niah.py --both
 ```
 
 ---
 
-## Summary
+## Code Fix Applied
 
-| Aspect | Status |
-|--------|--------|
-| Python 3.12 | ✓ Ready |
-| PyTorch CUDA | ✓ Ready (CPU fallback) |
-| CUDA 13.1 drivers | ✓ Installed |
-| RTX 5070 Ti detection | ✓ Detected (sm_120) |
-| sm_120 kernel support | ❌ Not yet in PyTorch |
-| CPU-based tests | ✓ All passing |
-| GPU-based tests | ⏳ Blocked (awaiting PyTorch update) |
+A fix was applied to `core/turboquant_cache.py` to properly handle CPU vs GPU contexts:
 
----
+```python
+# Use Triton only if globally available AND cache is on CUDA
+use_triton = _USE_TRITON and self.device.type == 'cuda'
+```
 
-## Next Steps
-
-### Immediate (CPU)
-- Run math unit tests: `pytest scripts/test_math.py -v`
-- Verify cache integration on CPU
-- Document compression ratio (0.94x with int8)
-
-### When sm_120 Support Lands
-- Upgrade PyTorch (`pip install --upgrade torch`)
-- Run GPU benchmarks
-- Measure VRAM savings on RTX 5070 Ti
-- Compare baseline vs TurboQuant TPS
+This ensures:
+- Tests with `device='cpu'` use Python fallback kernels
+- Production code with `device='cuda'` uses fast Triton kernels
 
 ---
 
 ## Troubleshooting
 
 ### "CUDA error: no kernel image is available"
-- **Cause:** Your GPU (sm_120) isn't supported by installed PyTorch
-- **Solution:** Wait for PyTorch to add sm_120 support, or build from source
+- **Cause:** PyTorch doesn't support your GPU's compute capability
+- **Solution:** Install PyTorch nightly with CUDA 12.8:
+  ```bash
+  pip install torch --index-url https://download.pytorch.org/whl/nightly/cu128
+  ```
 
-### "ModuleNotFoundError: No module named 'triton'"
-- **Cause:** Triton is optional (Windows doesn't have pre-built wheels)
-- **Solution:** Code falls back to Python kernels automatically
+### "Pointer argument cannot be accessed from Triton (cpu tensor?)"
+- **Cause:** Triton kernels called with CPU tensors
+- **Solution:** Ensure cache is initialized with `device=torch.device('cuda')`
 
-### venv not activating
-- **Windows PowerShell:** Run `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`
-- **Windows Git Bash:** Use `source venv312/Scripts/activate`
-- **Windows cmd.exe:** Use `venv312\Scripts\activate.bat`
+### "nvidia-smi not found" in WSL2
+- **Cause:** NVIDIA drivers not installed on Windows host
+- **Solution:** Install latest GeForce drivers from nvidia.com
+
+### Triton compilation slow (first run)
+- **Expected:** Triton JIT compiles kernels on first use (10-60 seconds)
+- **Subsequent runs:** Kernels are cached and load instantly
+
+---
+
+## Summary
+
+| Component | Status |
+|-----------|--------|
+| WSL2 Ubuntu 24.04 | ✓ Working |
+| Python 3.12 | ✓ Ready |
+| PyTorch 2.12.0+cu128 | ✓ Installed |
+| Triton 3.6.0 | ✓ Working |
+| CUDA 13.1 drivers | ✓ Detected |
+| RTX 5070 Ti (sm_120) | ✓ **Fully Supported** |
+| Unit tests | ✓ 25/25 passing |
+| GPU benchmarks | ✓ Running |
 
 ---
 
 ## References
 
-- PyTorch CUDA Support: https://pytorch.org/get-started/locally/
-- Blackwell Architecture: https://developer.nvidia.com/blackwell
-- RTX 5070 Ti Specs: https://www.nvidia.com/en-us/geforce/ada-generation/
-- CUDA Capabilities: https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#compute-capabilities
+- PyTorch Nightly: https://pytorch.org/get-started/locally/
+- Triton Documentation: https://triton-lang.org/
+- WSL2 CUDA Guide: https://docs.nvidia.com/cuda/wsl-user-guide/
+- TurboQuant Paper: https://arxiv.org/abs/2504.19874

@@ -116,13 +116,18 @@ which python
 
 ## Step 5: Install PyTorch with CUDA Support
 
-### 1. Install PyTorch Nightly (CUDA 12.4)
+### 1. Install PyTorch Nightly (CUDA 12.8 for RTX 5070 Ti / Blackwell)
+
+**IMPORTANT:** RTX 5070 Ti (Blackwell, sm_120) requires PyTorch nightly with CUDA 12.8:
 
 ```bash
-pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install --upgrade pip
+pip install torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
 ```
 
-This will take 3-5 minutes.
+This will take 5-10 minutes (downloads ~2GB).
+
+> **Note:** Standard cu124 builds do NOT support sm_120. You must use cu128 nightly.
 
 ### 2. Verify CUDA Detection
 
@@ -134,34 +139,35 @@ print(f'CUDA available: {torch.cuda.is_available()}')
 if torch.cuda.is_available():
     print(f'GPU: {torch.cuda.get_device_name(0)}')
     print(f'VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
+    # Test CUDA operation
+    x = torch.randn(100, 100, device='cuda')
+    y = x @ x.T
+    print(f'CUDA matmul test: SUCCESS')
 "
 ```
 
 Expected output:
 ```
-PyTorch: 2.7.0.dev...+cu124
+PyTorch: 2.12.0.dev...+cu128
 CUDA available: True
-GPU: NVIDIA GeForce RTX 5070 Ti
+GPU: NVIDIA GeForce RTX 5070 Ti Laptop GPU
 VRAM: 12.8 GB
+CUDA matmul test: SUCCESS
 ```
 
 ---
 
 ## Step 6: Install Triton
 
-### 1. Install Triton Compiler
+### 1. Verify Triton Installation
 
-Triton will compile from source on Linux. This takes 5-10 minutes but only happens once:
-
-```bash
-pip install triton
-```
-
-### 2. Verify Triton Installation
+Triton is installed automatically with PyTorch nightly (cu128). Verify:
 
 ```bash
 python -c "import triton; print(f'Triton: {triton.__version__}')"
 ```
+
+Expected: `Triton: 3.6.0` (or similar)
 
 ---
 
@@ -169,15 +175,16 @@ python -c "import triton; print(f'Triton: {triton.__version__}')"
 
 ```bash
 pip install -r requirements.txt
+pip install pytest  # For running tests
 ```
 
 This installs:
 - transformers
 - bitsandbytes
 - accelerate
-- peft
+- datasets
+- einops
 - pytest
-- All other dependencies
 
 ---
 
