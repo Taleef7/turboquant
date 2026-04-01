@@ -8,8 +8,9 @@ Design constraints (CRITICAL):
 
 Contents:
   compress_kv_python  — CPU reference implementation (mirrors the fused kernel)
+  compress_kv_hybrid  — PyTorch matmuls + Triton quantization (fast, sm_120 compatible)
   build_outlier_mask  — select top-variance channels for 3-bit quantization
-  _turboquant_compress_fused — fully fused Triton kernel (requires CUDA)
+  _turboquant_compress_fused — fully fused Triton kernel (requires CUDA, may hang on sm_120)
   triton_compress_kv  — launcher for the Triton kernel
 """
 
@@ -21,30 +22,41 @@ import torch
 try:
     import triton
     import triton.language as tl
+
     _TRITON_AVAILABLE = True
 except ImportError:
     _TRITON_AVAILABLE = False
+
+# Import new vectorized Triton quantization kernels
+try:
+    from kernels.quantize_triton import triton_quantize, triton_dequantize
+
+    _TRITON_QUANTIZE_AVAILABLE = _TRITON_AVAILABLE
+except ImportError:
+    _TRITON_QUANTIZE_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
 # 1. Python reference implementation
 # ---------------------------------------------------------------------------
 
+
 def compress_kv_python(
-    x: torch.Tensor,                # (seq_len, head_dim) float32
-    Pi: torch.Tensor,               # (head_dim, head_dim) float32
-    S: torch.Tensor,                # (k, head_dim) float32
-    centroids_2bit: torch.Tensor,   # (4,) float32
-    centroids_3bit: torch.Tensor,   # (8,) float32
-    is_outlier: torch.Tensor,       # (head_dim,) bool — True for 3-bit channels
+    x: torch.Tensor,  # (seq_len, head_dim) float32
+    Pi: torch.Tensor,  # (head_dim, head_dim) float32
+    S: torch.Tensor,  # (k, head_dim) float32
+    centroids_2bit: torch.Tensor,  # (4,) float32
+    centroids_3bit: torch.Tensor,  # (8,) float32
+    is_outlier: torch.Tensor,  # (head_dim,) bool — True for 3-bit channels
 ) -> tuple:
     """
-    CPU reference implementation that mirrors the fused Triton kernel exactly.
+    GPU-optimized vectorized implementation using pure PyTorch operations.
+    NO Python for-loops - all operations run on GPU in parallel.
 
     The pipeline per token:
-      1. Rotate:          y      = Pi @ x          (SRAM only in kernel)
-      2. Quantize:        y_hat  = nearest centroid  (SRAM only in kernel)
-      3. Back-rotate:     x_mse  = Pi^T @ y_hat     (SRAM only in kernel)
+      1. Rotate:          y      = Pi @ x
+      2. Quantize:        y_hat  = nearest centroid (vectorized)
+      3. Back-rotate:     x_mse  = Pi^T @ y_hat
       4. Residual + norm: r = x - x_mse, gamma = ||r||
       5. QJL projection:  qjl_bits = sign(S @ r)
 
@@ -56,41 +68,172 @@ def compress_kv_python(
     x = x.float()
     seq_len, head_dim = x.shape
     k = S.shape[0]
+    device = x.device
 
-    # 1. Rotate: y = Pi @ x  (each row: y_i = Pi @ x_i)
-    y = x @ Pi.T                                     # (seq_len, head_dim)
+    # 1. Rotate: y = x @ Pi^T  (all tokens in parallel on GPU)
+    y = x @ Pi.T  # (seq_len, head_dim)
 
-    # 2. Quantize per channel — assign nearest centroid, record index + value
+    # 2. Vectorized quantization - NO PYTHON LOOPS
+    # Separate channels into 2-bit (normal) and 3-bit (outlier) groups
+    normal_mask = ~is_outlier  # (head_dim,) bool
+    outlier_mask = is_outlier  # (head_dim,) bool
+
+    # Pre-allocate outputs
+    idx_all = torch.zeros(seq_len, head_dim, dtype=torch.int8, device=device)
     y_hat = torch.zeros_like(y)
-    idx_all = torch.zeros(seq_len, head_dim, dtype=torch.int8)
 
-    for j in range(head_dim):
-        yj = y[:, j]                                  # (seq_len,)
-        centroids = centroids_3bit if is_outlier[j] else centroids_2bit
-        dists = (yj.unsqueeze(1) - centroids.unsqueeze(0)).abs()  # (seq_len, n_levels)
-        idx = dists.argmin(dim=1)                     # (seq_len,)
-        idx_all[:, j] = idx.to(torch.int8)
-        y_hat[:, j] = centroids[idx]
+    # Process normal channels (2-bit, 4 centroids) - fully vectorized
+    if normal_mask.any():
+        y_normal = y[:, normal_mask]  # (seq_len, n_normal)
+        # Compute distances to all 4 centroids at once: (seq_len, n_normal, 4)
+        dists_normal = (y_normal.unsqueeze(-1) - centroids_2bit.view(1, 1, -1)).abs()
+        idx_normal = dists_normal.argmin(dim=-1)  # (seq_len, n_normal)
+        idx_all[:, normal_mask] = idx_normal.to(torch.int8)
+        y_hat[:, normal_mask] = centroids_2bit[idx_normal]
 
-    # 3. Back-rotate: x_mse = Pi^T @ y_hat
-    x_mse = y_hat @ Pi                               # (seq_len, head_dim)
+    # Process outlier channels (3-bit, 8 centroids) - fully vectorized
+    if outlier_mask.any():
+        y_outlier = y[:, outlier_mask]  # (seq_len, n_outlier)
+        # Compute distances to all 8 centroids at once: (seq_len, n_outlier, 8)
+        dists_outlier = (y_outlier.unsqueeze(-1) - centroids_3bit.view(1, 1, -1)).abs()
+        idx_outlier = dists_outlier.argmin(dim=-1)  # (seq_len, n_outlier)
+        idx_all[:, outlier_mask] = idx_outlier.to(torch.int8)
+        y_hat[:, outlier_mask] = centroids_3bit[idx_outlier]
 
-    # 4. Residual + norm
-    r = x - x_mse                                    # (seq_len, head_dim)
-    gamma = torch.norm(r, dim=-1)                    # (seq_len,)
+    # 3. Back-rotate: x_mse = y_hat @ Pi (all tokens in parallel on GPU)
+    x_mse = y_hat @ Pi  # (seq_len, head_dim)
 
-    # 5. QJL sketch: sign(S @ r^T), result (seq_len, k)
-    projections = r @ S.T                            # (seq_len, k)
-    qjl_bits = torch.where(projections >= 0.0,
-                            torch.ones_like(projections, dtype=torch.int8),
-                            -torch.ones_like(projections, dtype=torch.int8))
+    # 4. Residual + norm (GPU vectorized)
+    r = x - x_mse  # (seq_len, head_dim)
+    gamma = torch.norm(r, dim=-1)  # (seq_len,)
+
+    # 5. QJL sketch: sign(S @ r^T) (GPU matrix multiply)
+    projections = r @ S.T  # (seq_len, k)
+    qjl_bits = torch.where(
+        projections >= 0.0,
+        torch.ones_like(projections, dtype=torch.int8),
+        -torch.ones_like(projections, dtype=torch.int8),
+    )
 
     return idx_all, qjl_bits, gamma
 
 
 # ---------------------------------------------------------------------------
+# 1b. Hybrid implementation (PyTorch + Triton quantize)
+# ---------------------------------------------------------------------------
+
+
+def compress_kv_hybrid(
+    x: torch.Tensor,  # (seq_len, head_dim) float32
+    Pi: torch.Tensor,  # (head_dim, head_dim) float32
+    S: torch.Tensor,  # (k, head_dim) float32
+    centroids_2bit: torch.Tensor,  # (4,) float32
+    centroids_3bit: torch.Tensor,  # (8,) float32
+    is_outlier: torch.Tensor,  # (head_dim,) bool — True for 3-bit channels
+) -> tuple:
+    """
+    Hybrid implementation: PyTorch cuBLAS for matmuls, Triton for quantization.
+
+    This avoids the tl.static_range(0, 128) loops that hang on sm_120.
+    Uses cuBLAS for rotation (fast tensor cores) and Triton only for the
+    embarrassingly-parallel quantization step.
+
+    Pipeline:
+      1. [PyTorch cuBLAS]  y = x @ Pi.T          (rotation)
+      2. [Triton kernel]   idx, y_hat = quantize(y)  (vectorized)
+      3. [PyTorch cuBLAS]  x_mse = y_hat @ Pi    (back-rotation)
+      4. [PyTorch]         r = x - x_mse, gamma = ||r||
+      5. [PyTorch cuBLAS]  qjl_bits = sign(r @ S.T)
+
+    Returns:
+        idx_all:   (seq_len, head_dim) int8  — centroid indices (0-based)
+        qjl_bits:  (seq_len, k) int8         — ±1 sketch bits
+        gamma:     (seq_len,) float32        — residual norms
+    """
+    if not _TRITON_QUANTIZE_AVAILABLE:
+        raise RuntimeError("Triton quantize kernels not available")
+
+    x = x.float()
+    seq_len, head_dim = x.shape
+    device = x.device
+
+    # 1. Rotate: y = x @ Pi^T  (cuBLAS)
+    y = x @ Pi.T  # (seq_len, head_dim)
+
+    # 2. Triton quantization (vectorized, no static_range loops)
+    idx_all, y_hat = triton_quantize(y, centroids_2bit, centroids_3bit, is_outlier)
+
+    # 3. Back-rotate: x_mse = y_hat @ Pi (cuBLAS)
+    x_mse = y_hat @ Pi  # (seq_len, head_dim)
+
+    # 4. Residual + norm (PyTorch native)
+    r = x - x_mse  # (seq_len, head_dim)
+    gamma = torch.norm(r, dim=-1)  # (seq_len,)
+
+    # 5. QJL sketch: sign(r @ S^T) (cuBLAS)
+    projections = r @ S.T  # (seq_len, k)
+    qjl_bits = torch.where(
+        projections >= 0.0,
+        torch.ones_like(projections, dtype=torch.int8),
+        -torch.ones_like(projections, dtype=torch.int8),
+    )
+
+    return idx_all, qjl_bits, gamma
+
+
+def compress_values_group_quant(
+    x: torch.Tensor,
+    group_size: int = 32,
+) -> tuple:
+    """
+    Compress Value vectors with per-group asymmetric min/max quantization.
+
+    This intentionally does NOT use rotation or QJL correction.
+
+    Args:
+        x:          (seq_len, head_dim) float tensor.
+        group_size: Number of channels per quantization group.
+
+    Returns:
+        idx_all: (seq_len, head_dim) int8 quantized indices in [0, 15]
+        mins:    (seq_len, n_groups) float32 per-group minima
+        scales:  (seq_len, n_groups) float32 per-group scales, where
+                 dequantized_value = mins + index * scales
+    """
+    if x.ndim != 2:
+        raise ValueError(f"x must be 2D (seq_len, head_dim), got shape {x.shape}")
+
+    seq_len, head_dim = x.shape
+    if head_dim % group_size != 0:
+        raise ValueError(
+            f"head_dim ({head_dim}) must be divisible by group_size ({group_size})"
+        )
+
+    x = x.float()
+    n_groups = head_dim // group_size
+
+    x_grouped = x.reshape(seq_len, n_groups, group_size)
+    mins = x_grouped.amin(dim=-1)
+    maxs = x_grouped.amax(dim=-1)
+
+    # 4-bit quantization -> 16 levels -> denominator 15.
+    scales = (maxs - mins) / 15.0
+    scales = torch.clamp(scales, min=1e-8)
+
+    idx = torch.round((x_grouped - mins.unsqueeze(-1)) / scales.unsqueeze(-1))
+    idx = idx.clamp_(0, 15).to(torch.int8)
+
+    return (
+        idx.reshape(seq_len, head_dim),
+        mins.to(torch.float32),
+        scales.to(torch.float32),
+    )
+
+
+# ---------------------------------------------------------------------------
 # 2. Helper: build outlier channel mask
 # ---------------------------------------------------------------------------
+
 
 def build_outlier_mask(x: torch.Tensor, n_outliers: int = 32) -> torch.Tensor:
     """
@@ -104,7 +247,7 @@ def build_outlier_mask(x: torch.Tensor, n_outliers: int = 32) -> torch.Tensor:
     Returns:
         Boolean mask of shape (head_dim,).
     """
-    var = x.float().var(dim=0)                       # (head_dim,)
+    var = x.float().var(dim=0)  # (head_dim,)
     _, top_idx = torch.topk(var, n_outliers)
     mask = torch.zeros(x.shape[1], dtype=torch.bool, device=x.device)
     mask[top_idx] = True
@@ -119,15 +262,15 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _turboquant_compress_fused(
-        x_ptr,             # (seq_len, head_dim) float16  [input]
-        Pi_ptr,            # (head_dim, head_dim) float32 [input]
-        S_ptr,             # (k, head_dim) float32        [input]
-        is_outlier_ptr,    # (head_dim,) int8             [input]
-        c2_ptr,            # (4,) float32                 [input]
-        c3_ptr,            # (8,) float32                 [input]
-        idx_all_ptr,       # (seq_len, head_dim) int8     [output]
-        qjl_ptr,           # (seq_len, k) int8            [output]
-        gamma_ptr,         # (seq_len,) float32           [output]
+        x_ptr,  # (seq_len, head_dim) float16  [input]
+        Pi_ptr,  # (head_dim, head_dim) float32 [input]
+        S_ptr,  # (k, head_dim) float32        [input]
+        is_outlier_ptr,  # (head_dim,) int8             [input]
+        c2_ptr,  # (4,) float32                 [input]
+        c3_ptr,  # (8,) float32                 [input]
+        idx_all_ptr,  # (seq_len, head_dim) int8     [output]
+        qjl_ptr,  # (seq_len, k) int8            [output]
+        gamma_ptr,  # (seq_len,) float32           [output]
         head_dim: tl.constexpr,
         k: tl.constexpr,
         BLOCK_D: tl.constexpr,
@@ -143,14 +286,16 @@ if _TRITON_AVAILABLE:
         SRAM registers — never spill to global memory.
         """
         token_id = tl.program_id(0)
-        offs = tl.arange(0, BLOCK_D)                 # [0 .. head_dim-1]
-        mask = offs < head_dim                        # guard for BLOCK_D > head_dim
+        offs = tl.arange(0, BLOCK_D)  # [0 .. head_dim-1]
+        mask = offs < head_dim  # guard for BLOCK_D > head_dim
 
         # ------------------------------------------------------------------
         # Load x[token, :] from global memory — THE ONLY READ OF x
         # ------------------------------------------------------------------
         x_base = x_ptr + token_id * head_dim
-        x_vec = tl.load(x_base + offs, mask=mask, other=0.0).to(tl.float32)  # (BLOCK_D,) in SRAM
+        x_vec = tl.load(x_base + offs, mask=mask, other=0.0).to(
+            tl.float32
+        )  # (BLOCK_D,) in SRAM
 
         # ------------------------------------------------------------------
         # Load tiny centroid arrays into registers (12 floats total)
@@ -176,16 +321,20 @@ if _TRITON_AVAILABLE:
         #   find nearest centroid for y_j
         #   accumulate results into SRAM vectors y_hat_vec and idx_vec
         # ------------------------------------------------------------------
-        y_hat_vec = tl.zeros([BLOCK_D], dtype=tl.float32)  # reconstructed rotated coords
-        idx_vec   = tl.zeros([BLOCK_D], dtype=tl.int8)
+        y_hat_vec = tl.zeros(
+            [BLOCK_D], dtype=tl.float32
+        )  # reconstructed rotated coords
+        idx_vec = tl.zeros([BLOCK_D], dtype=tl.int8)
 
         for j in tl.static_range(0, BLOCK_D):
             # Load Pi row j from global memory
-            pi_row = tl.load(Pi_ptr + j * head_dim + offs, mask=mask, other=0.0)   # (BLOCK_D,)
-            y_j = tl.sum(pi_row * x_vec)                      # scalar dot product
+            pi_row = tl.load(
+                Pi_ptr + j * head_dim + offs, mask=mask, other=0.0
+            )  # (BLOCK_D,)
+            y_j = tl.sum(pi_row * x_vec)  # scalar dot product
 
             # Check is_outlier[j]
-            outlier_flag = tl.load(is_outlier_ptr + j)        # int8 scalar
+            outlier_flag = tl.load(is_outlier_ptr + j)  # int8 scalar
 
             # ---- 2-bit nearest centroid (4 levels) ----
             # Compare absolute distances sequentially, keep running best
@@ -258,7 +407,7 @@ if _TRITON_AVAILABLE:
             # ---- Scatter scalar into SRAM vectors at position j ----
             # tl.where(offs == j, scalar, vector) writes scalar at index j
             y_hat_vec = tl.where(offs == j, chosen_val, y_hat_vec)
-            idx_vec   = tl.where(offs == j, chosen_idx, idx_vec)
+            idx_vec = tl.where(offs == j, chosen_idx, idx_vec)
 
         # ------------------------------------------------------------------
         # Step 3: Back-rotate: x_mse = Pi^T @ y_hat
@@ -272,15 +421,17 @@ if _TRITON_AVAILABLE:
 
         for i in tl.static_range(0, BLOCK_D):
             # Load Pi column i — Pi[j, i] for j in 0..head_dim-1
-            pi_col = tl.load(Pi_ptr + offs * head_dim + i, mask=mask, other=0.0)   # (BLOCK_D,)
-            x_mse_i = tl.sum(pi_col * y_hat_vec)             # scalar
+            pi_col = tl.load(
+                Pi_ptr + offs * head_dim + i, mask=mask, other=0.0
+            )  # (BLOCK_D,)
+            x_mse_i = tl.sum(pi_col * y_hat_vec)  # scalar
             x_mse_vec = tl.where(offs == i, x_mse_i, x_mse_vec)
 
         # ------------------------------------------------------------------
         # Step 4: Residual and norm
         # ------------------------------------------------------------------
-        r_vec = x_vec - x_mse_vec                            # (BLOCK_D,) in SRAM
-        gamma_val = tl.sqrt(tl.sum(r_vec * r_vec))          # scalar in SRAM
+        r_vec = x_vec - x_mse_vec  # (BLOCK_D,) in SRAM
+        gamma_val = tl.sqrt(tl.sum(r_vec * r_vec))  # scalar in SRAM
 
         # ------------------------------------------------------------------
         # Step 5: QJL — sign(S @ r)
@@ -288,10 +439,15 @@ if _TRITON_AVAILABLE:
         qjl_base = qjl_ptr + token_id * k
 
         for m in tl.static_range(0, k):
-            s_row = tl.load(S_ptr + m * head_dim + offs, mask=mask, other=0.0)    # (BLOCK_D,)
-            proj = tl.sum(s_row * r_vec)                     # scalar
-            bit = tl.where(proj >= 0.0, tl.full([], 1, dtype=tl.int8),
-                           tl.full([], -1, dtype=tl.int8))
+            s_row = tl.load(
+                S_ptr + m * head_dim + offs, mask=mask, other=0.0
+            )  # (BLOCK_D,)
+            proj = tl.sum(s_row * r_vec)  # scalar
+            bit = tl.where(
+                proj >= 0.0,
+                tl.full([], 1, dtype=tl.int8),
+                tl.full([], -1, dtype=tl.int8),
+            )
             tl.store(qjl_base + m, bit)
 
         # ------------------------------------------------------------------
@@ -307,6 +463,7 @@ if _TRITON_AVAILABLE:
 # ---------------------------------------------------------------------------
 # 4. Launcher
 # ---------------------------------------------------------------------------
+
 
 def triton_compress_kv(
     x: torch.Tensor,
@@ -356,19 +513,24 @@ def triton_compress_kv(
     is_outlier_i8 = is_outlier.to(torch.int8).contiguous()
 
     # Allocate outputs
-    idx_all  = torch.empty(seq_len, head_dim, dtype=torch.int8, device=x.device)
-    qjl_bits = torch.empty(seq_len, k,        dtype=torch.int8, device=x.device)
-    gamma    = torch.empty(seq_len,           dtype=torch.float32, device=x.device)
+    idx_all = torch.empty(seq_len, head_dim, dtype=torch.int8, device=x.device)
+    qjl_bits = torch.empty(seq_len, k, dtype=torch.int8, device=x.device)
+    gamma = torch.empty(seq_len, dtype=torch.float32, device=x.device)
 
     # BLOCK_D must be a power-of-two >= head_dim for tl.arange
     BLOCK_D = triton.next_power_of_2(head_dim)
 
     grid = (seq_len,)
     _turboquant_compress_fused[grid](
-        x, Pi, S,
+        x,
+        Pi,
+        S,
         is_outlier_i8,
-        centroids_2bit, centroids_3bit,
-        idx_all, qjl_bits, gamma,
+        centroids_2bit,
+        centroids_3bit,
+        idx_all,
+        qjl_bits,
+        gamma,
         head_dim=head_dim,
         k=k,
         BLOCK_D=BLOCK_D,

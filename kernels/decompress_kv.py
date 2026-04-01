@@ -8,6 +8,11 @@ SRAM execution contract:
 
 Dequantization formula:
   x_tilde = Pi^T * y_hat  +  (sqrt(pi/2) / k) * gamma * S^T * qjl
+
+Contents:
+  decompress_kv_python  — CPU reference implementation
+  decompress_kv_hybrid  — PyTorch matmuls + Triton dequantization (sm_120 compatible)
+  _turboquant_decompress_fused — fully fused Triton kernel (may hang on sm_120)
 """
 
 import math
@@ -19,66 +24,194 @@ import torch
 try:
     import triton
     import triton.language as tl
+
     _TRITON_AVAILABLE = True
 except ImportError:
     _TRITON_AVAILABLE = False
+
+# Import new vectorized Triton dequantization kernels
+try:
+    from kernels.quantize_triton import triton_dequantize
+
+    _TRITON_QUANTIZE_AVAILABLE = _TRITON_AVAILABLE
+except ImportError:
+    _TRITON_QUANTIZE_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
 # 1. Python reference implementation
 # ---------------------------------------------------------------------------
 
+
 def decompress_kv_python(
-    idx_all: torch.Tensor,          # (seq_len, head_dim) int8
-    qjl_bits: torch.Tensor,         # (seq_len, k) int8 — values are +1 or -1
-    gamma: torch.Tensor,            # (seq_len,) float32
-    Pi: torch.Tensor,               # (head_dim, head_dim) float32
-    S: torch.Tensor,                # (k, head_dim) float32
-    centroids_2bit: torch.Tensor,   # (4,) float32
-    centroids_3bit: torch.Tensor,   # (8,) float32
-    is_outlier: torch.Tensor,       # (head_dim,) bool
+    idx_all: torch.Tensor,  # (seq_len, head_dim) int8
+    qjl_bits: torch.Tensor,  # (seq_len, k) int8 — values are +1 or -1
+    gamma: torch.Tensor,  # (seq_len,) float32
+    Pi: torch.Tensor,  # (head_dim, head_dim) float32
+    S: torch.Tensor,  # (k, head_dim) float32
+    centroids_2bit: torch.Tensor,  # (4,) float32
+    centroids_3bit: torch.Tensor,  # (8,) float32
+    is_outlier: torch.Tensor,  # (head_dim,) bool
     target_dtype: torch.dtype = torch.float16,
+    use_qjl: bool = False,  # Whether to apply QJL correction
 ) -> torch.Tensor:
     """
-    Pure-PyTorch CPU reference for TurboQuant decompression.
+    GPU-optimized vectorized decompression using pure PyTorch operations.
+    NO Python for-loops - all operations run on GPU in parallel.
 
     Steps:
-      1. Centroid lookup: y_hat[:, j] = centroids_3bit[idx_all[:,j]] if is_outlier[j]
-                                        else centroids_2bit[idx_all[:,j]]
+      1. Centroid lookup (vectorized by channel type)
       2. x_mse = y_hat @ Pi
-         In row-vector convention, Π^T·ŷ (column-vector form) = ŷ @ Π (row-vector form)
-         Valid because Π is orthogonal: Π^T = Π^{-1}
-      3. correction = qjl_bits.float() @ S   shape: (seq_len, head_dim)
-      4. scale = sqrt(pi/2) / k
-      5. x_tilde = x_mse + scale * gamma[:,None] * correction
+      3. If use_qjl: correction = qjl_bits.float() @ S
+      4. If use_qjl: scale = sqrt(pi/2) / k
+      5. x_tilde = x_mse + (scale * gamma[:,None] * correction if use_qjl else 0)
+
+    Args:
+        use_qjl: If False (default), returns TurboQuant_mse (best MSE).
+                 If True, returns TurboQuant_prod (better inner products, worse MSE).
 
     Returns (seq_len, head_dim) in target_dtype.
     """
     seq_len, head_dim = idx_all.shape
     k = S.shape[0]
+    device = idx_all.device
 
     idx_long = idx_all.long()
+    normal_mask = ~is_outlier  # (head_dim,) bool
+    outlier_mask = is_outlier  # (head_dim,) bool
 
-    # Step 1: centroid lookup
-    y_hat = torch.zeros(seq_len, head_dim, dtype=torch.float32)
-    for j in range(head_dim):
-        if is_outlier[j]:
-            y_hat[:, j] = centroids_3bit[idx_long[:, j]]
-        else:
-            y_hat[:, j] = centroids_2bit[idx_long[:, j]]
+    # Step 1: Vectorized centroid lookup - NO PYTHON LOOPS
+    y_hat = torch.zeros(seq_len, head_dim, dtype=torch.float32, device=device)
 
-    # Step 2: x_mse = Pi^T * y_hat
+    # Normal channels (2-bit): use advanced indexing
+    if normal_mask.any():
+        idx_normal = idx_long[:, normal_mask]  # (seq_len, n_normal)
+        y_hat[:, normal_mask] = centroids_2bit[idx_normal]
+
+    # Outlier channels (3-bit): use advanced indexing
+    if outlier_mask.any():
+        idx_outlier = idx_long[:, outlier_mask]  # (seq_len, n_outlier)
+        y_hat[:, outlier_mask] = centroids_3bit[idx_outlier]
+
+    # Step 2: x_mse = y_hat @ Pi (GPU matrix multiply)
     x_mse = y_hat @ Pi
 
-    # Step 3: QJL correction
-    qjl_f = qjl_bits.float()                # (seq_len, k)
-    correction = qjl_f @ S                  # (seq_len, head_dim)
-
-    # Steps 4-5: scale and combine
-    scale = math.sqrt(math.pi / 2.0) / k
-    x_tilde = x_mse + scale * gamma.float().unsqueeze(-1) * correction
+    # Steps 3-5: Optional QJL correction
+    if use_qjl:
+        qjl_f = qjl_bits.float()  # (seq_len, k)
+        correction = qjl_f @ S  # (seq_len, head_dim)
+        scale = math.sqrt(math.pi / 2.0) / k
+        x_tilde = x_mse + scale * gamma.float().unsqueeze(-1) * correction
+    else:
+        x_tilde = x_mse
 
     return x_tilde.to(target_dtype)
+
+
+# ---------------------------------------------------------------------------
+# 1b. Hybrid implementation (PyTorch + Triton dequantize)
+# ---------------------------------------------------------------------------
+
+
+def decompress_kv_hybrid(
+    idx_all: torch.Tensor,  # (seq_len, head_dim) int8
+    qjl_bits: torch.Tensor,  # (seq_len, k) int8 — values are +1 or -1
+    gamma: torch.Tensor,  # (seq_len,) float32
+    Pi: torch.Tensor,  # (head_dim, head_dim) float32
+    S: torch.Tensor,  # (k, head_dim) float32
+    centroids_2bit: torch.Tensor,  # (4,) float32
+    centroids_3bit: torch.Tensor,  # (8,) float32
+    is_outlier: torch.Tensor,  # (head_dim,) bool
+    target_dtype: torch.dtype = torch.float16,
+    use_qjl: bool = False,  # Whether to apply QJL correction
+) -> torch.Tensor:
+    """
+    Hybrid implementation: PyTorch cuBLAS for matmuls, Triton for dequantization.
+
+    This avoids the tl.static_range(0, 128) loops that hang on sm_120.
+    Uses Triton for the centroid lookup (embarrassingly parallel) and
+    cuBLAS for the matrix operations (fast tensor cores).
+
+    Pipeline:
+      1. [Triton kernel]   y_hat = dequantize(idx)   (vectorized centroid lookup)
+      2. [PyTorch cuBLAS]  x_mse = y_hat @ Pi        (back-rotation)
+      3. [PyTorch cuBLAS]  If use_qjl: correction = qjl @ S (QJL correction)
+      4. [PyTorch]         x_tilde = x_mse + (scale * gamma * correction if use_qjl)
+
+    Args:
+        use_qjl: If False (default), returns TurboQuant_mse (best MSE).
+                 If True, returns TurboQuant_prod (better inner products, worse MSE).
+
+    Returns (seq_len, head_dim) in target_dtype.
+    """
+    if not _TRITON_QUANTIZE_AVAILABLE:
+        raise RuntimeError("Triton quantize kernels not available")
+
+    seq_len, head_dim = idx_all.shape
+    k = S.shape[0]
+
+    # 1. Triton dequantization (vectorized centroid lookup)
+    y_hat = triton_dequantize(idx_all, centroids_2bit, centroids_3bit, is_outlier)
+
+    # 2. Back-rotation: x_mse = y_hat @ Pi (cuBLAS)
+    x_mse = y_hat @ Pi  # (seq_len, head_dim)
+
+    # 3-4. Optional QJL correction
+    if use_qjl:
+        qjl_f = qjl_bits.float()  # (seq_len, k)
+        correction = qjl_f @ S  # (seq_len, head_dim)
+        scale = math.sqrt(math.pi / 2.0) / k
+        x_tilde = x_mse + scale * gamma.float().unsqueeze(-1) * correction
+    else:
+        x_tilde = x_mse
+
+    return x_tilde.to(target_dtype)
+
+
+def decompress_values_group_quant(
+    idx_all: torch.Tensor,
+    mins: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int = 32,
+    target_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """
+    Decompress Value vectors from per-group 4-bit min/max quantization.
+
+    Args:
+        idx_all:     (seq_len, head_dim) int8 indices in [0, 15]
+        mins:        (seq_len, n_groups) float32 group minima
+        scales:      (seq_len, n_groups) float32 group scales
+        group_size:  Number of channels per quantization group
+        target_dtype:Output dtype
+
+    Returns:
+        x_hat: (seq_len, head_dim) tensor in target_dtype.
+    """
+    if idx_all.ndim != 2:
+        raise ValueError(
+            f"idx_all must be 2D (seq_len, head_dim), got shape {idx_all.shape}"
+        )
+
+    seq_len, head_dim = idx_all.shape
+    if head_dim % group_size != 0:
+        raise ValueError(
+            f"head_dim ({head_dim}) must be divisible by group_size ({group_size})"
+        )
+
+    n_groups = head_dim // group_size
+    if mins.shape != (seq_len, n_groups):
+        raise ValueError(
+            f"mins shape must be ({seq_len}, {n_groups}), got {mins.shape}"
+        )
+    if scales.shape != (seq_len, n_groups):
+        raise ValueError(
+            f"scales shape must be ({seq_len}, {n_groups}), got {scales.shape}"
+        )
+
+    idx_grouped = idx_all.to(torch.float32).reshape(seq_len, n_groups, group_size)
+    x_hat = mins.unsqueeze(-1).float() + idx_grouped * scales.unsqueeze(-1).float()
+    return x_hat.reshape(seq_len, head_dim).to(target_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -90,17 +223,17 @@ if _TRITON_AVAILABLE:
     @triton.jit
     def _turboquant_decompress_fused(
         # Compressed inputs — read once per token
-        idx_all_ptr,       # (seq_len, head_dim) int8
-        qjl_ptr,           # (seq_len, k) int8  (values +1 or -1)
-        gamma_ptr,         # (seq_len,) float32
+        idx_all_ptr,  # (seq_len, head_dim) int8
+        qjl_ptr,  # (seq_len, k) int8  (values +1 or -1)
+        gamma_ptr,  # (seq_len,) float32
         # Random matrices and centroid tables
-        Pi_ptr,            # (head_dim, head_dim) float32, row-major
-        S_ptr,             # (k, head_dim) float32, row-major
-        is_outlier_ptr,    # (head_dim,) int8  (1 = outlier, 0 = normal)
-        c2_ptr,            # (4,) float32 — 2-bit centroids
-        c3_ptr,            # (8,) float32 — 3-bit centroids
+        Pi_ptr,  # (head_dim, head_dim) float32, row-major
+        S_ptr,  # (k, head_dim) float32, row-major
+        is_outlier_ptr,  # (head_dim,) int8  (1 = outlier, 0 = normal)
+        c2_ptr,  # (4,) float32 — 2-bit centroids
+        c3_ptr,  # (8,) float32 — 3-bit centroids
         # Output — written once per token
-        out_ptr,           # (seq_len, head_dim) float16
+        out_ptr,  # (seq_len, head_dim) float16
         # Compile-time constants
         head_dim: tl.constexpr,
         k: tl.constexpr,
@@ -155,18 +288,38 @@ if _TRITON_AVAILABLE:
                 is_out = tl.load(is_outlier_ptr + j)
 
                 # 2-bit lookup (4 levels)
-                val2 = tl.where(idx_j == 0, c2_0,
-                       tl.where(idx_j == 1, c2_1,
-                       tl.where(idx_j == 2, c2_2, c2_3)))
+                val2 = tl.where(
+                    idx_j == 0,
+                    c2_0,
+                    tl.where(idx_j == 1, c2_1, tl.where(idx_j == 2, c2_2, c2_3)),
+                )
 
                 # 3-bit lookup (8 levels)
-                val3 = tl.where(idx_j == 0, c3_0,
-                       tl.where(idx_j == 1, c3_1,
-                       tl.where(idx_j == 2, c3_2,
-                       tl.where(idx_j == 3, c3_3,
-                       tl.where(idx_j == 4, c3_4,
-                       tl.where(idx_j == 5, c3_5,
-                       tl.where(idx_j == 6, c3_6, c3_7)))))))
+                val3 = tl.where(
+                    idx_j == 0,
+                    c3_0,
+                    tl.where(
+                        idx_j == 1,
+                        c3_1,
+                        tl.where(
+                            idx_j == 2,
+                            c3_2,
+                            tl.where(
+                                idx_j == 3,
+                                c3_3,
+                                tl.where(
+                                    idx_j == 4,
+                                    c3_4,
+                                    tl.where(
+                                        idx_j == 5,
+                                        c3_5,
+                                        tl.where(idx_j == 6, c3_6, c3_7),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                )
 
                 chosen = tl.where(is_out != 0, val3, val2)
                 y_hat = tl.where(offs == j, chosen, y_hat)
@@ -206,6 +359,7 @@ if _TRITON_AVAILABLE:
 # ---------------------------------------------------------------------------
 # 3. Launcher
 # ---------------------------------------------------------------------------
+
 
 def triton_decompress_kv(
     idx_all: torch.Tensor,
@@ -248,11 +402,17 @@ def triton_decompress_kv(
         )
 
     if idx_all.device != Pi.device:
-        raise ValueError(f"idx_all device ({idx_all.device}) must match Pi device ({Pi.device})")
+        raise ValueError(
+            f"idx_all device ({idx_all.device}) must match Pi device ({Pi.device})"
+        )
     if qjl_bits.device != Pi.device:
-        raise ValueError(f"qjl_bits device ({qjl_bits.device}) must match Pi device ({Pi.device})")
+        raise ValueError(
+            f"qjl_bits device ({qjl_bits.device}) must match Pi device ({Pi.device})"
+        )
     if gamma.device != Pi.device:
-        raise ValueError(f"gamma device ({gamma.device}) must match Pi device ({Pi.device})")
+        raise ValueError(
+            f"gamma device ({gamma.device}) must match Pi device ({Pi.device})"
+        )
 
     seq_len, head_dim = idx_all.shape
     k = S.shape[0]

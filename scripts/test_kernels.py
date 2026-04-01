@@ -2,13 +2,33 @@
 Unit tests for TurboQuant compression/decompression kernels (Python reference).
 Run: pytest scripts/test_kernels.py -v
 """
+
 import pytest
 import torch
 import sys, os
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from utils.math_utils import generate_rotation_matrix, generate_qjl_matrix, get_centroids_2bit, get_centroids_3bit
-from kernels.compress_kv import compress_kv_python, build_outlier_mask
-from kernels.decompress_kv import decompress_kv_python
+from utils.math_utils import (
+    generate_rotation_matrix,
+    generate_qjl_matrix,
+    get_centroids_2bit,
+    get_centroids_3bit,
+)
+from kernels.compress_kv import (
+    compress_kv_python,
+    build_outlier_mask,
+    compress_values_group_quant,
+)
+from kernels.decompress_kv import (
+    decompress_kv_python,
+    decompress_values_group_quant,
+)
+from kernels.bitpack_triton import (
+    pack_4bit,
+    unpack_4bit,
+    pack_sign_bits,
+    unpack_sign_bits,
+)
 
 
 def test_build_outlier_mask_shape():
@@ -75,10 +95,14 @@ def test_compress_kv_python_idx_ranges():
     idx_all, qjl_bits, gamma = compress_kv_python(x, Pi, S, c2, c3, mask)
     # Normal channels: 4 levels (0-3)
     normal_idx = idx_all[:, ~mask]
-    assert (normal_idx >= 0).all() and (normal_idx <= 3).all(), "Normal channel indices out of [0,3]"
+    assert (normal_idx >= 0).all() and (normal_idx <= 3).all(), (
+        "Normal channel indices out of [0,3]"
+    )
     # Outlier channels: 8 levels (0-7)
     outlier_idx = idx_all[:, mask]
-    assert (outlier_idx >= 0).all() and (outlier_idx <= 7).all(), "Outlier channel indices out of [0,7]"
+    assert (outlier_idx >= 0).all() and (outlier_idx <= 7).all(), (
+        "Outlier channel indices out of [0,7]"
+    )
 
 
 def test_compress_qjl_bits_are_plus_minus_one():
@@ -93,7 +117,9 @@ def test_compress_qjl_bits_are_plus_minus_one():
     mask = build_outlier_mask(x)
     _, qjl_bits, _ = compress_kv_python(x, Pi, S, c2, c3, mask)
     unique_vals = qjl_bits.unique().tolist()
-    assert set(unique_vals).issubset({-1, 1}), f"qjl_bits contains unexpected values: {unique_vals}"
+    assert set(unique_vals).issubset({-1, 1}), (
+        f"qjl_bits contains unexpected values: {unique_vals}"
+    )
 
 
 def test_compress_gamma_positive():
@@ -126,7 +152,9 @@ def test_decompress_output_shape():
     x = x / x.norm(dim=-1, keepdim=True)
     mask = build_outlier_mask(x)
     idx_all, qjl_bits, gamma = compress_kv_python(x, Pi, S, c2, c3, mask)
-    x_hat = decompress_kv_python(idx_all, qjl_bits, gamma, Pi, S, c2, c3, mask, torch.float32)
+    x_hat = decompress_kv_python(
+        idx_all, qjl_bits, gamma, Pi, S, c2, c3, mask, torch.float32
+    )
     assert x_hat.shape == (seq, d)
     assert x_hat.dtype == torch.float32, f"Expected float32, got {x_hat.dtype}"
 
@@ -143,8 +171,10 @@ def test_roundtrip_mse():
     x = x / x.norm(dim=-1, keepdim=True)
     mask = build_outlier_mask(x)
     idx_all, qjl_bits, gamma = compress_kv_python(x, Pi, S, c2, c3, mask)
-    x_hat = decompress_kv_python(idx_all, qjl_bits, gamma, Pi, S, c2, c3, mask, torch.float32)
-    mse = ((x - x_hat)**2).mean().item()
+    x_hat = decompress_kv_python(
+        idx_all, qjl_bits, gamma, Pi, S, c2, c3, mask, torch.float32
+    )
+    mse = ((x - x_hat) ** 2).mean().item()
     assert mse < 0.01, f"Round-trip MSE too high: {mse}"
 
 
@@ -160,9 +190,65 @@ def test_inner_product_preservation():
     x = x / x.norm(dim=-1, keepdim=True)
     mask = build_outlier_mask(x)
     idx_all, qjl_bits, gamma = compress_kv_python(x, Pi, S, c2, c3, mask)
-    x_hat = decompress_kv_python(idx_all, qjl_bits, gamma, Pi, S, c2, c3, mask, torch.float32)
+    x_hat = decompress_kv_python(
+        idx_all, qjl_bits, gamma, Pi, S, c2, c3, mask, torch.float32
+    )
     ip_error = ((x @ x.T) - (x_hat @ x.T)).abs().mean().item()
     assert ip_error < 0.05, f"Inner product error too high: {ip_error}"
+
+
+def test_compress_values_group_quant_output_shapes():
+    seq, d, group_size = 10, 128, 32
+    x = torch.randn(seq, d)
+
+    idx_all, mins, scales = compress_values_group_quant(x, group_size=group_size)
+
+    assert idx_all.shape == (seq, d)
+    assert mins.shape == (seq, d // group_size)
+    assert scales.shape == (seq, d // group_size)
+    assert idx_all.dtype == torch.int8
+    assert mins.dtype == torch.float32
+    assert scales.dtype == torch.float32
+
+
+def test_values_group_quant_roundtrip_cosine_similarity():
+    seq, d, group_size = 64, 128, 32
+    torch.manual_seed(123)
+    # Values in real models tend to have compact dynamic ranges.
+    x = 0.5 * torch.randn(seq, d)
+
+    idx_all, mins, scales = compress_values_group_quant(x, group_size=group_size)
+    x_hat = decompress_values_group_quant(
+        idx_all,
+        mins,
+        scales,
+        group_size=group_size,
+        target_dtype=torch.float32,
+    )
+
+    cosine = torch.nn.functional.cosine_similarity(x, x_hat, dim=-1).mean().item()
+    assert cosine > 0.99, f"Value roundtrip cosine similarity too low: {cosine}"
+
+
+def test_bitpack_4bit_roundtrip():
+    torch.manual_seed(7)
+    idx = torch.randint(0, 16, (11, 129), dtype=torch.int8)
+    packed = pack_4bit(idx)
+    unpacked = unpack_4bit(packed, n_cols=idx.shape[1])
+    assert packed.dtype == torch.uint8
+    assert unpacked.dtype == torch.int8
+    assert torch.equal(idx, unpacked)
+
+
+def test_bitpack_sign_roundtrip():
+    torch.manual_seed(11)
+    bits = torch.randint(0, 2, (13, 257), dtype=torch.int8)
+    signs = torch.where(bits > 0, torch.ones_like(bits), -torch.ones_like(bits))
+    packed = pack_sign_bits(signs)
+    unpacked = unpack_sign_bits(packed, n_cols=signs.shape[1])
+    assert packed.dtype == torch.uint8
+    assert unpacked.dtype == torch.int8
+    assert torch.equal(signs, unpacked)
 
 
 # ---------------------------------------------------------------------------
@@ -171,10 +257,12 @@ def test_inner_product_preservation():
 
 from core.turboquant_cache import TurboQuantCache
 
+
 def test_cache_update_first_token():
     """cache.update() on first call returns correct shapes."""
-    cache = TurboQuantCache(head_dim=64, n_qjl=64, n_outliers=8,
-                             device=torch.device('cpu'))
+    cache = TurboQuantCache(
+        head_dim=64, n_qjl=64, n_outliers=8, device=torch.device("cpu")
+    )
     b, h, s, d = 1, 4, 8, 64
     k = torch.randn(b, h, s, d)
     v = torch.randn(b, h, s, d)
@@ -182,10 +270,12 @@ def test_cache_update_first_token():
     assert k_out.shape == (b, h, s, d)
     assert v_out.shape == (b, h, s, d)
 
+
 def test_cache_update_appends_tokens():
     """Second update appends new tokens and returns extended sequence."""
-    cache = TurboQuantCache(head_dim=64, n_qjl=64, n_outliers=8,
-                             device=torch.device('cpu'))
+    cache = TurboQuantCache(
+        head_dim=64, n_qjl=64, n_outliers=8, device=torch.device("cpu")
+    )
     b, h, s, d = 1, 4, 8, 64
     k = torch.randn(b, h, s, d)
     v = torch.randn(b, h, s, d)
@@ -197,35 +287,94 @@ def test_cache_update_appends_tokens():
     assert k_out.shape == (b, h, s + 1, d)
     assert v_out.shape == (b, h, s + 1, d)
 
+
 def test_cache_get_seq_length():
-    cache = TurboQuantCache(head_dim=64, n_qjl=64, n_outliers=8,
-                             device=torch.device('cpu'))
+    cache = TurboQuantCache(
+        head_dim=64, n_qjl=64, n_outliers=8, device=torch.device("cpu")
+    )
     assert cache.get_seq_length(layer_idx=0) == 0
     k = torch.randn(1, 4, 10, 64)
     v = torch.randn(1, 4, 10, 64)
     cache.update(k, v, layer_idx=0)
     assert cache.get_seq_length(layer_idx=0) == 10
 
+
 def test_cache_compression_ratio():
     """Compressed KV storage size should be tracked accurately."""
-    cache = TurboQuantCache(head_dim=64, n_qjl=64, n_outliers=8,
-                             device=torch.device('cpu'))
+    cache = TurboQuantCache(
+        head_dim=64,
+        n_qjl=64,
+        n_outliers=8,
+        device=torch.device("cpu"),
+        buffer_size=0,
+    )
     b, h, s, d = 1, 4, 16, 64
     k = torch.randn(b, h, s, d)
     v = torch.randn(b, h, s, d)
     cache.update(k, v, layer_idx=0)
     compressed = cache.compressed_size_bytes()
     fp16_size = b * h * s * d * 2 * 2  # keys + values, 2 bytes per fp16
-    # With actual int8 storage, compression ratio is ~0.97x due to overhead
-    # (idx_all + qjl_bits = 2 bytes per element, gamma = 0.25 bytes/element on average)
+    # With value group quantization, ratio should now be >1x even without bit-packing.
     ratio = fp16_size / compressed
-    assert 0.8 < ratio < 1.1, \
-        f"Compression size out of expected range: {ratio:.2f}x"
+    assert 1.0 < ratio < 1.5, f"Compression size out of expected range: {ratio:.2f}x"
+
+
+def test_cache_update_no_buffer_value_quality():
+    """Without buffer, value path should preserve vectors with high cosine similarity."""
+    cache = TurboQuantCache(
+        head_dim=64,
+        n_qjl=64,
+        n_outliers=8,
+        device=torch.device("cpu"),
+        buffer_size=0,
+        value_group_size=32,
+    )
+
+    b, h, s, d = 1, 4, 24, 64
+    k = torch.randn(b, h, s, d)
+    v = 0.5 * torch.randn(b, h, s, d)
+
+    _, v_out = cache.update(k, v, layer_idx=0)
+
+    v_flat = v.reshape(-1, d).float()
+    v_out_flat = v_out.reshape(-1, d).float()
+    cosine = (
+        torch.nn.functional.cosine_similarity(v_flat, v_out_flat, dim=-1).mean().item()
+    )
+
+    assert cosine > 0.99, f"Value cache cosine similarity too low: {cosine:.4f}"
+
+
+def test_cache_compression_ratio_with_bitpacking(monkeypatch):
+    """Bit-packing should improve stored-size ratio over unpacked baseline."""
+    import core.turboquant_cache as tqm
+
+    monkeypatch.setattr(tqm, "_USE_BITPACKING", True)
+
+    cache = TurboQuantCache(
+        head_dim=64,
+        n_qjl=64,
+        n_outliers=8,
+        device=torch.device("cpu"),
+        buffer_size=0,
+    )
+
+    b, h, s, d = 1, 4, 16, 64
+    k = torch.randn(b, h, s, d)
+    v = torch.randn(b, h, s, d)
+    cache.update(k, v, layer_idx=0)
+
+    compressed = cache.compressed_size_bytes()
+    fp16_size = b * h * s * d * 2 * 2
+    ratio = fp16_size / compressed
+    assert ratio > 1.8, f"Bit-packed ratio too low: {ratio:.2f}x"
+
 
 def test_cache_multiple_layers():
     """Each layer gets its own independent cache slot."""
-    cache = TurboQuantCache(head_dim=64, n_qjl=64, n_outliers=8,
-                             device=torch.device('cpu'))
+    cache = TurboQuantCache(
+        head_dim=64, n_qjl=64, n_outliers=8, device=torch.device("cpu")
+    )
     k = torch.randn(1, 4, 8, 64)
     v = torch.randn(1, 4, 8, 64)
     cache.update(k, v, layer_idx=0)
@@ -233,3 +382,51 @@ def test_cache_multiple_layers():
     assert cache.get_seq_length(layer_idx=0) == 8
     assert cache.get_seq_length(layer_idx=1) == 8
     assert cache.get_seq_length(layer_idx=2) == 0
+
+
+def test_cache_no_buffer_raw_keys_preserve_exactly():
+    """When key compression is disabled, keys should round-trip exactly."""
+    cache = TurboQuantCache(
+        head_dim=64,
+        n_qjl=64,
+        n_outliers=8,
+        device=torch.device("cpu"),
+        buffer_size=0,
+        compress_keys=False,
+    )
+
+    b, h, s, d = 1, 4, 12, 64
+    k = torch.randn(b, h, s, d, dtype=torch.float16)
+    v = torch.randn(b, h, s, d, dtype=torch.float16)
+
+    k_out, _ = cache.update(k, v, layer_idx=0)
+    assert torch.equal(k_out, k)
+
+
+def test_cache_raw_keys_storage_path_is_accounted():
+    """Disabling key compression should switch to tracked k_raw storage path."""
+    kwargs = dict(
+        head_dim=64,
+        n_qjl=64,
+        n_outliers=8,
+        device=torch.device("cpu"),
+        buffer_size=0,
+    )
+
+    b, h, s, d = 1, 4, 16, 64
+    k = torch.randn(b, h, s, d)
+    v = torch.randn(b, h, s, d)
+
+    compressed_cache = TurboQuantCache(**kwargs, compress_keys=True)
+    compressed_cache.update(k, v, layer_idx=0)
+    compressed_bytes = compressed_cache.compressed_size_bytes()
+
+    raw_key_cache = TurboQuantCache(**kwargs, compress_keys=False)
+    raw_key_cache.update(k, v, layer_idx=0)
+    raw_key_bytes = raw_key_cache.compressed_size_bytes()
+
+    # k_raw path stores fp16 keys directly and should be distinguishable.
+    assert raw_key_bytes != compressed_bytes
+
+    key_payload = raw_key_cache._compressed_keys[0]
+    assert key_payload[9] == "k_raw"
