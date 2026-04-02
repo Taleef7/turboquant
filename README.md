@@ -5,10 +5,11 @@
 [![Python](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-12.8%2B-76B900.svg)](https://pytorch.org/get-started/locally/)
 [![Scope](https://img.shields.io/badge/Validated-Qwen%2032K%20NIAH-success.svg)](TESTING_RESULTS.md)
+[![Repro](https://img.shields.io/badge/Repro-Checklist-blue.svg)](docs/REPLICATION_CHECKLIST.md)
 
 A from-scratch PyTorch implementation of **TurboQuant** ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) for KV-cache compression on consumer GPUs.
 
-> Reproducible, Qwen-focused TurboQuant replication with paired baseline-vs-TurboQuant NIAH validation through 32K.
+> Reproducible, Qwen-focused TurboQuant replication with paired baseline-vs-TurboQuant NIAH validation through 16K in the current release-check path.
 
 ## Why This Matters
 
@@ -64,6 +65,19 @@ Important scope note:
 - Full high-trial retrieval closure is currently **Qwen-focused**.
 - Mistral/Gemma retrieval checks are currently smoke-level and tracked as follow-up.
 
+## Claim Policy (Read This First)
+
+What this repo currently claims:
+- Reproducible paired baseline-vs-TurboQuant evaluation for Qwen.
+- Practical retrieval closure gate for the current release-check scope (through 16K).
+- Reproducible throughput/compression comparisons with provided scripts.
+
+What this repo does not claim yet:
+- Full benchmark parity with all paper/blog experiments (LongBench/RULER/vector-search).
+- Generalized low-bit near-lossless parity across all models and contexts.
+
+See `docs/PAPER_CLAIMS_STATUS.md` and `docs/PAPER_COMPARISON.md`.
+
 ## Bits: This Repo vs Original Research
 
 | Topic | Original paper/blog | This repo (current validated scope) |
@@ -114,6 +128,26 @@ huggingface-cli login
 ```
 
 ## Quickstart
+
+## Quick Verify (10-20 min)
+
+```bash
+source venv312/bin/activate
+python scripts/reproduce_release.py --mode quick --output-dir results/repro_quick
+```
+
+Outputs:
+- `results/repro_quick/repro_report.json`
+- `results/repro_quick/repro_report.md`
+
+## Full Verify (Qwen release-check path)
+
+```bash
+source venv312/bin/activate
+python scripts/reproduce_release.py --mode full --output-dir results/repro_full
+```
+
+`full` mode is currently pinned to Qwen paired NIAH through 16K with higher trials.
 
 ### 1) Environment
 
@@ -170,6 +204,8 @@ This command directly compares baseline and TurboQuant on identical prompts and 
 Expected outcome:
 - `Delta (baseline-tq)` at or under `2.0pp` for this matrix
 - Most recent observed run: `1.39pp`
+
+For current release-check scope, use the one-command `full` path above (16K) and the checklist in `docs/REPLICATION_CHECKLIST.md`.
 
 ### B) Multi-model completion benchmark
 
@@ -241,6 +277,8 @@ turboquant/
 - Paper: [TurboQuant (arXiv:2504.19874)](https://arxiv.org/abs/2504.19874)
 - Current implementation notes: `TESTING_RESULTS.md`, `UPDATED_PLAN.md`, `ISSUES.md`
 - Paper comparison mapping: `docs/PAPER_COMPARISON.md`
+- Claims status matrix: `docs/PAPER_CLAIMS_STATUS.md`
+- Replication checklist: `docs/REPLICATION_CHECKLIST.md`
 
 ## Release Summary
 

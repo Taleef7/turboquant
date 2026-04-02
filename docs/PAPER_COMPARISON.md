@@ -31,17 +31,17 @@ python scripts/test_long_context.py \
   --test niah \
   --mode paired \
   --model Qwen/Qwen2.5-7B-Instruct \
-  --max-context 32768 \
+  --max-context 16384 \
   --key-bits 8 \
   --value-bits 6 \
-  --buffer-size 16384 \
+  --buffer-size 12288 \
   --trials 6 \
-  --output-prefix .tmp/niah_qwen_k8_v6_b16384_ctx32k_t6
+  --output-prefix .tmp/niah_qwen_k8_v6_b12288_ctx16k_t6
 ```
 
 Outputs:
-- `.tmp/niah_qwen_k8_v6_b16384_ctx32k_t6.json`
-- `.tmp/niah_qwen_k8_v6_b16384_ctx32k_t6.csv`
+- `.tmp/niah_qwen_k8_v6_b12288_ctx16k_t6.json`
+- `.tmp/niah_qwen_k8_v6_b12288_ctx16k_t6.csv`
 
 Main metric:
 - `Delta (baseline-tq)` in percentage points (`<= 2.0pp` target for this project)
@@ -73,7 +73,7 @@ python scripts/test_multimodel.py --model gemma2-9b
 
 ## Important Differences vs Paper Setup
 
-- This repo currently emphasizes a practical Qwen-focused retrieval closure path through 32K (paired NIAH) rather than full paper benchmark parity.
+- This repo currently emphasizes a practical Qwen-focused retrieval closure path through 16K (paired NIAH) rather than full paper benchmark parity.
 - Paper reports include LongBench(-E), additional method comparisons, and explicit `TurboQuant_prod` analysis at low bit budgets.
 - Here, optional QJL path is present in code but not yet shown to outperform the MSE-first path in current NIAH measurements.
 
@@ -86,3 +86,7 @@ Recommended next additions:
 4. Optional ANN benchmark script for the paper's near-neighbor experiment style.
 
 Until those land, use this document as the source of truth for what is directly reproducible in this repository.
+
+Also see:
+- `docs/REPLICATION_CHECKLIST.md`
+- `docs/PAPER_CLAIMS_STATUS.md`

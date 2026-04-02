@@ -7,11 +7,45 @@ Measures tokens/second for generation with various prompt lengths.
 import torch
 import time
 import sys
+import argparse
+import json
+import subprocess
+from datetime import datetime, timezone
 
 sys.path.insert(0, "/home/taleef/projects/turboquant")
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from core.turboquant_cache_v2 import TurboQuantCacheV2
+
+
+def _git_commit_sha() -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+        )
+        return out.strip()
+    except Exception:
+        return "unknown"
+
+
+def _env_metadata() -> dict:
+    cuda_available = torch.cuda.is_available()
+    meta = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "git_commit": _git_commit_sha(),
+        "torch_version": torch.__version__,
+        "cuda_available": cuda_available,
+    }
+    if cuda_available:
+        props = torch.cuda.get_device_properties(0)
+        meta.update(
+            {
+                "gpu_name": props.name,
+                "gpu_vram_gb": round(props.total_memory / (1024**3), 2),
+                "cuda_runtime": torch.version.cuda,
+            }
+        )
+    return meta
 
 
 def benchmark_generation(
@@ -74,6 +108,17 @@ def benchmark_generation(
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Throughput benchmark: baseline vs TurboQuant"
+    )
+    parser.add_argument(
+        "--output-json",
+        type=str,
+        default="",
+        help="Optional path to write benchmark results JSON",
+    )
+    args = parser.parse_args()
+
     print("Loading Qwen/Qwen2.5-7B-Instruct...")
 
     bnb_config = BitsAndBytesConfig(
@@ -101,6 +146,8 @@ def main():
     print(f"\n{'=' * 70}")
     print(f"Throughput Benchmark: Generating {num_generate} tokens")
     print(f"{'=' * 70}\n")
+
+    result_rows = []
 
     for prompt_len in prompt_lengths:
         # Create prompt of target length
@@ -144,6 +191,18 @@ def main():
             f"  TurboQ-8b:  {tq8_throughput:6.2f} tok/s ({tq8_tokens} tokens in {tq8_time:.2f}s) [{speedup_8:.1f}% of baseline]"
         )
 
+        result_rows.append(
+            {
+                "prompt_tokens": int(actual_prompt_len),
+                "num_generate": int(num_generate),
+                "baseline_tok_per_s": float(baseline_throughput),
+                "turboquant_6bit_tok_per_s": float(tq6_throughput),
+                "turboquant_8bit_tok_per_s": float(tq8_throughput),
+                "turboquant_6bit_pct_of_baseline": float(speedup_6),
+                "turboquant_8bit_pct_of_baseline": float(speedup_8),
+            }
+        )
+
         print()
 
     # Memory usage comparison
@@ -180,6 +239,24 @@ def main():
     print(f"  Baseline KV cache:    {baseline_kv_mb:.1f} MB")
     print(f"  TurboQuant-6b cache:  {tq6_kv_mb:.1f} MB")
     print(f"  Compression ratio:    {compression_ratio:.2f}x")
+
+    if args.output_json:
+        payload = {
+            "metadata": _env_metadata(),
+            "model": "Qwen/Qwen2.5-7B-Instruct",
+            "prompt_lengths": prompt_lengths,
+            "num_generate": num_generate,
+            "results": result_rows,
+            "memory_estimate": {
+                "baseline_kv_mb": baseline_kv_mb,
+                "turboquant_6bit_kv_mb": tq6_kv_mb,
+                "compression_ratio": compression_ratio,
+                "assumed_seq_len": seq_len,
+            },
+        }
+        with open(args.output_json, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        print(f"\nWrote JSON results: {args.output_json}")
 
 
 if __name__ == "__main__":
