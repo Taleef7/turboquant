@@ -172,10 +172,10 @@ python -m pytest scripts/test_math.py scripts/test_kernels.py -v
 python scripts/run_baseline.py
 
 # TurboQuant (compressed KV cache)
-python scripts/run_turboquant.py
+python scripts/run_turboquant_v2.py
 
-# NIAH evaluation
-python scripts/eval_niah.py --both
+# NIAH paired baseline-vs-TurboQuant
+python scripts/test_long_context.py --test niah --mode paired --max-context 8192 --key-bits 8 --value-bits 6 --buffer-size 16384 --trials 2
 ```
 
 ---

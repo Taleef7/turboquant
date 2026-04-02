@@ -1,8 +1,29 @@
 # TurboQuant: KV Cache Compression for LLMs
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![arXiv](https://img.shields.io/badge/arXiv-2504.19874-b31b1b.svg)](https://arxiv.org/abs/2504.19874)
+[![Python](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-12.8%2B-76B900.svg)](https://pytorch.org/get-started/locally/)
+[![Scope](https://img.shields.io/badge/Validated-Qwen%2032K%20NIAH-success.svg)](TESTING_RESULTS.md)
 
 A from-scratch PyTorch implementation of **TurboQuant** ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) for KV-cache compression on consumer GPUs.
+
+> Reproducible, Qwen-focused TurboQuant replication with paired baseline-vs-TurboQuant NIAH validation through 32K.
+
+## Why This Matters
+
+Long-context inference is often limited by KV-cache memory and memory bandwidth, not raw compute.
+If you can shrink KV-cache without breaking quality, you can run longer contexts cheaper and faster.
+
+This project is a practical replication effort focused on that tradeoff.
+
+```text
+Without KV compression:
+  longer context -> much larger KV cache -> more VRAM pressure / memory traffic
+
+With TurboQuant-style KV compression:
+  longer context -> compressed KV cache -> lower memory footprint -> better practical scaling
+```
 
 ## What This Project Does
 
@@ -10,6 +31,25 @@ A from-scratch PyTorch implementation of **TurboQuant** ([arXiv:2504.19874](http
 - Preserves completion quality with compact settings (`6-bit` keys/values) for generation-heavy workloads.
 - Provides a retrieval-safe profile for long-context NIAH-style tasks.
 - Includes reproducible long-context paired evaluation tooling (`baseline` vs `TurboQuant` on identical prompts).
+
+## TurboQuant In One Diagram
+
+```text
+Input token stream
+      |
+      v
+Model computes K,V per layer/head
+      |
+      +--> Baseline cache: store fp16 K,V directly
+      |
+      +--> TurboQuant cache:
+             K: norm -> unit normalize -> random rotate -> Lloyd-Max quantize -> indices (+ optional QJL fields)
+             V: per-group min/max quantize -> indices + scales
+             keep recent window uncompressed (buffer)
+      |
+      v
+Attention step dequantizes on demand for logits/value mix
+```
 
 ## Current Validated Scope
 
@@ -24,6 +64,55 @@ Important scope note:
 - Full high-trial retrieval closure is currently **Qwen-focused**.
 - Mistral/Gemma retrieval checks are currently smoke-level and tracked as follow-up.
 
+## Bits: This Repo vs Original Research
+
+| Topic | Original paper/blog | This repo (current validated scope) |
+|---|---|---|
+| Key path concept | `TurboQuant_prod` uses MSE + 1-bit QJL residual correction | MSE-first path with optional QJL scaffolding |
+| Reported effective bit settings | Commonly highlighted around 2.5/3.5-bit variants in paper benchmarks | Completion default: key=6, value=6 |
+| Retrieval-safe operating point | paper reports near-lossless at lower effective bits in its setup | Qwen paired NIAH through 32K: key=8, value=6, buffer=16384 |
+| Practical note | Theory + specialized benchmark setup | Engineering-focused, reproducible commands/artifacts in this repo |
+
+For an explicit mapping of paper experiments to repo coverage, see `docs/PAPER_COMPARISON.md`.
+
+## Requirements (Step-by-Step)
+
+## 1) Hardware / runtime
+
+- NVIDIA GPU strongly recommended for full benchmarks.
+- For RTX 50-series Blackwell (`sm_120`), use PyTorch nightly `cu128` builds.
+- VRAM:
+  - ~12-16 GB: practical for current Qwen scope (through 32K paired tests may still be slow/heavy)
+  - higher VRAM helps for larger context and multi-model sweeps
+
+## 2) System dependencies
+
+- Python 3.12
+- `pip`
+- CUDA-compatible NVIDIA driver
+
+## 3) Python packages
+
+This repo uses `requirements.txt`:
+- `torch`
+- `transformers`
+- `triton`
+- `bitsandbytes`
+- `datasets`
+- `einops`
+- `accelerate`
+
+## 4) Hugging Face access (if needed)
+
+- Qwen and Mistral are generally accessible directly.
+- Llama-3.1 requires accepted model terms + auth token.
+- If you plan to run gated models:
+
+```bash
+pip install -U "huggingface_hub[cli]"
+huggingface-cli login
+```
+
 ## Quickstart
 
 ### 1) Environment
@@ -36,11 +125,20 @@ source venv312/bin/activate
 pip install -r requirements.txt
 ```
 
+If you are on RTX 50-series/Blackwell, install PyTorch nightly `cu128` first (then install requirements):
+
+```bash
+pip install --upgrade pip
+pip install torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+pip install -r requirements.txt
+```
+
 ### 2) Unit Tests (fast sanity)
 
 ```bash
 pytest scripts/test_math.py scripts/test_kernels.py -v
 pytest scripts/test_long_context_harness.py -q
+pytest scripts/test_cache_config.py scripts/test_qjl_config.py -q
 ```
 
 ### 3) Baseline and TurboQuant demos
@@ -67,6 +165,8 @@ python scripts/test_long_context.py \
   --output-prefix .tmp/niah_qwen_k8_v6_b16384_ctx32k_t6
 ```
 
+This command directly compares baseline and TurboQuant on identical prompts and writes reproducible artifacts.
+
 Expected outcome:
 - `Delta (baseline-tq)` at or under `2.0pp` for this matrix
 - Most recent observed run: `1.39pp`
@@ -80,6 +180,12 @@ python scripts/test_multimodel.py --model llama3.1-8b
 python scripts/test_multimodel.py --model gemma2-9b
 ```
 
+## C) Throughput baseline-vs-TurboQuant (Qwen)
+
+```bash
+python scripts/benchmark_throughput.py
+```
+
 ## Retrieval-Safe Configuration
 
 `configs/retrieval_profile.json` currently defines:
@@ -89,6 +195,19 @@ python scripts/test_multimodel.py --model gemma2-9b
 
 Tradeoff:
 - Larger `buffer_size` improves retrieval robustness but increases uncompressed cache memory.
+
+## What Is Compared Today (for users)
+
+- Baseline vs TurboQuant completion behavior
+- Baseline vs TurboQuant paired NIAH retrieval (`scripts/test_long_context.py --mode paired`)
+- Throughput baseline vs TurboQuant (`scripts/benchmark_throughput.py`)
+
+Not fully implemented yet for one-command parity with paper figures:
+- LongBench(-E) runner
+- RULER runner
+- full multi-method table generation (PQ/KIVI/etc.)
+
+Use `docs/PAPER_COMPARISON.md` to see exactly what is covered vs deferred.
 
 ## Project Layout
 

@@ -236,7 +236,7 @@ Throughput (TPS):  ~45.2 tok/s
 ### 2. TurboQuant Benchmark
 
 ```bash
-python scripts/run_turboquant.py
+python scripts/run_turboquant_v2.py
 ```
 
 Expected output:
@@ -251,11 +251,8 @@ Throughput (TPS):     ~38.5 tok/s
 ### 3. NIAH Evaluation
 
 ```bash
-# TurboQuant only
-python scripts/eval_niah.py
-
-# Compare baseline vs TurboQuant
-python scripts/eval_niah.py --both
+# Paired baseline vs TurboQuant retrieval check
+python scripts/test_long_context.py --test niah --mode paired --max-context 8192 --key-bits 8 --value-bits 6 --buffer-size 16384 --trials 2
 ```
 
 ---
@@ -378,8 +375,8 @@ source venv312/bin/activate
 - [ ] Python 3.12 installed in WSL2
 - [ ] Repository cloned to `/home/username/turboquant`
 - [ ] Virtual environment created and activated
-- [ ] PyTorch installed with CUDA 12.4
-- [ ] Triton installed (source compilation complete)
+- [ ] PyTorch installed with CUDA 12.8 nightly (for sm_120)
+- [ ] Triton installed
 - [ ] All dependencies installed from requirements.txt
 - [ ] Tests passing (25/25)
 - [ ] Benchmarks running successfully
