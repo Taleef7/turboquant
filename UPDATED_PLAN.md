@@ -72,11 +72,9 @@ VALUES: x → per-group min/max → quantize → indices + scales
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/test_6bit_keys.py` | Verify 6-bit quality with long prompts |
 | `scripts/benchmark_throughput.py` | Measure tok/s vs baseline |
-| `scripts/profile_ops.py` | Profile compress/decompress timing |
-| `scripts/validate_single_vector.py` | Single-vector MSE validation |
-| `scripts/validate_attention.py` | Attention score fidelity |
+| `scripts/test_long_context.py` | Paired NIAH retrieval validation |
+| `scripts/reproduce_release.py` | One-command repro (quick/full) |
 | `scripts/test_multimodel.py` | Multi-model benchmark (Qwen, Mistral, Llama, Gemma) |
 
 ---
@@ -124,14 +122,14 @@ Tested on all paper's benchmark models:
 cd /home/taleef/projects/turboquant
 source venv312/bin/activate
 
-# Quality test
-python scripts/test_6bit_keys.py
+# One-command reproducibility (quick)
+python scripts/reproduce_release.py --mode quick --output-dir results/repro_quick
+
+# One-command reproducibility (full release-check path)
+python scripts/reproduce_release.py --mode full --output-dir results/repro_full
 
 # Throughput benchmark
 python scripts/benchmark_throughput.py
-
-# Profile operations
-python scripts/profile_ops.py
 
 # Multi-model benchmark
 python scripts/test_multimodel.py --model qwen2.5-7b

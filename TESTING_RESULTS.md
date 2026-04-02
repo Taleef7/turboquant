@@ -251,8 +251,11 @@ outputs = model.generate(
 cd /home/taleef/projects/turboquant
 source venv312/bin/activate
 
-# Quality test (6-bit keys)
-python scripts/test_6bit_keys.py
+# Reproducibility quick check
+python scripts/reproduce_release.py --mode quick --output-dir results/repro_quick
+
+# Reproducibility full check (Qwen release-check scope)
+python scripts/reproduce_release.py --mode full --output-dir results/repro_full
 
 # Throughput benchmark (single model)
 python scripts/benchmark_throughput.py
