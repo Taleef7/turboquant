@@ -279,6 +279,8 @@ turboquant/
 - Paper comparison mapping: `docs/PAPER_COMPARISON.md`
 - Claims status matrix: `docs/PAPER_CLAIMS_STATUS.md`
 - Replication checklist: `docs/REPLICATION_CHECKLIST.md`
+- Contributor guide: `CONTRIBUTING.md`
+- Script index: `scripts/README.md`
 
 ## Release Summary
 
