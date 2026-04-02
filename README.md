@@ -2,67 +2,31 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A from-scratch PyTorch implementation of **TurboQuant** ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) for KV cache compression, targeting consumer GPUs.
+A from-scratch PyTorch implementation of **TurboQuant** ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) for KV-cache compression on consumer GPUs.
 
-TurboQuant achieves **5.2x compression** with **identical output quality** - no fine-tuning required.
+## What This Project Does
 
----
+- Compresses KV cache online during generation using a TurboQuant-style rotation + Lloyd-Max pipeline.
+- Preserves completion quality with compact settings (`6-bit` keys/values) for generation-heavy workloads.
+- Provides a retrieval-safe profile for long-context NIAH-style tasks.
+- Includes reproducible long-context paired evaluation tooling (`baseline` vs `TurboQuant` on identical prompts).
 
-## Results
+## Current Validated Scope
 
-**All targets exceeded:**
+- Compression: **5.2x** (target 4.5x)
+- Throughput: **61-84%** of baseline depending on model/prompt length
+- Completion quality: **matches baseline** in tested suites
+- Retrieval quality (Qwen2.5-7B): **NIAH gate met through 32K** with `retrieval-safe-v3`
+  - Gate: baseline-vs-TurboQuant delta `<= 2.0pp`
+  - Observed at 32K paired matrix (t6): **1.39pp**
 
-| Metric | Target | Achieved |
-|--------|--------|----------|
-| Compression Ratio | 4.5x | **5.2x** |
-| Output Quality | Identical | **Identical** (6-bit keys) |
-| Throughput | 80% baseline | **61-84%** (varies by model) |
-
-**Multi-model validation:**
-
-| Model | Quality | Throughput @ 500 tok |
-|-------|---------|---------------------|
-| Qwen2.5-7B-Instruct | Identical | 84% |
-| Mistral-7B-Instruct-v0.3 | Identical | 61% |
-| Llama-3.1-8B-Instruct | Identical | 78% |
-| Gemma-2-9B-IT | Identical | 81% |
-
-> Benchmarked on RTX 5070 Ti (16 GB), models loaded in 4-bit via bitsandbytes.
-
----
-
-## Algorithm
-
-TurboQuant uses **MSE-optimal Lloyd-Max quantization** with learned codebooks:
-
-```
-Keys:   x -> ||x|| (store) -> x/||x|| (normalize) -> rotate -> quantize (6-bit)
-Values: x -> per-group min/max quantization (8-bit)
-
-Decompress (just-in-time for attention):
-  keys:   indices -> dequantize -> inverse rotate -> scale by ||x||
-  values: indices -> scale by (max-min) + min
-```
-
-Key insight: **6-bit keys are required** for coherent generation at 500+ tokens. 4-bit causes quality degradation in long contexts.
-
----
-
-## Hardware Requirements
-
-| Component | Requirement |
-|-----------|-------------|
-| GPU VRAM  | >= 16 GB (RTX 4080/5070 Ti or better) |
-| RAM       | >= 32 GB system RAM |
-| CUDA      | >= 12.1 |
-
-> Models are loaded in **4-bit (NF4)** via bitsandbytes, consuming ~5 GB VRAM.
-
----
+Important scope note:
+- Full high-trial retrieval closure is currently **Qwen-focused**.
+- Mistral/Gemma retrieval checks are currently smoke-level and tracked as follow-up.
 
 ## Quickstart
 
-### 1. Setup environment
+### 1) Environment
 
 ```bash
 git clone https://github.com/Taleef7/turboquant.git
@@ -72,92 +36,102 @@ source venv312/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Run unit tests (CPU)
+### 2) Unit Tests (fast sanity)
 
 ```bash
 pytest scripts/test_math.py scripts/test_kernels.py -v
+pytest scripts/test_long_context_harness.py -q
 ```
 
-### 3. Run baseline benchmark (GPU)
+### 3) Baseline and TurboQuant demos
 
 ```bash
 python scripts/run_baseline.py
-```
-
-### 4. Run TurboQuant demo
-
-```bash
 python scripts/run_turboquant_v2.py
 ```
 
-### 5. Multi-model benchmark
+## Reproducing Key Claims
+
+### A) Qwen paired NIAH retrieval gate (through 32K)
 
 ```bash
-# Test specific model
+python scripts/test_long_context.py \
+  --test niah \
+  --mode paired \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --max-context 32768 \
+  --key-bits 8 \
+  --value-bits 6 \
+  --buffer-size 16384 \
+  --trials 6 \
+  --output-prefix .tmp/niah_qwen_k8_v6_b16384_ctx32k_t6
+```
+
+Expected outcome:
+- `Delta (baseline-tq)` at or under `2.0pp` for this matrix
+- Most recent observed run: `1.39pp`
+
+### B) Multi-model completion benchmark
+
+```bash
 python scripts/test_multimodel.py --model qwen2.5-7b
 python scripts/test_multimodel.py --model mistral-7b
-python scripts/test_multimodel.py --model llama3.1-8b  # Requires HF auth
+python scripts/test_multimodel.py --model llama3.1-8b
 python scripts/test_multimodel.py --model gemma2-9b
 ```
 
-### 6. Quality verification
+## Retrieval-Safe Configuration
 
-```bash
-python scripts/test_6bit_keys.py
-```
+`configs/retrieval_profile.json` currently defines:
+- `key_bits=8`
+- `value_bits=6`
+- `buffer_size=16384`
 
----
+Tradeoff:
+- Larger `buffer_size` improves retrieval robustness but increases uncompressed cache memory.
 
-## Project Structure
+## Project Layout
 
-```
+```text
 turboquant/
 ├── core/
-│   ├── turboquant_cache_v2.py   # Main cache class (6-bit keys, 8-bit values)
-│   └── turboquant_simple.py     # MSE-only quantizers
-├── kernels/
-│   ├── compress_kv.py           # Compression kernels
-│   ├── decompress_kv.py         # Decompression kernels
-│   └── quantize_triton.py       # Triton kernels (experimental)
-├── utils/
-│   └── math_utils.py            # Lloyd-Max codebook computation
-├── codebooks/                   # Precomputed codebooks
-│   ├── codebook_d128_b6.json    # 6-bit, head_dim=128 (most models)
-│   ├── codebook_d128_b8.json    # 8-bit, head_dim=128
-│   └── codebook_d256_b6.json    # 6-bit, head_dim=256 (Gemma-2)
+│   ├── turboquant_cache_v2.py      # Main DynamicCache integration
+│   └── turboquant_simple.py        # Quantizers (MSE path + optional QJL scaffolding)
+├── codebooks/                      # Precomputed Lloyd-Max codebooks
+├── configs/
+│   └── retrieval_profile.json      # Retrieval-safe profile
 ├── scripts/
-│   ├── test_multimodel.py       # Multi-model benchmark
-│   ├── benchmark_throughput.py  # Throughput measurement
-│   ├── test_6bit_keys.py        # Quality verification
-│   └── run_turboquant_v2.py     # Interactive demo
-├── UPDATED_PLAN.md              # Implementation plan
-├── TESTING_RESULTS.md           # Full test results
-└── PHASE2_RESULTS.md            # Key discoveries
+│   ├── test_long_context.py        # Paired NIAH harness
+│   ├── test_long_context_harness.py# Harness unit tests
+│   ├── test_multimodel.py          # Completion benchmark across models
+│   ├── run_baseline.py
+│   └── run_turboquant_v2.py
+├── ISSUES.md                       # Local issue/status tracker
+├── TESTING_RESULTS.md              # Detailed measured results
+└── UPDATED_PLAN.md                 # Current execution/status plan
 ```
 
----
+## Known Limits / Deferred Work
 
-## Key Discoveries
+- Retrieval closure beyond 32K (64K/128K) is optional/deferred for now.
+- Full multi-model retrieval closure with higher trial counts is pending.
+- QJL path is scaffolded but not yet shown to improve paired NIAH in current integration.
 
-1. **6-bit keys required for quality** - 4-bit keys cause garbled output for sequences > 500 tokens
-2. **QJL not needed** - MSE-only quantization achieves same quality with less overhead
-3. **Lloyd-Max codebooks** - Precomputed for Beta distribution on [-1, 1] after rotation
-4. **Model-specific throughput** - More layers = more cache ops = lower % of baseline
+## References
 
----
+- Paper: [TurboQuant (arXiv:2504.19874)](https://arxiv.org/abs/2504.19874)
+- Current implementation notes: `TESTING_RESULTS.md`, `UPDATED_PLAN.md`, `ISSUES.md`
+- Paper comparison mapping: `docs/PAPER_COMPARISON.md`
 
-## Citation
+## Release Summary
 
-```bibtex
-@article{zandieh2025turboquant,
-  title={TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate},
-  author={Zandieh, Amir and Daliri, Majid and Hadian, Majid and Mirrokni, Vahab},
-  journal={arXiv preprint arXiv:2504.19874},
-  year={2025}
-}
-```
+This release stabilizes a reproducible, user-runnable TurboQuant workflow with:
+- clear baseline-vs-TurboQuant paired retrieval evaluation,
+- a documented retrieval-safe configuration (`retrieval-safe-v3`),
+- synchronized docs/status files describing validated scope and remaining optional work.
 
----
+Practical outcome for current scope:
+- Qwen retrieval gate is closed through 32K with paired NIAH delta within target.
 
 ## License
 

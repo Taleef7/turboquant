@@ -1,7 +1,7 @@
 # TurboQuant Implementation — Testing Results
 
 **Date:** 2026-04-01 (Updated)  
-**Status:** ✓ Phase 5 Complete - All Targets Met, Multi-Model Verified  
+**Status:** ✅ Completion quality verified; retrieval gate closed through 32K on Qwen  
 **Hardware:** RTX 5070 Ti Laptop GPU (12.8GB VRAM, sm_120 Blackwell)  
 **Platform:** Ubuntu 24.04 (WSL2)  
 **PyTorch:** 2.12.0.dev20260330+cu128 (nightly)  
@@ -13,10 +13,60 @@
 
 | Metric | Target | Achieved | Status |
 |--------|--------|----------|--------|
-| Quality | Coherent output | ✅ 6-bit keys match baseline | ✅ |
+| Completion Quality | Coherent output | ✅ 6-bit matches baseline on completion suites | ✅ |
+| Retrieval Quality (NIAH) | <= 2pp delta vs baseline | ✅ 1.39pp through 32K (paired, t6) with retrieval-safe-v3 | ✅* |
 | Throughput (500+ tok) | ≥80% baseline | 67-81% | ✅ |
 | Compression | ≥4.5× | 5.2× | ✅ |
 | Multi-model | ≥2 models | **4 models tested** (Qwen, Mistral, Llama, Gemma) | ✅ |
+
+---
+
+## Retrieval Validation Update (Paired NIAH)
+
+Closure target: **baseline-vs-TurboQuant delta <= 2.0 percentage points**
+
+Paired harness improvements now in `scripts/test_long_context.py`:
+- baseline and TurboQuant run on identical prompts
+- deterministic needle generation
+- post-tokenization needle-presence checks
+- JSON/CSV output for reproducibility
+
+Latest measured profiles:
+
+| Profile | 4K | 8K | Delta vs baseline |
+|---------|----|----|-------------------|
+| key=6, value=6, buffer=128 | fail | fail | 100pp |
+| key=8, value=6, buffer=128 | pass | partial | 33.33pp |
+| key=8, value=6, buffer=1024 | pass | better | 16.67pp |
+| key=8, value=6, buffer=4096 (t6) | pass | partial | 5.56pp |
+| key=8, value=6, buffer=6912 (t6) | pass | partial | 5.56pp |
+| key=8, value=6, buffer=6976 (t6) | pass | pass | 0.00pp |
+| key=8, value=6, buffer=7168 (t6) | pass | pass | 0.00pp |
+
+Result: retrieval gate is met for paired 4K/8K/16K/32K matrix (6 seeds/depth) on Qwen2.5-7B with retrieval-safe-v3.
+
+8K threshold bracketing from current sweeps:
+- fail at `buffer_size=6912`
+- pass at `buffer_size>=6976`
+
+16K tuning check:
+- `buffer_size=8192`: TurboQuant 96.30%, baseline 100.00%, delta 3.70pp
+- `buffer_size=12288`: TurboQuant 100.00%, baseline 100.00%, delta 0.00pp
+
+32K tuning check:
+- `buffer_size=12288`: TurboQuant 91.67%, baseline 100.00%, delta 8.33pp
+- `buffer_size=16384`: TurboQuant 98.61%, baseline 100.00%, delta 1.39pp
+
+Conclusion: gate is closed through 32K for this profile.
+
+*Scope note: validated on Qwen2.5-7B paired NIAH matrix (4K/8K/16K/32K). Multi-model retrieval closure is intentionally deferred for current scope.
+
+Preliminary multi-model retrieval signal (low-impact run):
+- Mistral-7B, paired NIAH with retrieval-safe-v3 settings, contexts 4K/8K/16K, 1 seed/depth (9 eligible cases)
+- Baseline 100.00%, TurboQuant 100.00%, delta 0.00pp
+- Gemma-2-9B, paired NIAH with retrieval-safe-v3 settings, contexts 4K/8K, 1 seed/depth (6 eligible cases)
+- Baseline 100.00%, TurboQuant 100.00%, delta 0.00pp
+- This is a smoke signal only; full multi-model closure requires larger trial counts.
 
 ---
 

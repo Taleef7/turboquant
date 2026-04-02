@@ -2,10 +2,10 @@
 TurboQuantCache V2 - Simplified implementation using TurboQuantMSE.
 
 Key differences from v1:
-- No QJL (MSE-only quantization proven better for generation)
+- MSE-first quantization path with optional QJL scaffolding
 - Uses TurboQuantMSE from core/turboquant_simple.py
 - No outlier channels (uniform bit-width)
-- Much simpler codebase
+- Separate key/value bit configuration support
 
 Usage:
     cache = TurboQuantCacheV2(head_dim=128)
@@ -31,7 +31,7 @@ class TurboQuantCacheV2(DynamicCache):
 
     Args:
         head_dim: Dimension of each attention head (128 for Qwen2.5-7B).
-        bits: Quantization bit width (default 4).
+        bits: Quantization bit width fallback when key_bits/value_bits are not set.
         device: Device for tensors.
         dtype: Float dtype for decompressed output. Default float16.
         buffer_size: Number of recent tokens to keep uncompressed.
@@ -41,18 +41,30 @@ class TurboQuantCacheV2(DynamicCache):
         self,
         head_dim: int = 128,
         bits: int = 6,  # 6-bit keys required for quality with long contexts
+        key_bits: Optional[int] = None,
+        value_bits: Optional[int] = None,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float16,
+        key_norm_dtype: torch.dtype = torch.float16,
+        key_use_qjl: bool = False,
+        key_qjl_dim: Optional[int] = None,
+        key_qjl_seed: int = 12345,
         buffer_size: int = 128,
     ):
         super().__init__()
         self.head_dim = head_dim
         self.bits = bits
+        self.key_bits = key_bits if key_bits is not None else bits
+        self.value_bits = value_bits if value_bits is not None else bits
         self.buffer_size = buffer_size
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         self.dtype = dtype
+        self.key_norm_dtype = key_norm_dtype
+        self.key_use_qjl = key_use_qjl
+        self.key_qjl_dim = key_qjl_dim if key_qjl_dim is not None else head_dim
+        self.key_qjl_seed = key_qjl_seed
 
         # Per-layer quantizers (lazy init for layer-specific rotation matrices)
         self._key_quantizers: Dict[int, TurboQuantMSE] = {}
@@ -74,9 +86,13 @@ class TurboQuantCacheV2(DynamicCache):
             seed = 42 + layer_idx * 7
             self._key_quantizers[layer_idx] = TurboQuantMSE(
                 head_dim=self.head_dim,
-                bits=self.bits,
+                bits=self.key_bits,
                 seed=seed,
                 device=str(self.device),
+                norm_dtype=self.key_norm_dtype,
+                use_qjl=self.key_use_qjl,
+                qjl_dim=self.key_qjl_dim,
+                qjl_seed=self.key_qjl_seed + layer_idx,
             )
         return self._key_quantizers[layer_idx]
 
@@ -85,7 +101,7 @@ class TurboQuantCacheV2(DynamicCache):
         if layer_idx not in self._value_quantizers:
             self._value_quantizers[layer_idx] = TurboQuantValueMSE(
                 head_dim=self.head_dim,
-                bits=self.bits,
+                bits=self.value_bits,
                 device=str(self.device),
             )
         return self._value_quantizers[layer_idx]
@@ -147,6 +163,22 @@ class TurboQuantCacheV2(DynamicCache):
             new_norms = new_compressed["norms"].reshape(batch * heads, seq_new)
             merged_norms = torch.cat([old_norms, new_norms], dim=1).reshape(-1)
             result["norms"] = merged_norms.to(torch.float16)
+
+            if "qjl_bits" in existing and "qjl_bits" in new_compressed:
+                qjl_dim = existing["qjl_bits"].shape[-1]
+                old_qjl = existing["qjl_bits"].reshape(batch * heads, seq_old, qjl_dim)
+                new_qjl = new_compressed["qjl_bits"].reshape(
+                    batch * heads, seq_new, qjl_dim
+                )
+                result["qjl_bits"] = torch.cat([old_qjl, new_qjl], dim=1).reshape(
+                    -1, qjl_dim
+                )
+
+                old_gamma = existing["qjl_gamma"].reshape(batch * heads, seq_old)
+                new_gamma = new_compressed["qjl_gamma"].reshape(batch * heads, seq_new)
+                result["qjl_gamma"] = torch.cat([old_gamma, new_gamma], dim=1).reshape(
+                    -1
+                )
         else:
             # Values have mins/scales (from TurboQuantValueMSE)
             n_groups = existing["mins"].shape[-1]
@@ -328,6 +360,9 @@ class TurboQuantCacheV2(DynamicCache):
             if ck is not None:
                 total += ck["indices"].nelement()  # uint8
                 total += ck["norms"].nelement() * 2  # float16
+                if "qjl_bits" in ck:
+                    total += ck["qjl_bits"].nelement()  # int8
+                    total += ck["qjl_gamma"].nelement() * 2  # float16
             if cv is not None:
                 total += cv["indices"].nelement()  # uint8
                 # Values use mins/scales instead of norms

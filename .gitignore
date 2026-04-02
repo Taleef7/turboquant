@@ -38,3 +38,13 @@ Thumbs.db
 outputs/
 results/
 *.log
+
+# Local experiment artifacts
+.tmp/
+
+# Optional extra codebooks generated during experiments
+codebooks/codebook_d8_b*.json
+codebooks/codebook_d32_b*.json
+codebooks/codebook_d64_b*.json
+codebooks/codebook_d128_b2.json
+codebooks/codebook_d128_b3.json

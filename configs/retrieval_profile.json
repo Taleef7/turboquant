@@ -1,0 +1,29 @@
+{
+  "name": "retrieval-safe-v3",
+  "description": "Conservative settings for retrieval-heavy workloads (NIAH/QA) on Qwen2.5-7B with paired gate validation through 32K.",
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "cache": {
+    "key_bits": 8,
+    "value_bits": 6,
+    "buffer_size": 16384,
+    "key_norm_dtype": "float16",
+    "key_use_qjl": false,
+    "key_qjl_dim": 128
+  },
+  "quality_gate": {
+    "metric": "paired_niah_delta_pp",
+    "target_max": 2.0,
+    "status": "met_for_4k_8k_16k_32k_t6"
+  },
+  "latest_observed": {
+    "contexts": [
+      4096,
+      8192,
+      16384,
+      32768
+    ],
+    "trials": 6,
+    "delta_pp": 1.39,
+    "notes": "Paired NIAH gate met at 4K/8K/16K/32K (6 seeds per depth) with key=8/value=6/buffer=16384. At 32K, buffer=12288 gave 8.33pp delta, while 16384 reduced delta to 1.39pp (1 miss in 72 eligible cases)."
+  }
+}

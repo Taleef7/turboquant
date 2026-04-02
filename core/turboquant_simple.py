@@ -39,13 +39,25 @@ class TurboQuantMSE(nn.Module):
     """
 
     def __init__(
-        self, head_dim: int, bits: int = 4, seed: int = 42, device: str = "cuda"
+        self,
+        head_dim: int,
+        bits: int = 4,
+        seed: int = 42,
+        device: str = "cuda",
+        norm_dtype: torch.dtype = torch.float16,
+        use_qjl: bool = False,
+        qjl_dim: Optional[int] = None,
+        qjl_seed: int = 12345,
     ):
         super().__init__()
         self.head_dim = head_dim
         self.bits = bits
         self.n_levels = 2**bits
         self.device = device
+        self.norm_dtype = norm_dtype
+        self.use_qjl = use_qjl
+        self.qjl_dim = qjl_dim if qjl_dim is not None else head_dim
+        self.qjl_seed = qjl_seed
 
         # Rotation matrix
         self.register_buffer("Pi", generate_rotation_matrix(head_dim, seed, device))
@@ -56,6 +68,12 @@ class TurboQuantMSE(nn.Module):
         )
         self.register_buffer("centroids", centroids)
         self.register_buffer("boundaries", boundaries)
+
+        if self.use_qjl:
+            qjl_gen = torch.Generator(device="cpu")
+            qjl_gen.manual_seed(self.qjl_seed)
+            S = torch.randn(self.qjl_dim, self.head_dim, generator=qjl_gen)
+            self.register_buffer("S_qjl", S.to(device))
 
     @torch.no_grad()
     def compress(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -86,11 +104,27 @@ class TurboQuantMSE(nn.Module):
             self.boundaries[1:-1].contiguous(), rotated.contiguous()
         )
 
-        return {
+        result = {
             "indices": indices.to(torch.uint8),
-            "norms": norms.squeeze(-1).to(torch.float16),
+            "norms": norms.squeeze(-1).to(self.norm_dtype),
             "shape": orig_shape,
         }
+
+        if self.use_qjl:
+            values = self.centroids[indices.long()]
+            x_mse_unit = values @ self.Pi
+            residual_unit = x_unit - x_mse_unit
+            qjl_proj = residual_unit @ self.S_qjl.T
+            qjl_bits = torch.where(
+                qjl_proj >= 0,
+                torch.ones_like(qjl_proj, dtype=torch.int8),
+                -torch.ones_like(qjl_proj, dtype=torch.int8),
+            )
+            qjl_gamma = torch.norm(residual_unit, dim=-1)
+            result["qjl_bits"] = qjl_bits
+            result["qjl_gamma"] = qjl_gamma.to(self.norm_dtype)
+
+        return result
 
     @torch.no_grad()
     def decompress(self, compressed: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -112,6 +146,13 @@ class TurboQuantMSE(nn.Module):
 
         # 3. Rescale by stored norm
         result = unrotated * norms
+
+        if self.use_qjl and "qjl_bits" in compressed and "qjl_gamma" in compressed:
+            qjl_bits = compressed["qjl_bits"].float()
+            qjl_gamma = compressed["qjl_gamma"].float().unsqueeze(-1)
+            scale = (torch.pi / 2.0) ** 0.5 / self.qjl_dim
+            correction_unit = qjl_bits @ self.S_qjl
+            result = result + (scale * qjl_gamma * correction_unit) * norms
 
         return result.reshape(orig_shape)
 
