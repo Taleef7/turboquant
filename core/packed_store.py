@@ -237,6 +237,24 @@ class PackedKVBlockStore:
         """Iterate chronological compressed blocks without reconstructing history."""
         yield from self._blocks
 
+    @property
+    def key_codec(self) -> KeyCodec:
+        """Codec metadata required by the CPU-only reference attention path."""
+        return self._key_codec
+
+    @property
+    def value_codec(self) -> ValueCodec:
+        """Value codec metadata required by the CPU-only reference path."""
+        return self._value_codec
+
+    @property
+    def block_size(self) -> int:
+        return _BLOCK_SIZE
+
+    @property
+    def num_kv_heads(self) -> int | None:
+        return self._num_kv_heads
+
     def iter_fp16_window(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         """Yield the single unencoded tail (alignment tail plus recency window)."""
         if self._pending_keys is not None:

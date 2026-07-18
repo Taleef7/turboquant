@@ -20,6 +20,11 @@ from core.packed_store import (
 )
 from core.packing import pack_indices, pack_sign_bits, tensor_nbytes, unpack_indices, unpack_sign_bits
 from core.profiles import CacheImplementation, CompressionProfile, load_profile
+from core.reference_attention import (
+    ReferenceAttentionDebugState,
+    ReferenceAttentionLayout,
+    packed_reference_decode,
+)
 
 __all__ = [
     "CompressionProfile",
@@ -36,12 +41,15 @@ __all__ = [
     "PackedStoreRuntimeLayout",
     "PackedValuePayload",
     "PhysicalByteBreakdown",
+    "ReferenceAttentionDebugState",
+    "ReferenceAttentionLayout",
     "UnsupportedCapabilityError",
     "derive_model_capabilities",
     "create_packed_kv_block_store",
     "load_profile",
     "load_model_manifest",
     "pack_indices",
+    "packed_reference_decode",
     "pack_sign_bits",
     "require_direct_decode_support",
     "tensor_nbytes",
