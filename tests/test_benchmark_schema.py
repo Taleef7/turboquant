@@ -158,6 +158,47 @@ def test_quality_artifact_accepts_discrete_verified_needle_placement(depth: floa
     assert result.valid is True
 
 
+def test_quality_artifact_requires_the_exact_discrete_needle_placement():
+    matrix = complete_matrix()
+    row = matrix["rows"][0]
+    row["needle_depth_actual"] = 0.1005
+
+    result = validate_quality_artifact(matrix)
+
+    assert result.valid is False
+    assert any("discrete placement" in error for error in result.errors)
+
+    matrix = complete_matrix()
+    row = matrix["rows"][0]
+    row["filler_token_budget"] = 1
+    row["needle_depth_actual"] = 0.9
+
+    result = validate_quality_artifact(matrix)
+
+    assert result.valid is False
+    assert any("discrete placement" in error for error in result.errors)
+
+    matrix = complete_matrix()
+    row = matrix["rows"][0]
+    row["filler_token_budget"] = 3
+    row["needle_depth_actual"] = 0.0
+
+    result = validate_quality_artifact(matrix)
+
+    assert result.valid is True
+
+
+def test_quality_artifact_rejects_filler_budget_that_cannot_fit_in_the_input():
+    matrix = complete_matrix()
+    row = matrix["rows"][0]
+    row["filler_token_budget"] = row["context_actual"]
+
+    result = validate_quality_artifact(matrix)
+
+    assert result.valid is False
+    assert any("less than context_actual" in error for error in result.errors)
+
+
 @pytest.mark.parametrize(
     ("depth", "incorrect_depth"), ((0.1, 0.5), (0.5, 0.9), (0.9, 0.1))
 )

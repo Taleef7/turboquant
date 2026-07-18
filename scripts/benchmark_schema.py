@@ -241,12 +241,19 @@ def validate_quality_artifact(
         filler_budget = row.get("filler_token_budget")
         if type(filler_budget) is not int or filler_budget <= 0:
             errors.append(f"row {index} filler_token_budget must be a positive integer")
+        elif type(actual_context) is int and actual_context > 0 and filler_budget >= actual_context:
+            errors.append(
+                f"row {index} filler_token_budget must be less than context_actual"
+            )
         elif (
             isinstance(actual_depth, (int, float))
             and not isinstance(actual_depth, bool)
             and math.isfinite(actual_depth)
         ):
-            if abs(actual_depth - key[1]) > 1 / filler_budget:
+            expected_depth = round(filler_budget * key[1]) / filler_budget
+            if not math.isclose(
+                actual_depth, expected_depth, rel_tol=0.0, abs_tol=1e-12
+            ):
                 errors.append(
                     f"row {index} needle_depth_actual violates the discrete placement contract"
                 )
