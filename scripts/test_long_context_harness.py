@@ -103,6 +103,9 @@ def test_token_level_builder_keeps_exact_4k_and_8k_lengths_with_the_needle():
             assert metadata["input_token_count"] == context_tokens
             assert metadata["needle_present_after_tokenization"] is True
             assert metadata["needle_token_index"] >= 0
+            assert metadata["filler_token_budget"] == metadata["haystack_target_tokens"]
+            assert metadata["filler_token_budget"] > 0
+            assert metadata["construction_mode"] == "verified_token_ids"
             assert abs(metadata["needle_depth_actual"] - needle_depth) <= 1 / metadata["haystack_target_tokens"]
 
 

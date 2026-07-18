@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from scripts.benchmark_schema import (
     QualityMatrix,
     calculate_paired_bootstrap,
@@ -27,6 +29,9 @@ def _row(context: int, depth: float, seed: int) -> dict:
         "context_target": context,
         "context_actual": context,
         "depth": depth,
+        "needle_depth_actual": depth,
+        "filler_token_budget": 1000,
+        "construction_mode": "verified_token_ids",
         "trial_seed": seed,
         "status": "completed",
         "needle_present_after_tokenization": True,
@@ -136,3 +141,59 @@ def test_quality_artifact_requires_actual_context_length_for_every_row():
 
     assert result.valid is False
     assert any("context_actual" in error for error in result.errors)
+
+
+@pytest.mark.parametrize("depth", (0.1, 0.5, 0.9))
+def test_quality_artifact_accepts_discrete_verified_needle_placement(depth: float):
+    matrix = complete_matrix()
+    matrix["expected_matrix"]["depths"] = [depth]
+    for row in matrix["rows"]:
+        row["depth"] = depth
+        row["needle_depth_actual"] = round(row["filler_token_budget"] * depth) / row[
+            "filler_token_budget"
+        ]
+
+    result = validate_quality_artifact(matrix)
+
+    assert result.valid is True
+
+
+@pytest.mark.parametrize(
+    ("depth", "incorrect_depth"), ((0.1, 0.5), (0.5, 0.9), (0.9, 0.1))
+)
+def test_quality_artifact_rejects_missing_or_inconsistent_needle_placement_evidence(
+    depth: float, incorrect_depth: float
+):
+    matrix = complete_matrix()
+    matrix["expected_matrix"]["depths"] = [depth]
+    for candidate in matrix["rows"]:
+        candidate["depth"] = depth
+    row = matrix["rows"][0]
+    row["needle_depth_actual"] = incorrect_depth
+    row["construction_mode"] = "string_roundtrip"
+
+    result = validate_quality_artifact(matrix)
+
+    assert result.valid is False
+    assert any("needle_depth_actual" in error for error in result.errors)
+    assert any("construction_mode" in error for error in result.errors)
+
+    matrix = complete_matrix()
+    matrix["expected_matrix"]["depths"] = [depth]
+    for candidate in matrix["rows"]:
+        candidate["depth"] = depth
+    matrix["rows"][0]["filler_token_budget"] = 0
+    result = validate_quality_artifact(matrix)
+
+    assert result.valid is False
+    assert any("filler_token_budget" in error for error in result.errors)
+
+    matrix = complete_matrix()
+    matrix["expected_matrix"]["depths"] = [depth]
+    for candidate in matrix["rows"]:
+        candidate["depth"] = depth
+    matrix["rows"][0]["needle_depth_actual"] = float("nan")
+    result = validate_quality_artifact(matrix)
+
+    assert result.valid is False
+    assert any("finite" in error for error in result.errors)

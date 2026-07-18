@@ -57,6 +57,9 @@ class QualityRow:
     context_target: int
     context_actual: int
     depth: float
+    needle_depth_actual: float
+    filler_token_budget: int
+    construction_mode: str
     trial_seed: int
     status: str
     needle_present_after_tokenization: bool
@@ -71,6 +74,9 @@ class QualityRow:
             context_target=int(row["context_target"]),
             context_actual=int(row["context_actual"]),
             depth=float(row["depth"]),
+            needle_depth_actual=float(row["needle_depth_actual"]),
+            filler_token_budget=int(row["filler_token_budget"]),
+            construction_mode=str(row["construction_mode"]),
             trial_seed=int(row["trial_seed"]),
             status=str(row["status"]),
             needle_present_after_tokenization=bool(
@@ -222,6 +228,32 @@ def validate_quality_artifact(
                     f"row {index} context fidelity requires {minimum_context}-{key[0]} "
                     f"effective tokens for requested {key[0]}, got {actual_context}"
                 )
+        actual_depth = row.get("needle_depth_actual")
+        if (
+            not isinstance(actual_depth, (int, float))
+            or isinstance(actual_depth, bool)
+            or not math.isfinite(actual_depth)
+            or not 0.0 <= actual_depth <= 1.0
+        ):
+            errors.append(
+                f"row {index} needle_depth_actual must be finite and within [0, 1]"
+            )
+        filler_budget = row.get("filler_token_budget")
+        if type(filler_budget) is not int or filler_budget <= 0:
+            errors.append(f"row {index} filler_token_budget must be a positive integer")
+        elif (
+            isinstance(actual_depth, (int, float))
+            and not isinstance(actual_depth, bool)
+            and math.isfinite(actual_depth)
+        ):
+            if abs(actual_depth - key[1]) > 1 / filler_budget:
+                errors.append(
+                    f"row {index} needle_depth_actual violates the discrete placement contract"
+                )
+        if row.get("construction_mode") != "verified_token_ids":
+            errors.append(
+                f"row {index} construction_mode must be verified_token_ids"
+            )
         if row.get("status") != "completed":
             errors.append(f"row {index} status is not completed")
         if row.get("needle_present_after_tokenization") is not True:

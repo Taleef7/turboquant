@@ -185,9 +185,10 @@ Answer with just the code, nothing else.
         else before_needle / filler_budget,
         "input_token_count": len(input_ids),
         "truncated": False,
+        "filler_token_budget": filler_budget,
         "haystack_target_tokens": filler_budget,
         "attempts": 1,
-        "construction": "verified_token_ids",
+        "construction_mode": "verified_token_ids",
     }
     if len(input_ids) != context_tokens or needle_pos < 0:
         raise RuntimeError("NIAH token builder failed its exact-context invariant")
@@ -425,6 +426,9 @@ def run_niah_paired_test(
             "needle_present_after_tokenization"
         ],
         "needle_token_index": metadata["needle_token_index"],
+        "needle_depth_actual": metadata["needle_depth_actual"],
+        "filler_token_budget": metadata["filler_token_budget"],
+        "construction_mode": metadata["construction_mode"],
         "truncated": metadata["truncated"],
         "key_bits": key_bits,
         "value_bits": value_bits,
