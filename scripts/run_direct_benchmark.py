@@ -201,6 +201,7 @@ def main() -> None:
             for backend in BACKENDS:
                 trial = _run_once(model, profile, prompt, backend, args.decode_tokens)
                 trial["trial_index"] = trial_index
+                trial["context_tokens"] = args.prompt_tokens
                 artifact["trials"].append(trial)
         probe_contexts = [int(value) for value in args.probe_contexts.split(",") if value] if args.probe_contexts else [max(512, args.prompt_tokens // 2), args.prompt_tokens]
         probe_contexts = sorted(set(probe_contexts))

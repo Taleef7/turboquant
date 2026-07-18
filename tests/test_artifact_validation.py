@@ -13,7 +13,15 @@ from tests.test_benchmark_schema import _binding, complete_matrix
 def _qualified_report() -> dict:
     quality = complete_matrix()
     quality["status"] = "qualified"
+    quality["expected_matrix"]["contexts"] = [32768]
+    quality["rows"] = quality["rows"][:2]
+    for row in quality["rows"]:
+        row["context_target"] = 32768
+        row["context_actual"] = 32768
     systems = _systems_artifact()
+    systems["configuration"] = {"prompt_tokens": 32768}
+    for trial in systems["trials"]:
+        trial["context_tokens"] = 32768
     decision = {
         "preflight_valid": True, "eight_k_retrieval_safe": True,
         "eight_k_systems_valid": True, "eight_k_capacity_admitted": True,
@@ -268,8 +276,30 @@ def test_qualified_run_rejects_skipped_32k_bypass_and_bad_decision_reason():
     assert result.valid is False
     assert any("approved 32K decision" in error for error in result.errors)
     assert any("reason does not match" in error for error in result.errors)
-    assert any("32K child legs" in error for error in result.errors)
 
 
 def test_qualified_run_accepts_a_valid_approved_32k_ladder():
     assert validate_qualified_run(_qualified_report()).valid is True
+
+
+def test_qualified_run_rejects_labeled_but_non_32k_children_and_missing_attempted_legs():
+    report = _qualified_report()
+    report["legs"]["32k"]["quality"]["artifact"]["expected_matrix"]["contexts"] = [4096]
+    for row in report["legs"]["32k"]["quality"]["artifact"]["rows"]:
+        row["context_target"] = row["context_actual"] = 4096
+    report["legs"]["32k"]["systems"]["artifact"]["configuration"]["prompt_tokens"] = 4096
+    for trial in report["legs"]["32k"]["systems"]["artifact"]["trials"]:
+        trial["context_tokens"] = 4096
+
+    result = validate_qualified_run(report)
+
+    assert result.valid is False
+    assert any("context_target 32768" in error for error in result.errors)
+    assert any("prove 32768" in error for error in result.errors)
+
+    report = _qualified_report()
+    report["status"] = "failed"
+    report["legs"] = {}
+    result = validate_qualified_run(report)
+    assert result.valid is False
+    assert any("attempted 32K decision requires 32K child legs" in error for error in result.errors)
