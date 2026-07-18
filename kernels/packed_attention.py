@@ -55,6 +55,24 @@ class PackedAttentionBenchmarkDebug:
     timed_launches: int = 0
 
 
+@dataclass
+class PackedAttentionHotPathDebugState:
+    """Opt-in accounting for the prepared per-layer decode hot path.
+
+    Static validation intentionally performs the two GQA bound reductions once
+    during preparation.  A subsequent ``launch`` must not perform scalar
+    reductions or copy static constants to the device.
+    """
+
+    static_validation_passes: int = 0
+    static_validation_reductions: int = 0
+    hot_path_validation_reductions: int = 0
+    hot_path_device_constant_transfers: int = 0
+    rotation_launches: int = 0
+    packed_score_launches: int = 0
+    packed_value_launches: int = 0
+
+
 @dataclass(frozen=True)
 class PackedAttentionBlock:
     """One chronological, independently packed KV block for decode coordination."""
@@ -848,6 +866,255 @@ def prepare_packed_value_mix(
         head_dim,
         value_bits,
         group_size,
+        debug,
+    )
+
+
+@dataclass(frozen=True)
+class PreparedPackedAttentionDecode:
+    """Validated static packed layout for one Qwen attention layer.
+
+    The immutable packed blocks and their device-resident constants are
+    prepared outside token generation.  ``launch`` receives only the dynamic
+    query and bounded fp16 tail, and deliberately bypasses the public generic
+    helpers so their validation reductions cannot synchronize every block.
+    """
+
+    blocks: tuple[PackedAttentionBlock, ...]
+    rotation: torch.Tensor
+    gqa_mapping: torch.Tensor
+    gqa_mapping_long: torch.Tensor
+    heads: int
+    head_dim: int
+    num_kv_heads: int
+    scale: float
+    debug: PackedAttentionHotPathDebugState | None = None
+
+    def launch(
+        self,
+        query: torch.Tensor,
+        *,
+        fp16_window: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Run one decode token without revalidating static GPU inputs."""
+        if (
+            not isinstance(query, torch.Tensor)
+            or query.ndim != 3
+            or query.shape[0] != self.heads
+            or query.shape[-1] != self.head_dim
+            or query.dtype not in _FLOAT_DTYPES
+            or query.device != self.rotation.device
+        ):
+            raise ValueError("query must match the prepared heads, head_dim, dtype, and device.")
+        query_tokens = query.shape[1]
+        if query_tokens < 1:
+            raise ValueError("query must contain at least one token.")
+        rotated_query = torch.empty(
+            (self.heads, query_tokens, self.head_dim),
+            device=query.device,
+            dtype=torch.float32,
+        )
+        _rotate_query_kernel[(self.heads * query_tokens, triton.cdiv(self.head_dim, 32))](
+            query.contiguous(),
+            self.rotation,
+            rotated_query,
+            QUERY_TOKENS=query_tokens,
+            HEAD_DIM=self.head_dim,
+            BLOCK_OUT=32,
+        )
+        if self.debug is not None:
+            self.debug.rotation_launches += 1
+        state = (
+            torch.full(
+                (self.heads, query_tokens),
+                -torch.inf,
+                device=query.device,
+                dtype=torch.float32,
+            ),
+            torch.zeros((self.heads, query_tokens), device=query.device, dtype=torch.float32),
+            torch.zeros(
+                (self.heads, query_tokens, self.head_dim),
+                device=query.device,
+                dtype=torch.float32,
+            ),
+        )
+        saw_history = False
+        for block in self.blocks:
+            tokens = block.packed_keys.shape[1]
+            scores = torch.empty(
+                (self.heads, query_tokens, tokens),
+                device=query.device,
+                dtype=torch.float32,
+            )
+            grid = lambda meta: (
+                self.heads * query_tokens,
+                triton.cdiv(tokens, meta["BLOCK_T"]),
+            )
+            _packed_key_scores_kernel[grid](
+                rotated_query,
+                block.packed_keys,
+                block.key_codebook,
+                block.key_norms,
+                self.gqa_mapping,
+                scores,
+                QUERY_TOKENS=query_tokens,
+                TOKEN_COUNT=tokens,
+                PACKED_WIDTH=block.packed_keys.shape[-1],
+                HEAD_DIM=self.head_dim,
+                KEY_BITS=block.key_bits,
+                SCALE=self.scale,
+            )
+            old_max, old_denominator, old_numerator = state
+            new_max = torch.empty_like(old_max, dtype=torch.float32)
+            new_denominator = torch.empty_like(old_denominator, dtype=torch.float32)
+            new_numerator = torch.empty_like(old_numerator, dtype=torch.float32)
+            _online_state_kernel[(self.heads * query_tokens,)](
+                scores,
+                old_max,
+                old_denominator,
+                new_max,
+                new_denominator,
+                QUERY_TOKENS=query_tokens,
+                TOKEN_COUNT=tokens,
+            )
+            _packed_value_numerator_kernel[(self.heads * query_tokens, 1)](
+                scores,
+                block.packed_values,
+                block.value_mins,
+                block.value_scales,
+                self.gqa_mapping,
+                old_max,
+                old_numerator,
+                new_max,
+                new_numerator,
+                QUERY_TOKENS=query_tokens,
+                TOKEN_COUNT=tokens,
+                PACKED_WIDTH=block.packed_values.shape[-1],
+                HEAD_DIM=self.head_dim,
+                GROUP_SIZE=block.value_group_size,
+                VALUE_BITS=block.value_bits,
+            )
+            state = (new_max, new_denominator, new_numerator)
+            if self.debug is not None:
+                self.debug.packed_score_launches += 1
+                self.debug.packed_value_launches += 1
+            saw_history = True
+        if fp16_window is not None:
+            window_keys, window_values = fp16_window
+            if (
+                not isinstance(window_keys, torch.Tensor)
+                or not isinstance(window_values, torch.Tensor)
+                or window_keys.ndim != 3
+                or window_values.shape != window_keys.shape
+                or window_keys.shape[0] != self.num_kv_heads
+                or window_keys.shape[1] < 1
+                or window_keys.shape[-1] != self.head_dim
+                or window_keys.device != query.device
+                or window_values.device != query.device
+            ):
+                raise ValueError("fp16_window must match the prepared KV-head layout and device.")
+            mapped_keys = window_keys.float()[self.gqa_mapping_long]
+            mapped_values = window_values.float()[self.gqa_mapping_long]
+            window_scores = torch.einsum("hqd,htd->hqt", query.float(), mapped_keys)
+            window_scores = window_scores * self.scale
+            old_max, old_denominator, old_numerator = state
+            block_max = window_scores.max(dim=-1).values
+            new_max = torch.maximum(old_max, block_max)
+            old_scale = torch.where(
+                torch.isfinite(old_max),
+                torch.exp(old_max - new_max),
+                torch.zeros_like(old_max),
+            )
+            weights = torch.exp(window_scores - new_max.unsqueeze(-1))
+            state = (
+                new_max,
+                old_denominator * old_scale + weights.sum(dim=-1),
+                old_numerator * old_scale.unsqueeze(-1)
+                + torch.einsum("hqt,htd->hqd", weights, mapped_values),
+            )
+            saw_history = True
+        if not saw_history:
+            raise ValueError("cannot decode packed attention with no KV history.")
+        return (state[2] / state[1].unsqueeze(-1)).to(query.dtype)
+
+
+def prepare_packed_attention_decode(
+    blocks: Iterable[PackedAttentionBlock],
+    rotation: torch.Tensor,
+    gqa_mapping: torch.Tensor,
+    *,
+    num_kv_heads: int | None = None,
+    scale: float | None = None,
+    debug: PackedAttentionHotPathDebugState | None = None,
+) -> PreparedPackedAttentionDecode:
+    """Validate static CUDA state once for repeated one-layer decode launches."""
+    if not (_TRITON_AVAILABLE and isinstance(rotation, torch.Tensor) and rotation.is_cuda):
+        raise RuntimeError("prepared packed-attention decode requires CUDA and Triton.")
+    if rotation.ndim != 2 or rotation.shape[0] != rotation.shape[1]:
+        raise ValueError("rotation must have shape [head_dim, head_dim].")
+    if not isinstance(gqa_mapping, torch.Tensor) or gqa_mapping.ndim != 1:
+        raise ValueError("gqa_mapping must have shape [heads].")
+    if gqa_mapping.device != rotation.device:
+        raise ValueError("rotation and gqa_mapping must share a device.")
+    prepared_blocks = tuple(blocks)
+    head_dim = rotation.shape[0]
+    inferred_kv_heads = None
+    for block in prepared_blocks:
+        if not isinstance(block, PackedAttentionBlock):
+            raise TypeError("blocks must yield PackedAttentionBlock instances.")
+        _validate_bits(block.key_bits, "block.key_bits")
+        _validate_bits(block.value_bits, "block.value_bits")
+        _require_packed_tensor(block.packed_keys, "block.packed_keys")
+        _require_packed_tensor(block.packed_values, "block.packed_values")
+        kv_heads, tokens, key_width = block.packed_keys.shape
+        if inferred_kv_heads is None:
+            inferred_kv_heads = kv_heads
+        if (
+            kv_heads != inferred_kv_heads
+            or block.packed_values.shape[:2] != (kv_heads, tokens)
+            or key_width != math.ceil(head_dim * block.key_bits / 8)
+            or block.packed_values.shape[-1] != math.ceil(head_dim * block.value_bits / 8)
+            or block.key_norms.shape != (kv_heads, tokens)
+            or block.key_codebook.shape != (1 << block.key_bits,)
+            or block.value_mins.shape != (kv_heads, tokens, head_dim // block.value_group_size)
+            or block.value_scales.shape != block.value_mins.shape
+            or any(
+                tensor.device != rotation.device
+                for tensor in (
+                    block.packed_keys,
+                    block.key_norms,
+                    block.key_codebook,
+                    block.packed_values,
+                    block.value_mins,
+                    block.value_scales,
+                )
+            )
+        ):
+            raise ValueError("packed block layout does not match the prepared rotation/device.")
+    kv_heads = inferred_kv_heads if inferred_kv_heads is not None else num_kv_heads
+    if type(kv_heads) is not int or kv_heads < 1:
+        raise ValueError("num_kv_heads is required when preparing an empty block sequence.")
+    if num_kv_heads is not None and num_kv_heads != kv_heads:
+        raise ValueError("num_kv_heads does not match the packed block layout.")
+    if gqa_mapping.shape[0] < 1 or int(gqa_mapping.min()) < 0 or int(gqa_mapping.max()) >= kv_heads:
+        raise ValueError("gqa_mapping contains an invalid KV-head index.")
+    attention_scale = 1 / math.sqrt(head_dim) if scale is None else float(scale)
+    if not math.isfinite(attention_scale):
+        raise ValueError("scale must be finite.")
+    if debug is not None:
+        if not isinstance(debug, PackedAttentionHotPathDebugState):
+            raise TypeError("debug must be PackedAttentionHotPathDebugState or None.")
+        debug.static_validation_passes += 1
+        debug.static_validation_reductions += 2
+    return PreparedPackedAttentionDecode(
+        prepared_blocks,
+        rotation.float().contiguous(),
+        gqa_mapping.contiguous(),
+        gqa_mapping.to(dtype=torch.long).contiguous(),
+        gqa_mapping.shape[0],
+        head_dim,
+        kv_heads,
+        attention_scale,
         debug,
     )
 

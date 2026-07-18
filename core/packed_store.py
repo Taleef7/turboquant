@@ -238,6 +238,11 @@ class PackedKVBlockStore:
         yield from self._blocks
 
     @property
+    def block_count(self) -> int:
+        """Number of immutable packed blocks, without materializing an iterator."""
+        return len(self._blocks)
+
+    @property
     def key_codec(self) -> KeyCodec:
         """Codec metadata required by the CPU-only reference attention path."""
         return self._key_codec

@@ -44,6 +44,20 @@ class PackedAttentionMetrics:
     packed_reference_max_error: float | None = None
 
 
+@dataclass
+class _PreparedLayerDecode:
+    """Reusable device constants and static block views for one attention layer."""
+
+    device: torch.device
+    block_count: int
+    scale: float
+    rotation: torch.Tensor
+    key_codebook: torch.Tensor
+    gqa_mapping: torch.Tensor
+    prepared: Any
+    debug: Any
+
+
 def _attention_layers(model: object) -> list[object]:
     try:
         layers = model.model.layers
@@ -127,6 +141,7 @@ class PackedAttentionSession:
         self._token: object | None = None
         self._previous_implementation: object | None = None
         self._last_logits: torch.Tensor | None = None
+        self._prepared_layers: dict[int, _PreparedLayerDecode] = {}
         self.compare_packed_reference = False
         self.use_packed_reference_backend = False
 
@@ -207,6 +222,87 @@ class PackedAttentionSession:
         self._last_logits = result.logits
         return result
 
+    def _prepared_layer_decode(
+        self,
+        layer_idx: int,
+        store: object,
+        query: torch.Tensor,
+        *,
+        scale: float,
+    ) -> _PreparedLayerDecode:
+        """Prepare static CUDA inputs only when the layer gains a packed block."""
+        from kernels.packed_attention import (
+            PackedAttentionBlock,
+            PackedAttentionHotPathDebugState,
+            prepare_packed_attention_decode,
+        )
+
+        num_kv_heads = self.capabilities.num_key_value_heads or 0
+        gqa_groups = self.capabilities.num_key_value_groups
+        if num_kv_heads < 1 or gqa_groups is None or gqa_groups < 1:
+            raise UnsupportedCapabilityError(_UNSUPPORTED_LAYOUT)
+        block_count = store.block_count
+        cached = self._prepared_layers.get(layer_idx)
+        if cached is not None and (
+            cached.device == query.device
+            and cached.block_count == block_count
+            and cached.scale == scale
+        ):
+            return cached
+        if cached is not None and cached.device == query.device:
+            rotation = cached.rotation
+            key_codebook = cached.key_codebook
+            gqa_mapping = cached.gqa_mapping
+            debug = cached.debug
+        else:
+            rotation = store.key_codec._rotation.to(query.device, dtype=torch.float32)
+            key_codebook = store.key_codec._centroids.to(query.device, dtype=torch.float32)
+            gqa_mapping = (
+                torch.arange(query.shape[1], device=query.device, dtype=torch.int32)
+                // gqa_groups
+            )
+            debug = PackedAttentionHotPathDebugState()
+        blocks = tuple(
+            PackedAttentionBlock(
+                packed_keys=block.keys.indices.reshape(num_kv_heads, block.logical_tokens, -1),
+                key_norms=block.keys.norms.reshape(num_kv_heads, block.logical_tokens),
+                key_codebook=key_codebook,
+                key_bits=store.key_codec.layout.bits,
+                packed_values=block.values.indices.reshape(
+                    num_kv_heads, block.logical_tokens, -1
+                ),
+                value_mins=block.values.mins.reshape(
+                    num_kv_heads, block.logical_tokens, -1
+                ),
+                value_scales=block.values.scales.reshape(
+                    num_kv_heads, block.logical_tokens, -1
+                ),
+                value_bits=store.value_codec.layout.bits,
+                value_group_size=store.value_codec.layout.group_size,
+            )
+            for block in store.iter_blocks()
+        )
+        prepared = prepare_packed_attention_decode(
+            blocks,
+            rotation,
+            gqa_mapping,
+            num_kv_heads=num_kv_heads,
+            scale=scale,
+            debug=debug,
+        )
+        cached = _PreparedLayerDecode(
+            query.device,
+            block_count,
+            scale,
+            rotation,
+            key_codebook,
+            gqa_mapping,
+            prepared,
+            debug,
+        )
+        self._prepared_layers[layer_idx] = cached
+        return cached
+
     def packed_decode(self, module: object, query: torch.Tensor, *, scale: float | None) -> torch.Tensor:
         from kernels.packed_attention import PackedAttentionBlock, PackedAttentionDebugState, packed_attention_decode
 
@@ -231,32 +327,64 @@ class PackedAttentionSession:
             )
             self.metrics.packed_reference_decode_calls += 1
             return reference.transpose(1, 2).contiguous()
-        blocks = (
-            PackedAttentionBlock(
-                packed_keys=block.keys.indices.reshape(query.shape[1] // self.capabilities.num_key_value_groups, block.logical_tokens, -1),
-                key_norms=block.keys.norms.reshape(query.shape[1] // self.capabilities.num_key_value_groups, block.logical_tokens),
-                key_codebook=store.key_codec._centroids.to(query.device),
-                key_bits=store.key_codec.layout.bits,
-                packed_values=block.values.indices.reshape(query.shape[1] // self.capabilities.num_key_value_groups, block.logical_tokens, -1),
-                value_mins=block.values.mins.reshape(query.shape[1] // self.capabilities.num_key_value_groups, block.logical_tokens, -1),
-                value_scales=block.values.scales.reshape(query.shape[1] // self.capabilities.num_key_value_groups, block.logical_tokens, -1),
-                value_bits=store.value_codec.layout.bits,
-                value_group_size=store.value_codec.layout.group_size,
-            )
-            for block in store.iter_blocks()
-        )
         tail = next(store.iter_fp16_window(), None)
         window = None if tail is None else (tail[0].squeeze(0), tail[1].squeeze(0))
-        debug = PackedAttentionDebugState()
-        output = packed_attention_decode(
-            query.squeeze(0), blocks, store.key_codec._rotation.to(query.device),
-            torch.arange(query.shape[1], device=query.device, dtype=torch.int32)
-            // self.capabilities.num_key_value_groups,
-            scale=float(scale) if scale is not None else 1 / math.sqrt(query.shape[-1]),
-            fp16_window=window, debug=debug, allow_torch_fallback=not query.is_cuda,
-        )
+        attention_scale = float(scale) if scale is not None else 1 / math.sqrt(query.shape[-1])
+        if query.is_cuda:
+            prepared = self._prepared_layer_decode(
+                layer_idx, store, query, scale=attention_scale
+            )
+            output = prepared.prepared.launch(query.squeeze(0), fp16_window=window)
+            packed_blocks_consumed = prepared.block_count
+        else:
+            blocks = (
+                PackedAttentionBlock(
+                    packed_keys=block.keys.indices.reshape(
+                        query.shape[1] // self.capabilities.num_key_value_groups,
+                        block.logical_tokens,
+                        -1,
+                    ),
+                    key_norms=block.keys.norms.reshape(
+                        query.shape[1] // self.capabilities.num_key_value_groups,
+                        block.logical_tokens,
+                    ),
+                    key_codebook=store.key_codec._centroids.to(query.device),
+                    key_bits=store.key_codec.layout.bits,
+                    packed_values=block.values.indices.reshape(
+                        query.shape[1] // self.capabilities.num_key_value_groups,
+                        block.logical_tokens,
+                        -1,
+                    ),
+                    value_mins=block.values.mins.reshape(
+                        query.shape[1] // self.capabilities.num_key_value_groups,
+                        block.logical_tokens,
+                        -1,
+                    ),
+                    value_scales=block.values.scales.reshape(
+                        query.shape[1] // self.capabilities.num_key_value_groups,
+                        block.logical_tokens,
+                        -1,
+                    ),
+                    value_bits=store.value_codec.layout.bits,
+                    value_group_size=store.value_codec.layout.group_size,
+                )
+                for block in store.iter_blocks()
+            )
+            debug = PackedAttentionDebugState()
+            output = packed_attention_decode(
+                query.squeeze(0),
+                blocks,
+                store.key_codec._rotation.to(query.device),
+                torch.arange(query.shape[1], device=query.device, dtype=torch.int32)
+                // self.capabilities.num_key_value_groups,
+                scale=attention_scale,
+                fp16_window=window,
+                debug=debug,
+                allow_torch_fallback=True,
+            )
+            packed_blocks_consumed = debug.blocks_consumed
         self.metrics.packed_decode_calls += 1
-        self.metrics.packed_blocks_consumed += debug.blocks_consumed
+        self.metrics.packed_blocks_consumed += packed_blocks_consumed
         if self.compare_packed_reference:
             from core.reference_attention import ReferenceAttentionLayout, packed_reference_decode
 
