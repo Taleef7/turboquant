@@ -120,6 +120,8 @@ def test_large_fp16_window_is_chunked_to_the_block_temporary_bound() -> None:
         atol=2e-3,
     )
     assert debug.max_temporary_tokens <= 256
+    assert debug.max_rotated_key_tokens <= 256
+    assert debug.max_fp32_value_tokens <= 256
 
 
 def test_packed_key_fp32_reference_representation_is_explicit() -> None:

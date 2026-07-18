@@ -44,6 +44,8 @@ class ReferenceAttentionDebugState:
     max_decoded_tokens: int = 0
     max_temporary_tokens: int = 0
     max_temporary_elements: int = 0
+    max_rotated_key_tokens: int = 0
+    max_fp32_value_tokens: int = 0
 
     def observe(
         self, tokens: int, *, decoded: bool, block_size: int, elements: int
@@ -56,6 +58,27 @@ class ReferenceAttentionDebugState:
             raise AssertionError("reference attention segment exceeded one packed block.")
         if decoded:
             self.max_decoded_tokens = max(self.max_decoded_tokens, tokens)
+
+    def observe_prepared_segment(
+        self,
+        rotated_keys: torch.Tensor,
+        fp32_values: torch.Tensor,
+        *,
+        block_size: int,
+    ) -> None:
+        """Record the local rotation/cast temporaries before attention scoring."""
+        key_tokens = rotated_keys.shape[-2]
+        value_tokens = fp32_values.shape[-2]
+        if key_tokens != value_tokens:
+            raise AssertionError("prepared key and value segments must have equal length.")
+        self.observe(
+            key_tokens,
+            decoded=False,
+            block_size=block_size,
+            elements=max(rotated_keys.numel(), fp32_values.numel()),
+        )
+        self.max_rotated_key_tokens = max(self.max_rotated_key_tokens, key_tokens)
+        self.max_fp32_value_tokens = max(self.max_fp32_value_tokens, value_tokens)
 
 
 def _validate_request(
@@ -126,13 +149,8 @@ def packed_reference_decode(
         # It is storage state, not an attention segment.
         if tokens == 0:
             return
-        if debug is not None:
-            debug.observe(
-                tokens,
-                decoded=decoded,
-                block_size=store.block_size,
-                elements=max(rotated_keys.numel(), values.numel()),
-            )
+        if debug is not None and decoded:
+            debug.max_decoded_tokens = max(debug.max_decoded_tokens, tokens)
         query_by_kv_head = rotated_query.reshape(
             1,
             layout.num_key_value_heads,
@@ -183,41 +201,39 @@ def packed_reference_decode(
         running_max = new_max
         saw_history = True
 
-    def consume_in_block_chunks(
-        rotated_keys: torch.Tensor,
-        values: torch.Tensor,
-        key_norms: torch.Tensor | None,
+    def prepare_and_consume_in_block_chunks(
+        raw_keys: torch.Tensor,
+        raw_values: torch.Tensor,
         *,
         decoded: bool,
     ) -> None:
-        total_tokens = rotated_keys.shape[-2]
+        total_tokens = raw_keys.shape[-2]
         for start in range(0, total_tokens, store.block_size):
             stop = min(start + store.block_size, total_tokens)
-            segment_norms = None
-            if key_norms is not None:
-                segment_norms = key_norms.reshape(
-                    layout.num_key_value_heads, total_tokens
-                )[..., start:stop]
+            rotated_keys = store.key_codec.rotate_reference_vectors(
+                raw_keys[..., start:stop, :]
+            )
+            fp32_values = raw_values[..., start:stop, :].float()
+            if debug is not None:
+                debug.observe_prepared_segment(
+                    rotated_keys, fp32_values, block_size=store.block_size
+                )
             consume_segment(
-                rotated_keys[..., start:stop, :],
-                values[..., start:stop, :],
-                segment_norms,
+                rotated_keys,
+                fp32_values,
+                None,
                 decoded=decoded,
             )
 
     for block in store.iter_blocks():
         decoded_keys = block.keys.unpack_reference_fp32()
-        consume_in_block_chunks(
-            store.key_codec.rotate_reference_vectors(decoded_keys),
-            block.values.unpack_reference().float(),
-            None,
+        prepare_and_consume_in_block_chunks(
+            decoded_keys,
+            block.values.unpack_reference(),
             decoded=True,
         )
     for key_window, value_window in store.iter_fp16_window():
-        rotated_window = store.key_codec.rotate_reference_vectors(key_window)
-        consume_in_block_chunks(
-            rotated_window, value_window.float(), None, decoded=False
-        )
+        prepare_and_consume_in_block_chunks(key_window, value_window, decoded=False)
 
     if not saw_history:
         raise ValueError("cannot decode attention from an empty packed store.")
