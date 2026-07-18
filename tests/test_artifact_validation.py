@@ -10,6 +10,27 @@ from scripts.benchmark_schema import (
 from tests.test_benchmark_schema import _binding, complete_matrix
 
 
+def _qualified_report() -> dict:
+    quality = complete_matrix()
+    quality["status"] = "qualified"
+    systems = _systems_artifact()
+    decision = {
+        "preflight_valid": True, "eight_k_retrieval_safe": True,
+        "eight_k_systems_valid": True, "eight_k_capacity_admitted": True,
+        "status": "approved", "attempt_32k": True,
+        "reason": "preflight_and_8k_gate_passed",
+    }
+    return {
+        "artifact_type": "qualified_run", "schema_version": 1, "binding": _binding(),
+        "metadata": {"timestamp_utc": "2026-07-18T00:00:00+00:00", "git_commit": "a" * 40},
+        "mode": "qualified", "status": "qualified",
+        "quality": {"status": "qualified", "artifact": quality},
+        "systems": {"status": "completed", "artifact": systems},
+        "qualified_32k_decision": decision,
+        "legs": {"32k": {"quality": {"status": "qualified", "artifact": quality}, "systems": {"structurally_valid": True, "artifact": systems}}},
+    }
+
+
 def _systems_artifact() -> dict:
     return {
         "artifact_type": "systems_benchmark",
@@ -232,3 +253,23 @@ def test_qualified_run_rejects_unknown_top_level_git_commit():
 
     assert result.valid is False
     assert any("release metadata.git_commit" in error for error in result.errors)
+
+
+def test_qualified_run_rejects_skipped_32k_bypass_and_bad_decision_reason():
+    report = _qualified_report()
+    report["qualified_32k_decision"].update({
+        "eight_k_capacity_admitted": False, "status": "skipped",
+        "attempt_32k": False, "reason": "8k_systems_invalid_or_failed",
+    })
+    report["legs"] = {}
+
+    result = validate_qualified_run(report)
+
+    assert result.valid is False
+    assert any("approved 32K decision" in error for error in result.errors)
+    assert any("reason does not match" in error for error in result.errors)
+    assert any("32K child legs" in error for error in result.errors)
+
+
+def test_qualified_run_accepts_a_valid_approved_32k_ladder():
+    assert validate_qualified_run(_qualified_report()).valid is True

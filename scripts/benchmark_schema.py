@@ -477,6 +477,40 @@ def validate_qualified_run(
     for error in _validate_metadata(report.get("metadata")):
         errors.append(f"release {error}")
     errors.extend(_validate_binding(report.get("binding"), expected_binding))
+    decision = report.get("qualified_32k_decision")
+    requires_32k_decision = (
+        report.get("mode") == "qualified" or report.get("status") == "qualified"
+    )
+    if not isinstance(decision, Mapping):
+        if requires_32k_decision:
+            errors.append("qualified_32k_decision is required")
+    elif requires_32k_decision:
+        decision_inputs = (
+            "preflight_valid",
+            "eight_k_retrieval_safe",
+            "eight_k_systems_valid",
+            "eight_k_capacity_admitted",
+        )
+        if any(type(decision.get(key)) is not bool for key in decision_inputs):
+            errors.append("qualified_32k_decision must include boolean admission inputs")
+        else:
+            preflight, retrieval, systems, capacity = (
+                decision["preflight_valid"], decision["eight_k_retrieval_safe"],
+                decision["eight_k_systems_valid"], decision["eight_k_capacity_admitted"],
+            )
+            expected = (
+                ("skipped", False, "preflight_invalid") if not preflight else
+                ("skipped", False, "8k_retrieval_gate_failed") if not retrieval else
+                ("skipped", False, "8k_systems_invalid_or_failed") if not systems else
+                ("skipped", False, "8k_capacity_admission_failed") if not capacity else
+                ("approved", True, "preflight_and_8k_gate_passed")
+            )
+            if (decision.get("status"), decision.get("attempt_32k"), decision.get("reason")) != expected:
+                errors.append("qualified_32k_decision reason does not match admission inputs")
+        if report.get("status") == "qualified" and (
+            decision.get("status") != "approved" or decision.get("attempt_32k") is not True
+        ):
+            errors.append("qualified report requires an approved 32K decision")
     for name, validator, required_status in (("quality", validate_quality_artifact, "qualified"), ("systems", validate_systems_artifact, "completed")):
         child = report.get(name)
         if not isinstance(child, Mapping) or (report.get("status") == "qualified" and child.get("status") != required_status) or not isinstance(child.get("artifact"), Mapping):
@@ -485,6 +519,24 @@ def validate_qualified_run(
         result = validator(child["artifact"], report.get("binding"))
         if not result.valid:
             errors.extend(f"{name}: {error}" for error in result.errors)
+    if report.get("status") == "qualified":
+        leg = report.get("legs", {}).get("32k") if isinstance(report.get("legs"), Mapping) else None
+        if not isinstance(leg, Mapping):
+            errors.append("qualified report requires 32K child legs")
+        else:
+            quality_leg, systems_leg = leg.get("quality"), leg.get("systems")
+            if not isinstance(quality_leg, Mapping) or quality_leg.get("status") != "qualified" or not isinstance(quality_leg.get("artifact"), Mapping):
+                errors.append("qualified report requires a qualified 32K quality child")
+            else:
+                result = validate_quality_artifact(quality_leg["artifact"], report.get("binding"))
+                if not result.valid:
+                    errors.extend(f"32k quality: {error}" for error in result.errors)
+            if not isinstance(systems_leg, Mapping) or systems_leg.get("structurally_valid") is not True or not isinstance(systems_leg.get("artifact"), Mapping):
+                errors.append("qualified report requires a valid 32K systems child")
+            else:
+                result = validate_systems_artifact(systems_leg["artifact"], report.get("binding"))
+                if not result.valid:
+                    errors.extend(f"32k systems: {error}" for error in result.errors)
     if report.get("status") == "qualified" and errors:
         errors.append("qualified status cannot accompany invalid child artifacts")
     return ValidationResult(not errors, tuple(errors))

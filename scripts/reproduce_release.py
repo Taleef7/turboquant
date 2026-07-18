@@ -26,15 +26,21 @@ def qualified_ladder_decision(
     eight_k_capacity_admitted: bool = False,
 ) -> dict:
     """Return the persisted, mechanical decision for the 32K qualified leg."""
+    inputs = {
+        "preflight_valid": preflight_valid,
+        "eight_k_retrieval_safe": eight_k_retrieval_safe,
+        "eight_k_systems_valid": eight_k_systems_valid,
+        "eight_k_capacity_admitted": eight_k_capacity_admitted,
+    }
     if not preflight_valid:
-        return {"status": "skipped", "attempt_32k": False, "reason": "preflight_invalid"}
+        return {**inputs, "status": "skipped", "attempt_32k": False, "reason": "preflight_invalid"}
     if not eight_k_retrieval_safe:
-        return {"status": "skipped", "attempt_32k": False, "reason": "8k_retrieval_gate_failed"}
+        return {**inputs, "status": "skipped", "attempt_32k": False, "reason": "8k_retrieval_gate_failed"}
     if not eight_k_systems_valid:
-        return {"status": "skipped", "attempt_32k": False, "reason": "8k_systems_invalid_or_failed"}
+        return {**inputs, "status": "skipped", "attempt_32k": False, "reason": "8k_systems_invalid_or_failed"}
     if not eight_k_capacity_admitted:
-        return {"status": "skipped", "attempt_32k": False, "reason": "8k_capacity_admission_failed"}
-    return {"status": "approved", "attempt_32k": True, "reason": "preflight_and_8k_gate_passed"}
+        return {**inputs, "status": "skipped", "attempt_32k": False, "reason": "8k_capacity_admission_failed"}
+    return {**inputs, "status": "approved", "attempt_32k": True, "reason": "preflight_and_8k_gate_passed"}
 
 
 def estimate_qualified_capacity(artifact: dict, *, target_context: int, source_context: int) -> dict:
@@ -145,7 +151,7 @@ def main() -> None:
 
     if mode == "quick":
         quality, systems, quality_status, safe, bootstrap = _run_leg(output_dir, "8k", quality_mode="quick", systems_context=8192)
-        status = "qualified" if quality_status == "qualified" and systems["structurally_valid"] else ("invalid" if quality_status == "invalid" or not systems["structurally_valid"] else "failed")
+        status = "inconclusive" if quality_status == "qualified" and systems["structurally_valid"] else ("invalid" if quality_status == "invalid" or not systems["structurally_valid"] else "failed")
         preflight = {"status": "not_requested", "attempt_32k": False}
         ladder = {"status": "not_requested", "attempt_32k": False}
         legs = {"8k": {"quality": quality, "systems": systems, "quality_status": quality_status}}
