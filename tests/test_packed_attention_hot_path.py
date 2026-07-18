@@ -17,6 +17,7 @@ from core.reference_attention import ReferenceAttentionLayout, packed_reference_
 from kernels.packed_attention import (
     PackedAttentionBlock,
     PackedAttentionHotPathDebugState,
+    PreparedPackedAttentionDecode,
     prepare_packed_attention_decode,
 )
 
@@ -113,12 +114,24 @@ def test_prepared_decode_rotates_once_without_hot_path_syncs_or_constant_copies(
             raise AssertionError("prepared launch converted a CUDA tensor to a Python int")
         return original_int(tensor)
 
-    monkeypatch.setattr(torch.Tensor, "to", reject_static_constant_transfer)
-    monkeypatch.setattr(torch.Tensor, "item", reject_cuda_scalar_conversion)
-    monkeypatch.setattr(torch.Tensor, "__int__", reject_cuda_int_conversion)
-    actual = prepared.launch(query, fp16_window=tail)
+    def reject_residency_verification(_: PreparedPackedAttentionDecode) -> None:
+        raise AssertionError("prepared launch must not scan static constants")
+
+    with monkeypatch.context() as guarded:
+        guarded.setattr(torch.Tensor, "to", reject_static_constant_transfer)
+        guarded.setattr(torch.Tensor, "item", reject_cuda_scalar_conversion)
+        guarded.setattr(torch.Tensor, "__int__", reject_cuda_int_conversion)
+        guarded.setattr(
+            PreparedPackedAttentionDecode,
+            "verify_static_constants_resident",
+            reject_residency_verification,
+            raising=False,
+        )
+        actual = prepared.launch(query, fp16_window=tail)
 
     assert debug.static_validation_reductions == 2
+    assert debug.constant_residency_checks == 0
+    prepared.verify_static_constants_resident()
     assert debug.constant_residency_checks == 1
     assert debug.rotation_launches == 1
     assert debug.packed_score_launches == len(blocks)
@@ -170,7 +183,9 @@ def test_qwen_layer_reuses_prepared_device_constants_between_decode_tokens() -> 
     assert cached.rotation.is_cuda and cached.key_codebook.is_cuda
     assert cached.gqa_mapping.is_cuda
     assert cached.debug.static_validation_reductions == 2
-    assert cached.debug.constant_residency_checks == 2
+    assert cached.debug.constant_residency_checks == 0
+    cached.prepared.verify_static_constants_resident()
+    assert cached.debug.constant_residency_checks == 1
     assert cached.debug.rotation_launches == 2
     torch.testing.assert_close(second, first, rtol=3e-3, atol=3e-3)
 

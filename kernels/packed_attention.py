@@ -891,8 +891,12 @@ class PreparedPackedAttentionDecode:
     static_constant_device: torch.device
     debug: PackedAttentionHotPathDebugState | None = None
 
-    def _assert_static_constants_resident(self) -> None:
-        """Reject a mutated prepared plan before entering its unchecked kernels."""
+    def verify_static_constants_resident(self) -> None:
+        """Explicitly verify a prepared plan's immutable device constants.
+
+        This is a test/debug operation.  It deliberately stays out of
+        :meth:`launch`, whose per-token setup must not scan every packed block.
+        """
         constants = (
             self.rotation,
             self.gqa_mapping,
@@ -918,7 +922,6 @@ class PreparedPackedAttentionDecode:
         fp16_window: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Run one decode token without revalidating static GPU inputs."""
-        self._assert_static_constants_resident()
         if (
             not isinstance(query, torch.Tensor)
             or query.ndim != 3
