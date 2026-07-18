@@ -22,12 +22,20 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from core.profiles import load_profile
 from core.qwen_adapter import install_qwen25_packed_backend
-from scripts.repro_utils import benchmark_binding, capture_env_metadata, git_commit_sha, write_json, write_markdown
+from scripts.repro_utils import (
+    PINNED_QWEN25_HUB_REVISION,
+    PINNED_QWEN25_MODEL_ID,
+    benchmark_binding,
+    capture_env_metadata,
+    git_commit_sha,
+    write_json,
+    write_markdown,
+)
 
 
 BACKENDS = ("baseline", "packed_reference", "triton_direct")
-MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
-MODEL_REVISION = "a09a35458c702b33eeacc393d103063234e8bc28"
+MODEL_ID = PINNED_QWEN25_MODEL_ID
+MODEL_REVISION = PINNED_QWEN25_HUB_REVISION
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -157,6 +165,11 @@ def main() -> None:
             print(message, file=captured, flush=True)
     emit(f"systems runner started: prompt_tokens={args.prompt_tokens} probe_contexts={args.probe_contexts or 'default'}")
     profile = load_profile(ROOT / "configs/profiles/qwen25-7b-direct-v1.json")
+    if (profile.revision.model_id, profile.revision.revision) != (
+        MODEL_ID,
+        MODEL_REVISION,
+    ):
+        raise RuntimeError("direct benchmark profile does not bind the pinned Hub revision")
     artifact = {
         "artifact_type": "systems_benchmark", "schema_version": 1,
         "binding": benchmark_binding(ROOT), "status": "inconclusive",

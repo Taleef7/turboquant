@@ -68,9 +68,9 @@ python scripts/reproduce_release.py --mode qualified --output-dir artifacts/repr
 
 Inspect the timestamped `repro_report.json`, `quality`/`systems` JSON files,
 persisted 32K decision, and stdout/stderr logs. The qualified command returns
-nonzero unless all gates pass. The current checked evidence is a failed quality
-result, so reproducing that current profile should retain failure evidence—not
-produce a success claim.
+nonzero unless all gates pass. The retained checked evidence is invalid under
+the current context/provenance contract, so a fresh run must not inherit its
+diagnostic outcomes as a success claim.
 
 ## 6. Interpret before publishing
 

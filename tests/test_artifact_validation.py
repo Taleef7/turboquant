@@ -16,7 +16,10 @@ def _systems_artifact() -> dict:
         "schema_version": 1,
         "binding": _binding(),
         "status": "completed",
-        "metadata": {"timestamp_utc": "2026-07-18T00:00:00+00:00", "git_commit": "test"},
+        "metadata": {
+            "timestamp_utc": "2026-07-18T00:00:00+00:00",
+            "git_commit": "a" * 40,
+        },
         "expected_backends": ["baseline", "packed_reference", "triton_direct"],
         "trials": [
             {
@@ -24,8 +27,14 @@ def _systems_artifact() -> dict:
                 "status": "completed",
                 "oom": False,
                 "exception": None,
-                "actual_store_bytes": 123,
-                "physical_bytes": {"keys": 1, "values": 2, "metadata": 3},
+                "actual_store_bytes": 6 if backend != "baseline" else 0,
+                "physical_bytes": {
+                    "keys": 1 if backend != "baseline" else 0,
+                    "values": 2 if backend != "baseline" else 0,
+                    "metadata": 3 if backend != "baseline" else 0,
+                    "fp16_window": 0,
+                    "padding": 0,
+                },
                 "max_memory_allocated": 4,
                 "max_memory_reserved": 5,
                 "prefill_ms": 6.0,
@@ -34,7 +43,15 @@ def _systems_artifact() -> dict:
                 "decode_p50_ms": 8.5,
                 "decode_p95_ms": 8.95,
                 "decode_tokens_per_second": 120.0,
-                "dispatch_counts": {"attention": 1},
+                "dispatch_counts": (
+                    {"standard_attention": 1}
+                    if backend == "baseline"
+                    else {
+                        "triton_direct": 1 if backend == "triton_direct" else 0,
+                        "packed_reference": 1 if backend == "packed_reference" else 0,
+                        "packed_blocks_consumed": 1 if backend == "triton_direct" else 0,
+                    }
+                ),
             }
             for backend in ["baseline", "packed_reference", "triton_direct"]
         ],
@@ -123,6 +140,37 @@ def test_systems_validator_rejects_oom_boundary_without_probe_outcomes():
     assert any("probes" in error for error in result.errors)
 
 
+def test_systems_validator_rejects_fake_direct_dispatch_and_byte_mismatch():
+    artifact = _systems_artifact()
+    direct = next(trial for trial in artifact["trials"] if trial["backend"] == "triton_direct")
+    reference = next(
+        trial for trial in artifact["trials"] if trial["backend"] == "packed_reference"
+    )
+    direct["dispatch_counts"]["triton_direct"] = 0
+    direct["dispatch_counts"]["packed_reference"] = 1
+    direct["dispatch_counts"]["packed_blocks_consumed"] = 0
+    direct["actual_store_bytes"] = 7
+    reference["dispatch_counts"]["triton_direct"] = 1
+
+    result = validate_systems_artifact(artifact)
+
+    assert result.valid is False
+    assert any("triton_direct dispatches" in error for error in result.errors)
+    assert any("packed_reference dispatches" in error for error in result.errors)
+    assert any("packed_blocks_consumed" in error for error in result.errors)
+    assert any("actual_store_bytes" in error for error in result.errors)
+
+
+def test_validator_rejects_unknown_git_commit_for_evidence():
+    matrix = complete_matrix()
+    matrix["metadata"]["git_commit"] = "unknown"
+
+    result = validate_artifact(matrix)
+
+    assert result.valid is False
+    assert any("git_commit" in error for error in result.errors)
+
+
 def test_qualified_run_cannot_pass_when_child_is_missing_or_invalid():
     report = {
         "artifact_type": "qualified_run",
@@ -138,3 +186,24 @@ def test_qualified_run_cannot_pass_when_child_is_missing_or_invalid():
 
     assert result.valid is False
     assert any("systems" in error for error in result.errors)
+
+
+def test_qualified_run_rejects_unknown_top_level_git_commit():
+    report = {
+        "artifact_type": "qualified_run",
+        "schema_version": 1,
+        "binding": _binding(),
+        "metadata": {
+            "timestamp_utc": "2026-07-18T00:00:00+00:00",
+            "git_commit": "unknown",
+        },
+        "mode": "qualified",
+        "status": "qualified",
+        "quality": {"status": "qualified", "artifact": complete_matrix()},
+        "systems": {"status": "completed", "artifact": _systems_artifact()},
+    }
+
+    result = validate_qualified_run(report)
+
+    assert result.valid is False
+    assert any("release metadata.git_commit" in error for error in result.errors)

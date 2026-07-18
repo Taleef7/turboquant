@@ -1,65 +1,66 @@
 # Forge Evidence Results
 
-## Current result: not qualified
+## Current result: invalid, not qualified
 
 **Raw artifact ID:** `qualified-v4/20260718T053419Z-unknown`
 **Raw local path:** `artifacts/qualified-v4/20260718T053419Z-unknown`
-**Release status:** `failed`
+**Raw report status:** `failed`
+**Current validation status: `invalid`**
 
-Raw artifacts are ignored by Git. Reproduce them with:
+Raw artifacts are ignored by Git. Reproduce a fresh evidence ladder with:
 
 ```bash
 python scripts/reproduce_release.py --mode qualified --output-dir artifacts/repro_qualified
 ```
 
-The command exits nonzero when the profile is not qualified, while preserving
-the JSON, CSV, Markdown, and child-process logs needed to inspect the result.
+The command exits nonzero whenever any context, provenance, quality, systems,
+or capacity gate fails, while preserving the JSON, CSV, Markdown, and child
+process logs needed to inspect the result.
 
-## Quality outcome
+## Why the retained artifact is invalid
 
-The quality artifact is structurally complete: contexts 4K/8K × depths
-0.1/0.5/0.9 × seeds 0/1, all completed and tokenization-preserving. It reports:
+The raw quality rows requested 4K/8K contexts, but their actual model input
+lengths were 3,656/3,659 and **7751/7754** tokens. The current contract defines
+`context_target` as requested model-input tokens and `context_actual` as the
+post-tokenization input length. It requires at least 99% fidelity: 4,056 tokens
+for a 4K row and 8,111 tokens for an 8K row. Every retained row is below that
+floor.
 
-> Complete 4K-8K matrix: baseline 12/12; direct profile 0/12
->
-> Exact 8K subset: baseline 6/6; direct profile 0/6
+The raw artifact also records `git_commit: unknown` and lacks the current Hub
+identity binding fields. It therefore cannot validate against the profile,
+model revision, and source set that produced a qualified result.
 
-The paired delta and the deterministic upper 95% bootstrap bound are both 100
-percentage points. The retrieval-safety threshold is an upper bound no greater
-than two percentage points, so this direct profile is **not retrieval-safe**.
+Its recorded diagnostic outcomes—baseline 12/12 and direct profile 0/12 across
+the underfilled rows—are **not a qualified 8K result** and cannot support a
+retrieval, memory, or throughput claim. The retained evidence is **not retrieval-safe**.
 
-## Systems outcome
+## Systems observation
 
-The systems artifact completed a baseline, packed-reference, and Triton-direct
-trial at 8K. The direct entry recorded physical packed-store bytes, allocator
-peaks, timing distributions, and dispatch counters. It demonstrates that the
-direct path runs and consumes packed blocks; it does not establish a performance
-or memory win. Exact values and category breakdowns are in the raw artifact
-under `8k-systems.json`.
-
-The 8K-calibrated capacity decision estimates 12,809,961,472 bytes for 32K
-against a 10,405,439,078-byte safety budget. Capacity admission therefore fails.
+The raw systems JSON recorded baseline, packed-reference, and Triton-direct
+trials with physical-store, allocator, timing, and dispatch fields. It remains
+useful for debugging, but it is invalid under the corrected commit/binding
+contract. Do not quote its bytes, peak memory, latency, or decode rate as a
+result claim.
 
 ## 32K outcome
 
-**32K: skipped.** The persisted decision reason is
-`8k_retrieval_gate_failed`; the calibrated capacity admission also fails. No
-32K child benchmark was launched and no 32K success claim exists.
+**32K: skipped.** The raw report persisted
+`8k_retrieval_gate_failed`; the old calibrated capacity admission also failed.
+No 32K child benchmark was launched. An invalid predecessor cannot turn that
+skip into a 32K qualification.
 
-## Model smoke and kernel correctness
+## Correctness evidence that remains separate
 
-The real-model Qwen2.5 smoke test covered a 1K prefill plus 64-token decode and
-passed its direct/reference token agreement, finite-logit, packed-block, and
-historical-concatenation checks. The maximum emitted fp16-logit drift was
-`16.935546875`. That smoke is a dispatch/correctness diagnostic—not a substitute
-for the failed retrieval matrix.
+The real-model Qwen2.5 smoke test covers a 1K prefill plus 64-token decode and
+checks direct/reference token agreement, finite logits, packed-block
+consumption, and absence of historical concatenation. The GPU parity suites
+compare direct packed kernels with the packed PyTorch reference, including the
+exact Qwen profile shape. These are implementation-correctness diagnostics, not
+substitutes for a qualified retrieval artifact.
 
-The GPU parity suite compares direct packed kernel outputs with the packed
-PyTorch reference. It validates kernel mechanics, not model-level quality.
+## What a future qualified result requires
 
-## How to use this result
-
-Treat this artifact as a baseline for profile improvement and regression tests.
-Do not use it to claim retrieval safety, a speedup, reduced end-to-end memory,
-or portability to another model family. The release becomes qualified only when
-the protocol's quality, systems, capacity, and validator gates all pass.
+A future artifact must use the pinned Hub revision, resolved Git commit, full
+source/profile/codebook binding, context-fidelity-compliant rows, direct
+Triton dispatch provenance, physical-byte consistency, and every declared
+quality/systems/capacity gate. See [BENCHMARK_PROTOCOL.md](BENCHMARK_PROTOCOL.md).

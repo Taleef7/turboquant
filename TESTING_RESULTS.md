@@ -1,8 +1,8 @@
 # TurboQuant Forge — Testing Results
 
-**Evidence status:** the latest qualified release attempt failed its quality
-gate. This document supersedes historical prototype summaries; it does not
-promote a failed artifact into a successful result.
+**Evidence status:** the latest retained release attempt is invalid under the
+current artifact contract. This document supersedes historical prototype
+summaries; it does not promote an invalid artifact into a successful result.
 
 ## Evidence sources
 
@@ -26,28 +26,27 @@ the available identifiers for this run.
 
 | Field | Value |
 | --- | --- |
-| Release status | `failed` |
-| Quality status | `failed` |
-| Systems status | `completed` and structurally valid |
-| Retrieval-safe | `false` |
-| 32K decision | `skipped` (`8k_retrieval_gate_failed`) |
+| Raw report status | `failed` (recorded before the strengthened contract) |
+| Current validation status | `invalid` |
+| Quality artifact | Invalid: effective inputs miss the required context fidelity floor and the commit/binding is incomplete. |
+| Systems artifact | Invalid: the commit/binding is incomplete under the current contract. |
+| 32K decision | `skipped` in the raw report; not a qualification outcome. |
 
 ### Quality gate
 
-The complete 4K-8K quality matrix has 12 completed, tokenization-preserving
-cases: contexts 4K and 8K; depths 0.1, 0.5, and 0.9; seeds 0 and 1. Across that
-complete matrix, the result is **baseline 12/12, direct profile 0/12**. The
-exact 8K subset is **baseline 6/6, direct profile 0/6**. The paired delta and
-deterministic bootstrap upper 95% bound are both 100 percentage points. The
-profile is therefore **not retrieval-safe** under the protocol's
-two-percentage-point upper-bound gate.
+The raw rows requested 4K and 8K, but their effective model input lengths are
+3,656/3,659 and 7,751/7,754 tokens, respectively. The contract requires at
+least 99% of each requested context (4,056 for 4K and 8,111 for 8K), so the
+matrix is invalid rather than a valid 4K-8K evaluation. Its recorded diagnostic
+outcomes were baseline 12/12 and direct profile 0/12 across those underfilled
+rows, but those outcomes are **not a qualified 8K result** or a retrieval claim.
 
 This is useful negative evidence: the harness caught a model-level quality
 regression that kernel parity and a short decode smoke cannot detect.
 
 ### Systems observation, not a win claim
 
-The 8K systems artifact completed one interleaved trial for baseline,
+The raw systems artifact recorded one interleaved trial for baseline,
 packed-reference, and Triton-direct backends. Its direct trial reported:
 
 | Measurement | Artifact value |
@@ -60,13 +59,13 @@ packed-reference, and Triton-direct backends. Its direct trial reported:
 | Direct dispatches | 1,792 |
 | Packed blocks consumed | 55,552 |
 
-These are measurements from the named raw artifact, not an assertion of a
-speed or memory improvement. In the same artifact, the baseline decode rate is
-26.039 tok/s, so this profile has no end-to-end performance claim.
+These are diagnostic measurements from the named raw artifact, not an assertion
+of a speed or memory improvement. The artifact is invalid under the current
+provenance contract, so these values cannot support an end-to-end claim.
 
 The calibrated 8K-to-32K reservation estimate is 12,809,961,472 bytes against
 a 10,405,439,078-byte safety budget. It fails capacity admission independently
-of the failed quality gate. No 32K quality or systems child process was run.
+of the invalid quality artifact. No 32K quality or systems child process was run.
 
 ## Correctness evidence that did pass
 

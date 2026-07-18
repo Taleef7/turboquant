@@ -9,16 +9,26 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import math
 import random
+import re
 from typing import Any, Mapping, Sequence
 
 
 REQUIRED_BINDING_KEYS = (
-    "model_sha256",
+    "model_id",
+    "model_revision",
+    "model_revision_sha256",
+    "model_manifest_sha256",
     "profile_sha256",
     "codebook_sha256",
     "code_sha256",
     "runner_sha256",
 )
+_GIT_COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+# ``context_target`` is the requested model-input token budget, while
+# ``context_actual`` is the number of tokens handed to the model after
+# tokenization. A shortfall below one percent is tolerated for tokenizer
+# boundary effects; anything larger is not evidence at the requested context.
+MIN_CONTEXT_FIDELITY = 0.99
 QUALITY_ARTIFACT_TYPE = "quality_matrix"
 SYSTEMS_ARTIFACT_TYPE = "systems_benchmark"
 QUALIFIED_ARTIFACT_TYPE = "qualified_run"
@@ -44,6 +54,7 @@ class PairedBootstrap:
 @dataclass(frozen=True)
 class QualityRow:
     context_target: int
+    context_actual: int
     depth: float
     trial_seed: int
     status: str
@@ -57,6 +68,7 @@ class QualityRow:
     def from_dict(cls, row: Mapping[str, Any]) -> "QualityRow":
         return cls(
             context_target=int(row["context_target"]),
+            context_actual=int(row["context_actual"]),
             depth=float(row["depth"]),
             trial_seed=int(row["trial_seed"]),
             status=str(row["status"]),
@@ -141,11 +153,15 @@ def _validate_binding(
     return errors
 
 
-def _has_metadata(metadata: Any) -> bool:
-    return isinstance(metadata, Mapping) and all(
-        isinstance(metadata.get(key), str) and metadata[key]
-        for key in ("timestamp_utc", "git_commit")
-    )
+def _validate_metadata(metadata: Any) -> list[str]:
+    if not isinstance(metadata, Mapping) or not isinstance(
+        metadata.get("timestamp_utc"), str
+    ) or not metadata["timestamp_utc"]:
+        return ["metadata must include timestamp_utc and git_commit"]
+    commit = metadata.get("git_commit")
+    if not isinstance(commit, str) or not _GIT_COMMIT_SHA.fullmatch(commit):
+        return ["metadata.git_commit must be a resolved 40-character SHA"]
+    return []
 
 
 def validate_quality_artifact(
@@ -159,8 +175,8 @@ def validate_quality_artifact(
         errors.append("schema_version must be 1")
     if artifact.get("status") not in {"completed", "failed", "qualified", "invalid"}:
         errors.append("quality status must be completed, failed, qualified, or invalid")
-    if not _has_metadata(artifact.get("metadata")):
-        errors.append("quality metadata must include timestamp_utc and git_commit")
+    for error in _validate_metadata(artifact.get("metadata")):
+        errors.append(f"quality {error}")
     errors.extend(_validate_binding(artifact.get("binding"), expected_binding))
     expected = artifact.get("expected_matrix")
     rows = artifact.get("rows")
@@ -195,6 +211,16 @@ def validate_quality_artifact(
             errors.append(f"row {index} duplicates matrix coordinates {key}")
         seen.add(key)
         valid_rows.append(row)
+        actual_context = row.get("context_actual")
+        if type(actual_context) is not int or actual_context <= 0:
+            errors.append(f"row {index} context_actual must be a positive integer")
+        else:
+            minimum_context = math.ceil(key[0] * MIN_CONTEXT_FIDELITY)
+            if actual_context > key[0] or actual_context < minimum_context:
+                errors.append(
+                    f"row {index} context fidelity requires {minimum_context}-{key[0]} "
+                    f"effective tokens for requested {key[0]}, got {actual_context}"
+                )
         if row.get("status") != "completed":
             errors.append(f"row {index} status is not completed")
         if row.get("needle_present_after_tokenization") is not True:
@@ -277,8 +303,8 @@ def validate_systems_artifact(
         errors.append("schema_version must be 1")
     if artifact.get("status") != "completed":
         errors.append("systems status is not completed")
-    if not _has_metadata(artifact.get("metadata")):
-        errors.append("systems metadata must include timestamp_utc and git_commit")
+    for error in _validate_metadata(artifact.get("metadata")):
+        errors.append(f"systems {error}")
     errors.extend(_validate_binding(artifact.get("binding"), expected_binding))
     expected = artifact.get("expected_backends")
     trials = artifact.get("trials")
@@ -311,7 +337,7 @@ def validate_systems_artifact(
             if trial.get(metric) is None:
                 errors.append(f"trial {index} missing {metric}")
         for metric in (
-            "actual_store_bytes", "max_memory_allocated", "max_memory_reserved",
+            "max_memory_allocated", "max_memory_reserved",
             "prefill_ms", "ttft_ms", "decode_p50_ms", "decode_p95_ms",
             "decode_tokens_per_second",
         ):
@@ -330,11 +356,43 @@ def validate_systems_artifact(
             errors.append(f"trial {index} physical_bytes lacks keys/values/metadata")
         elif any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in physical.values()):
             errors.append(f"trial {index} physical_bytes must be non-negative integers")
+        else:
+            actual_store = trial.get("actual_store_bytes")
+            if type(actual_store) is not int or actual_store < 0:
+                errors.append(f"trial {index} actual_store_bytes must be a non-negative integer")
+            elif actual_store != sum(physical.values()):
+                errors.append(
+                    f"trial {index} actual_store_bytes must equal physical_bytes total"
+                )
         dispatch = trial.get("dispatch_counts")
         if not isinstance(dispatch, Mapping) or not dispatch:
             errors.append(f"trial {index} dispatch_counts must be non-empty")
         elif any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in dispatch.values()):
             errors.append(f"trial {index} dispatch_counts must contain non-negative integers")
+        elif trial.get("backend") == "triton_direct":
+            if dispatch.get("triton_direct", 0) <= 0:
+                errors.append(f"trial {index} triton_direct dispatches must be positive")
+            if dispatch.get("packed_reference", 0) != 0:
+                errors.append(
+                    f"trial {index} triton_direct cannot report packed_reference dispatches"
+                )
+            if isinstance(physical, Mapping) and (
+                physical.get("keys", 0) + physical.get("values", 0) > 0
+            ) and dispatch.get("packed_blocks_consumed", 0) <= 0:
+                errors.append(
+                    f"trial {index} packed_blocks_consumed must be positive for packed history"
+                )
+        elif trial.get("backend") == "packed_reference":
+            if dispatch.get("packed_reference", 0) <= 0:
+                errors.append(f"trial {index} packed_reference dispatches must be positive")
+            if dispatch.get("triton_direct", 0) != 0:
+                errors.append(
+                    f"trial {index} packed_reference cannot report triton_direct dispatches"
+                )
+            if dispatch.get("packed_blocks_consumed", 0) != 0:
+                errors.append(
+                    f"trial {index} packed_reference cannot report packed_blocks_consumed"
+                )
     warmups = artifact.get("warmups")
     if not isinstance(warmups, list) or not warmups:
         errors.append("warmups must be a non-empty list")
@@ -371,6 +429,8 @@ def validate_qualified_run(
         errors.append("artifact_type must be qualified_run")
     if report.get("status") not in {"qualified", "invalid", "failed", "inconclusive"}:
         errors.append("release status must be qualified, invalid, failed, or inconclusive")
+    for error in _validate_metadata(report.get("metadata")):
+        errors.append(f"release {error}")
     errors.extend(_validate_binding(report.get("binding"), expected_binding))
     for name, validator, required_status in (("quality", validate_quality_artifact, "qualified"), ("systems", validate_systems_artifact, "completed")):
         child = report.get(name)

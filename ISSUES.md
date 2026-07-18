@@ -28,11 +28,12 @@ cannot select it and it is not a resolved direct-backend route.
 **Priority:** critical
 **Status:** open — current profile is not retrieval-safe
 
-The complete current 4K-8K quality matrix records baseline 12/12 versus direct
-profile 0/12; its exact 8K subset records baseline 6/6 versus direct profile
-0/6. Its release report is `failed`, and it explicitly skips 32K after the 8K
-quality gate. Do not use kernel parity or the short model smoke to close this
-issue.
+The retained raw quality rows underfill their requested contexts (3,656/3,659
+for 4K and 7,751/7,754 for 8K), so the current validator marks the artifact
+`invalid`; its raw `failed` report is no longer qualifying evidence. The 12/12
+versus 0/12 diagnostic outcome applies only to those underfilled rows. Its raw
+report also skips 32K. Do not use kernel parity or the short model smoke to
+close this issue.
 
 ### Promotion criteria
 

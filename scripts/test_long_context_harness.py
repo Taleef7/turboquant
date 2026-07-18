@@ -84,6 +84,7 @@ def test_build_prompt_metadata_keeps_needle_at_4k_budget():
         trial_seed=0,
     )
     assert metadata["needle_present_after_tokenization"] is True
+    assert metadata["input_token_count"] == 4096
 
 
 def test_select_niah_contexts_includes_requested_max_when_needed():

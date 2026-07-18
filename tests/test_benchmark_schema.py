@@ -11,7 +11,10 @@ from scripts.benchmark_schema import (
 
 def _binding() -> dict[str, str]:
     return {
-        "model_sha256": "m" * 64,
+        "model_id": "Qwen/Qwen2.5-7B-Instruct",
+        "model_revision": "a" * 40,
+        "model_revision_sha256": "m" * 64,
+        "model_manifest_sha256": "h" * 64,
         "profile_sha256": "p" * 64,
         "codebook_sha256": "c" * 64,
         "code_sha256": "d" * 64,
@@ -22,6 +25,7 @@ def _binding() -> dict[str, str]:
 def _row(context: int, depth: float, seed: int) -> dict:
     return {
         "context_target": context,
+        "context_actual": context,
         "depth": depth,
         "trial_seed": seed,
         "status": "completed",
@@ -45,7 +49,10 @@ def complete_matrix() -> dict:
         "artifact_type": "quality_matrix",
         "schema_version": 1,
         "binding": _binding(),
-        "metadata": {"timestamp_utc": "2026-07-18T00:00:00+00:00", "git_commit": "test"},
+        "metadata": {
+            "timestamp_utc": "2026-07-18T00:00:00+00:00",
+            "git_commit": "a" * 40,
+        },
         "status": "completed",
         "expected_matrix": expected,
         "rows": rows,
@@ -109,3 +116,23 @@ def test_quality_requires_top_level_status_and_metadata():
     assert result.valid is False
     assert any("quality status" in error for error in result.errors)
     assert any("metadata" in error for error in result.errors)
+
+
+def test_quality_artifact_rejects_materially_underfilled_requested_context():
+    matrix = complete_matrix()
+    matrix["rows"][0]["context_actual"] = 900
+
+    result = validate_quality_artifact(matrix)
+
+    assert result.valid is False
+    assert any("context fidelity" in error for error in result.errors)
+
+
+def test_quality_artifact_requires_actual_context_length_for_every_row():
+    matrix = complete_matrix()
+    matrix["rows"][0].pop("context_actual")
+
+    result = validate_quality_artifact(matrix)
+
+    assert result.valid is False
+    assert any("context_actual" in error for error in result.errors)

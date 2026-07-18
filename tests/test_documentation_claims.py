@@ -27,10 +27,10 @@ QUALIFIED_ARTIFACT_ID = re.compile(
     r"qualified(?:-[a-z0-9]+)?/\d{8}T\d{6}Z-[a-z0-9._-]+", re.IGNORECASE
 )
 THIRTY_TWO_K_SUCCESS = re.compile(
-    r"(?:\b(?:successful|passed)\s+(?:\w+\s+){0,2}32k\b|"
-    r"\bqualified\s+32k\b|\b32k\s+(?:(?:run|evaluation)\s+)?"
-    r"(?:success|passed|succeeded|qualified)\b|\b32k\s+(?:has|is|was)"
-    r"(?:\s+\w+){0,3}\s+(?:passed|qualified|successful)\b)",
+    r"(?:\b(?:successful(?:ly)?|passed|succeeded|qualified|validated)"
+    r"\s+(?:\w+\s+){0,3}32k\b|\b32k\s+(?:\w+\s+){0,4}"
+    r"(?:success(?:ful(?:ly)?)?|passed|succeeded|qualified|validated|completed)\b|"
+    r"\b(?:retrieval[- ]safe|validated\s+niah)\s+(?:through|at)\s+32k\b)",
     re.IGNORECASE,
 )
 
@@ -56,7 +56,17 @@ def has_qualified_artifact_id(value: str) -> bool:
 def is_32k_success_claim(value: str) -> bool:
     """Recognize a positive 32K qualification statement, not a skipped leg."""
     lowered = value.lower()
-    if any(marker in lowered for marker in ("not qualified", "skipped", "not run")):
+    if any(
+        marker in lowered
+        for marker in (
+            "not qualified",
+            "not retrieval-safe",
+            "skipped",
+            "not run",
+            "failed",
+            "no 32k success",
+        )
+    ):
         return False
     return THIRTY_TWO_K_SUCCESS.search(value) is not None
 
@@ -87,6 +97,11 @@ def test_claim_normalization_handles_unicode_multiplication_and_whitespace() -> 
 def test_32k_success_detection_covers_natural_language() -> None:
     assert is_32k_success_claim("32K is now qualified")
     assert is_32k_success_claim("A successful 32K run")
+    assert is_32k_success_claim("32K gate passed")
+    assert is_32k_success_claim("Retrieval-safe through 32K")
+    assert is_32k_success_claim("32K retrieval validation succeeded")
+    assert is_32k_success_claim("Validated NIAH through 32K")
+    assert is_32k_success_claim("32K completed successfully")
     assert not is_32k_success_claim("32K: skipped")
     assert not is_32k_success_claim("32K is not qualified")
 
@@ -116,7 +131,8 @@ def test_results_record_the_non_qualified_evidence_outcome() -> None:
     results = results_path.read_text(encoding="utf-8")
 
     assert "20260718T053419Z-unknown" in results
-    assert "Complete 4K-8K matrix: baseline 12/12; direct profile 0/12" in results
-    assert "Exact 8K subset: baseline 6/6; direct profile 0/6" in results
+    assert "Current validation status: `invalid`" in results
+    assert "7751/7754" in results
+    assert "not a qualified 8K result" in results
     assert "32K: skipped" in results
     assert "not retrieval-safe" in results

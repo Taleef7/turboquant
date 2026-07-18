@@ -21,6 +21,28 @@ _PACKAGE_NAMES = (
     "numpy",
     "scipy",
 )
+PINNED_QWEN25_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+PINNED_QWEN25_HUB_REVISION = "a09a35458c702b33eeacc393d103063234e8bc28"
+# Every file here can affect direct-attention correctness or qualification. The
+# relative names are also fed into the digest, avoiding an order-only hash.
+DIRECT_EVIDENCE_SOURCE_PATHS = (
+    "scripts/test_long_context.py",
+    "scripts/run_direct_benchmark.py",
+    "scripts/reproduce_release.py",
+    "scripts/benchmark_schema.py",
+    "scripts/repro_utils.py",
+    "core/capabilities.py",
+    "core/profiles.py",
+    "core/packing.py",
+    "core/codec.py",
+    "core/packed_store.py",
+    "core/reference_attention.py",
+    "core/packed_cache.py",
+    "core/qwen_adapter.py",
+    "kernels/packed_attention.py",
+    "configs/profiles/qwen25-7b-direct-v1.json",
+    "configs/models/qwen25-7b.json",
+)
 
 
 def git_commit_sha() -> str:
@@ -51,6 +73,13 @@ def benchmark_binding(root: str | Path) -> dict[str, str]:
     root_path = Path(root)
     profile = root_path / "configs" / "profiles" / "qwen25-7b-direct-v1.json"
     manifest = root_path / "configs" / "models" / "qwen25-7b.json"
+    profile_payload = json.loads(profile.read_text(encoding="utf-8"))
+    model_revision = profile_payload.get("model_revision")
+    if model_revision != {
+        "model_id": PINNED_QWEN25_MODEL_ID,
+        "revision": PINNED_QWEN25_HUB_REVISION,
+    }:
+        raise ValueError("direct benchmark profile must bind the pinned Qwen2.5 Hub revision")
     codebooks = (
         root_path / "codebooks" / "codebook_d128_b8.json",
         root_path / "codebooks" / "codebook_d128_b6.json",
@@ -59,21 +88,21 @@ def benchmark_binding(root: str | Path) -> dict[str, str]:
     for codebook in codebooks:
         combined.update(codebook.name.encode("utf-8"))
         combined.update(codebook.read_bytes())
-    behavior_paths = (
-        root_path / "scripts" / "test_long_context.py",
-        root_path / "scripts" / "run_direct_benchmark.py",
-        root_path / "core" / "qwen_adapter.py",
-        root_path / "core" / "packed_cache.py",
-        root_path / "core" / "packed_store.py",
-        root_path / "kernels" / "packed_attention.py",
-    )
     behavior = hashlib.sha256()
-    for source in behavior_paths:
+    for relative_path in DIRECT_EVIDENCE_SOURCE_PATHS:
+        source = root_path / relative_path
         behavior.update(source.relative_to(root_path).as_posix().encode("utf-8"))
         behavior.update(source.read_bytes())
     runner = root_path / "scripts" / "run_direct_benchmark.py"
     return {
-        "model_sha256": sha256_file(manifest),
+        # This is a digest of the immutable Hub identity, never a local
+        # manifest digest mislabeled as model weights.
+        "model_id": PINNED_QWEN25_MODEL_ID,
+        "model_revision": PINNED_QWEN25_HUB_REVISION,
+        "model_revision_sha256": hashlib.sha256(
+            f"{PINNED_QWEN25_MODEL_ID}@{PINNED_QWEN25_HUB_REVISION}".encode("utf-8")
+        ).hexdigest(),
+        "model_manifest_sha256": sha256_file(manifest),
         "profile_sha256": sha256_file(profile),
         "codebook_sha256": combined.hexdigest(),
         "code_sha256": behavior.hexdigest(),

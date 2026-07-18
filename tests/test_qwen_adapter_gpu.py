@@ -12,12 +12,11 @@ import torch
 
 from core.qwen_adapter import install_qwen25_packed_backend
 from core.profiles import load_profile
+from scripts.repro_utils import PINNED_QWEN25_HUB_REVISION, PINNED_QWEN25_MODEL_ID
 
 
-MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
-# Hub commit, not the local manifest label.  This makes accidental model drift
-# visible when this explicitly opt-in integration lane is run.
-MODEL_REVISION = "a09a35458c702b33eeacc393d103063234e8bc28"
+MODEL_ID = PINNED_QWEN25_MODEL_ID
+MODEL_REVISION = PINNED_QWEN25_HUB_REVISION
 PROMPT = "Reply with one short word: TurboQuant"
 ROOT = Path(__file__).resolve().parents[1]
 

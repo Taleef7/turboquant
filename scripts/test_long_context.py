@@ -31,7 +31,16 @@ from core.turboquant_cache_v2 import TurboQuantCacheV2
 from core.profiles import load_profile
 from core.qwen_adapter import install_qwen25_packed_backend
 from scripts.benchmark_schema import calculate_paired_bootstrap, quality_retrieval_safe
-from scripts.repro_utils import benchmark_binding, capture_env_metadata
+from scripts.repro_utils import (
+    PINNED_QWEN25_HUB_REVISION,
+    PINNED_QWEN25_MODEL_ID,
+    benchmark_binding,
+    capture_env_metadata,
+)
+
+
+MODEL_ID = PINNED_QWEN25_MODEL_ID
+MODEL_REVISION = PINNED_QWEN25_HUB_REVISION
 
 
 # ============================================================================
@@ -130,7 +139,10 @@ Answer with just the code, nothing else.
     needle_ids = tokenizer.encode(code, add_special_tokens=False)
     needle_ids_spaced = tokenizer.encode(" " + code, add_special_tokens=False)
 
-    haystack_target = max(64, context_tokens - 512)
+    # Target the requested *model input* budget. The prompt framing adds a
+    # modest fixed overhead, so the tokenizer truncates at exactly
+    # ``context_tokens`` while the depth-specific needle remains inside it.
+    haystack_target = max(64, context_tokens)
     step = 128
     attempts = 0
     max_attempts = 6
@@ -616,8 +628,10 @@ def run_memory_test(
     return results
 
 
-def load_model(model_name: str = "Qwen/Qwen2.5-7B-Instruct"):
-    """Load model with 4-bit quantization for memory efficiency."""
+def load_model(model_name: str = MODEL_ID):
+    """Load only the pinned Hub revision used by the direct profile evidence."""
+    if model_name != MODEL_ID:
+        raise ValueError("paired direct evidence supports only the pinned Qwen2.5 model")
     print(f"Loading {model_name}...")
 
     bnb_config = BitsAndBytesConfig(
@@ -627,9 +641,10 @@ def load_model(model_name: str = "Qwen/Qwen2.5-7B-Instruct"):
         bnb_4bit_quant_type="nf4",
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, revision=MODEL_REVISION)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
+        revision=MODEL_REVISION,
         quantization_config=bnb_config,
         device_map="auto",
         dtype=torch.float16,
@@ -660,7 +675,7 @@ def main():
         help="Maximum context length to test (default: 32K)",
     )
     parser.add_argument(
-        "--model", type=str, default="Qwen/Qwen2.5-7B-Instruct", help="Model to use"
+        "--model", type=str, default=MODEL_ID, help="Model to use"
     )
     parser.add_argument("--head-dim", type=int, default=128, help="Head dimension")
     parser.add_argument("--num-layers", type=int, default=28, help="Number of layers")

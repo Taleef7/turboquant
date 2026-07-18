@@ -17,10 +17,12 @@ The only implemented model adapter is Qwen2.5-7B-Instruct, using the checked-in
 narrow: text-only, batch size one, standard prefill, greedy single-token decode,
 one CUDA device, and full-attention layers.
 
-The latest complete evidence attempt is local artifact
-`artifacts/qualified-v4/20260718T053419Z-unknown`. Its release status is
-**failed**, not qualified: the 8K NIAH gate failed and the 32K leg was skipped.
-That result is the current truth, not a hidden caveat. See
+The latest retained evidence attempt is local artifact
+`artifacts/qualified-v4/20260718T053419Z-unknown`. Its generated report recorded
+`failed`, but the strengthened validator classifies it as **invalid**: its
+requested 4K/8K rows used materially shorter effective inputs and its Git/binding
+provenance is incomplete. Its original 32K leg was skipped. That invalidation is
+the current truth, not a hidden caveat. See
 [results](docs/RESULTS.md) and the [benchmark protocol](docs/BENCHMARK_PROTOCOL.md).
 
 ## What is implemented and tested
@@ -44,8 +46,8 @@ diagnostic evidence only and is not retrieval-safe evidence.
 
 ## What is not claimed
 
-- The shipped Qwen2.5 profile is **not retrieval-safe**. The complete 8K NIAH
-  evidence is a regression, so it must not be used to support a quality,
+- The shipped Qwen2.5 profile is **not retrieval-qualified**. The retained NIAH
+  artifact is invalid, so it must not be used to support a quality,
   memory-saving, or throughput claim.
 - There is no verified end-to-end speedup or memory win. Physical bytes, peak
   allocator memory, and latency are reported only inside named raw artifacts.
@@ -108,14 +110,14 @@ python scripts/reproduce_release.py --mode quick --output-dir artifacts/repro_qu
 python scripts/reproduce_release.py --mode qualified --output-dir artifacts/repro_qualified
 ```
 
-The second command currently exits nonzero because the profile fails its 8K
-quality gate. Use [the protocol](docs/BENCHMARK_PROTOCOL.md) to interpret
+The second command currently exits nonzero unless every context, provenance, and
+quality gate passes. Use [the protocol](docs/BENCHMARK_PROTOCOL.md) to interpret
 `qualified`, `failed`, `invalid`, and `inconclusive` states.
 
 ## Documentation map
 
 - [Results](docs/RESULTS.md): current artifact-backed observations, including
-  the failed quality gate.
+  the invalidated retained run.
 - [Benchmark protocol](docs/BENCHMARK_PROTOCOL.md): artifact schema, matrix,
   statistical and invalid-run rules.
 - [Portability](docs/PORTABILITY.md): model capability contracts and adapter

@@ -13,7 +13,8 @@ requested `artifacts/` output root. A release run retains:
 - `systems_benchmark` JSON and Markdown summaries;
 - `qualified_run` report and persisted capacity/32K decisions;
 - per-child stdout/stderr logs and invoked command metadata;
-- model, profile, codebook, source, and runner hashes plus environment metadata.
+- pinned Hub model ID/revision identity, manifest/profile/codebook/source/runner
+  hashes, and environment metadata with a resolved Git commit.
 
 The artifact directory is ignored by Git. A result document must name its raw
 artifact ID and reproduction command; it must not require the raw directory to
@@ -22,10 +23,13 @@ be committed.
 ## Quality matrix
 
 The runner builds the expected `(context, depth, seed)` matrix before executing
-anything. Every expected row must be present, completed, tokenization-preserving,
-and bound to the same model/profile/codebook/code hashes. A missing row, OOM,
-exception, altered binding, or tokenization loss makes the quality artifact
-invalid.
+anything. `context_target` means requested model-input tokens and
+`context_actual` means the post-tokenization length actually supplied to the
+model. Every row must be present, completed, tokenization-preserving, and
+within 99%–100% of its target. It must also bind the same pinned Hub revision,
+profile, codebook, and source hashes. A missing or underfilled row, OOM,
+exception, unresolved Git commit, altered binding, or tokenization loss makes
+the quality artifact invalid.
 
 For every eligible paired row the runner records baseline and profile outcome.
 The baseline must reach at least 95% accuracy. It reports baseline-minus-profile
@@ -42,8 +46,12 @@ latency, TTFT, per-token decode distribution, p50/p95, decode rate, direct
 dispatch counts, and an OOM-probe sequence.
 
 The direct benchmark must not use the legacy V2 cache and a qualified direct
-trial must not silently fall back to the PyTorch reference. System timing is not
-an end-to-end win unless a valid artifact reports the comparator and conditions.
+trial must not silently fall back to the PyTorch reference. A direct trial must
+report positive `triton_direct` dispatches, zero packed-reference dispatches,
+and positive packed-block consumption whenever packed payload exists. The
+reported store bytes must exactly equal its physical category breakdown.
+System timing is not an end-to-end win unless a valid artifact reports the
+comparator and conditions.
 
 ## Release ladder
 

@@ -10,17 +10,18 @@ claiming paper-level results.
 | Code provenance | Research implementation and paper | New clean-room Python/Triton implementation under MIT; no GPL code is copied. |
 | KV storage | Quantized cache representations | Physically bit-packed fixed blocks plus bounded fp16/bf16 tail; exact tensor bytes are measured. |
 | Attention execution | Research-specific evaluation | Blockwise PyTorch reference and direct Triton score/value mixing for the pinned Qwen2.5 path. |
-| Quality evaluation | Broad research benchmarks | Complete paired NIAH matrix with explicit invalid/failed states; current direct profile fails it. |
+| Quality evaluation | Broad research benchmarks | Paired NIAH runner with explicit invalid/failed states; retained direct evidence is invalid, so no retrieval result is claimed. |
 | Model support | Paper-dependent architectures | Qwen2.5 direct adapter only; other listed families have no adapter. |
 | Serving/runtime | Research and production-adjacent contexts | No server, batching, beam search, speculative decoding, paging/offload, or distributed path. |
 
-## Why a failed quality artifact remains valuable
+## Why an invalid quality artifact remains valuable
 
-The artifact `qualified-v4/20260718T053419Z-unknown` contains a complete 8K
-NIAH matrix, a structurally valid systems run, logs, and a mechanical 32K
-admission decision. It reports a failed retrieval gate rather than masking the
-regression with short-completion output. That makes the next engineering step
-clear: improve or replace the profile, then rerun the same fixed protocol.
+The artifact `qualified-v4/20260718T053419Z-unknown` retains attempted NIAH
+rows, systems logs, and a mechanical 32K admission decision. The corrected
+validator rejects it because effective contexts were materially shorter than
+requested and the commit/binding provenance is incomplete. That makes the next
+engineering step clear: rerun the fixed protocol with full context fidelity and
+resolved provenance before evaluating profile quality.
 
 ## Deliberate differences from the legacy prototype
 
