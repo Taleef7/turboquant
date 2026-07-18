@@ -70,6 +70,7 @@ class PackedAttentionHotPathDebugState:
     rotation_launches: int = 0
     packed_score_launches: int = 0
     packed_value_launches: int = 0
+    fused_packed_page_launches: int = 0
     tail_kernel_dispatches: int = 0
 
 
@@ -107,10 +108,108 @@ _QWEN25_DIRECT_HEADS = 28
 _QWEN25_DIRECT_KV_HEADS = 4
 _QWEN25_DIRECT_GQA_RATIO = 7
 _QWEN25_DIRECT_HEAD_DIM = 128
+_QWEN25_DIRECT_PAGE_TOKENS = 256
 _QWEN25_DIRECT_MAX_TAIL_TOKENS = 383
 
 
 if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _qwen25_packed_page_online_kernel(
+        query_ptr,
+        packed_keys_ptr,
+        key_codebook_ptr,
+        key_norms_ptr,
+        packed_values_ptr,
+        value_mins_ptr,
+        value_scales_ptr,
+        old_max_ptr,
+        old_denominator_ptr,
+        old_numerator_ptr,
+        new_max_ptr,
+        new_denominator_ptr,
+        new_numerator_ptr,
+        SCALE: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+    ):
+        """Fuse one canonical Qwen packed page into an fp32 online state."""
+        head = tl.program_id(0)
+        kv_head = head // 7
+        dims = tl.arange(0, 128)
+        query = tl.load(query_ptr + head * 128 + dims).to(tl.float32)
+        old_max = tl.load(old_max_ptr + head).to(tl.float32)
+        old_denominator = tl.load(old_denominator_ptr + head).to(tl.float32)
+        old_numerator = tl.load(old_numerator_ptr + head * 128 + dims).to(tl.float32)
+
+        block_max = -float("inf")
+        for token_start in tl.static_range(0, 256, BLOCK_T):
+            tokens = token_start + tl.arange(0, BLOCK_T)
+            row = kv_head * 256 + tokens
+            key_offsets = row[:, None] * 128 + dims[None, :]
+            key_indices = tl.load(packed_keys_ptr + key_offsets).to(tl.int32)
+            decoded_keys = tl.load(key_codebook_ptr + key_indices).to(tl.float32)
+            norms = tl.load(key_norms_ptr + row).to(tl.float32)
+            scores = tl.sum(decoded_keys * query[None, :], axis=1) * norms * SCALE
+            block_max = tl.maximum(block_max, tl.max(scores, axis=0))
+
+        new_max = tl.maximum(old_max, block_max)
+        old_scale = tl.where(old_max == -float("inf"), 0.0, tl.exp(old_max - new_max))
+        denominator_contribution = tl.zeros((), dtype=tl.float32)
+        denominator_compensation = tl.zeros((), dtype=tl.float32)
+        numerator_contribution = tl.zeros((128,), dtype=tl.float32)
+        numerator_compensation = tl.zeros((128,), dtype=tl.float32)
+        value_bit_position = dims * 6
+        value_byte_offset = value_bit_position // 8
+        value_shift = value_bit_position % 8
+        value_group = dims // 32
+        for token_start in tl.static_range(0, 256, BLOCK_T):
+            tokens = token_start + tl.arange(0, BLOCK_T)
+            row = kv_head * 256 + tokens
+            key_offsets = row[:, None] * 128 + dims[None, :]
+            key_indices = tl.load(packed_keys_ptr + key_offsets).to(tl.int32)
+            decoded_keys = tl.load(key_codebook_ptr + key_indices).to(tl.float32)
+            norms = tl.load(key_norms_ptr + row).to(tl.float32)
+            scores = tl.sum(decoded_keys * query[None, :], axis=1) * norms * SCALE
+            weights = tl.exp(scores - new_max)
+            denominator_tile = tl.sum(weights, axis=0)
+            denominator_adjusted = denominator_tile - denominator_compensation
+            denominator_updated = denominator_contribution + denominator_adjusted
+            denominator_compensation = (
+                denominator_updated - denominator_contribution - denominator_adjusted
+            )
+            denominator_contribution = denominator_updated
+
+            value_offsets = row[:, None] * 96 + value_byte_offset[None, :]
+            low = tl.load(packed_values_ptr + value_offsets).to(tl.int32)
+            high = tl.load(
+                packed_values_ptr + value_offsets + 1,
+                mask=value_byte_offset[None, :] + 1 < 96,
+                other=0,
+            ).to(tl.int32)
+            value_indices = (
+                (low | (high << 8)) >> value_shift[None, :]
+            ) & 63
+            metadata = row[:, None] * 4 + value_group[None, :]
+            mins = tl.load(value_mins_ptr + metadata).to(tl.float32)
+            scales = tl.load(value_scales_ptr + metadata).to(tl.float32)
+            decoded_values = mins + value_indices.to(tl.float32) * scales
+            numerator_tile = tl.sum(decoded_values * weights[:, None], axis=0)
+            numerator_adjusted = numerator_tile - numerator_compensation
+            numerator_updated = numerator_contribution + numerator_adjusted
+            numerator_compensation = (
+                numerator_updated - numerator_contribution - numerator_adjusted
+            )
+            numerator_contribution = numerator_updated
+
+        tl.store(new_max_ptr + head, new_max)
+        tl.store(
+            new_denominator_ptr + head,
+            old_denominator * old_scale + denominator_contribution,
+        )
+        tl.store(
+            new_numerator_ptr + head * 128 + dims,
+            old_numerator * old_scale + numerator_contribution,
+        )
 
     @triton.jit
     def _qwen25_fp16_tail_online_kernel(
@@ -1063,6 +1162,37 @@ def qwen25_fp16_tail_online_update(
     return new_max, new_denominator, new_numerator
 
 
+def _is_qwen25_packed_page(block: PackedAttentionBlock) -> bool:
+    """Whether one validated block matches the fixed canonical fused layout."""
+    return (
+        block.key_bits == 8
+        and block.value_bits == 6
+        and block.value_group_size == 32
+        and block.packed_keys.shape
+        == (
+            _QWEN25_DIRECT_KV_HEADS,
+            _QWEN25_DIRECT_PAGE_TOKENS,
+            _QWEN25_DIRECT_HEAD_DIM,
+        )
+        and block.key_norms.shape
+        == (_QWEN25_DIRECT_KV_HEADS, _QWEN25_DIRECT_PAGE_TOKENS)
+        and block.key_codebook.shape == (256,)
+        and block.packed_values.shape
+        == (
+            _QWEN25_DIRECT_KV_HEADS,
+            _QWEN25_DIRECT_PAGE_TOKENS,
+            _QWEN25_DIRECT_HEAD_DIM * 6 // 8,
+        )
+        and block.value_mins.shape
+        == (
+            _QWEN25_DIRECT_KV_HEADS,
+            _QWEN25_DIRECT_PAGE_TOKENS,
+            _QWEN25_DIRECT_HEAD_DIM // 32,
+        )
+        and block.value_scales.shape == block.value_mins.shape
+    )
+
+
 @dataclass(frozen=True)
 class PreparedPackedAttentionDecode:
     """Validated static packed layout for one Qwen attention layer.
@@ -1080,7 +1210,7 @@ class PreparedPackedAttentionDecode:
     heads: int
     head_dim: int
     num_kv_heads: int
-    qwen25_tail_kernel_eligible: bool
+    qwen25_canonical_mapping_eligible: bool
     scale: float
     static_constant_ptrs: tuple[int, ...]
     static_constant_device: torch.device
@@ -1161,6 +1291,41 @@ class PreparedPackedAttentionDecode:
         saw_history = False
         for block in self.blocks:
             tokens = block.packed_keys.shape[1]
+            if (
+                self.qwen25_canonical_mapping_eligible
+                and self.heads == _QWEN25_DIRECT_HEADS
+                and self.num_kv_heads == _QWEN25_DIRECT_KV_HEADS
+                and self.head_dim == _QWEN25_DIRECT_HEAD_DIM
+                and query_tokens == 1
+                and _is_qwen25_packed_page(block)
+            ):
+                old_max, old_denominator, old_numerator = state
+                new_max = torch.empty_like(old_max, dtype=torch.float32)
+                new_denominator = torch.empty_like(old_denominator, dtype=torch.float32)
+                new_numerator = torch.empty_like(old_numerator, dtype=torch.float32)
+                _qwen25_packed_page_online_kernel[(_QWEN25_DIRECT_HEADS,)](
+                    rotated_query,
+                    block.packed_keys,
+                    block.key_codebook,
+                    block.key_norms,
+                    block.packed_values,
+                    block.value_mins,
+                    block.value_scales,
+                    old_max,
+                    old_denominator,
+                    old_numerator,
+                    new_max,
+                    new_denominator,
+                    new_numerator,
+                    SCALE=self.scale,
+                    BLOCK_T=16,
+                    num_warps=4,
+                )
+                state = (new_max, new_denominator, new_numerator)
+                if self.debug is not None:
+                    self.debug.fused_packed_page_launches += 1
+                saw_history = True
+                continue
             scores = torch.empty(
                 (self.heads, query_tokens, tokens),
                 device=query.device,
@@ -1235,7 +1400,7 @@ class PreparedPackedAttentionDecode:
                 raise ValueError("fp16_window must match the prepared KV-head layout and device.")
             old_max, old_denominator, old_numerator = state
             if (
-                self.qwen25_tail_kernel_eligible
+                self.qwen25_canonical_mapping_eligible
                 and self.heads == _QWEN25_DIRECT_HEADS
                 and self.num_kv_heads == _QWEN25_DIRECT_KV_HEADS
                 and self.head_dim == _QWEN25_DIRECT_HEAD_DIM
@@ -1352,7 +1517,7 @@ def prepare_packed_attention_decode(
     prepared_rotation = rotation.float().contiguous()
     prepared_gqa_mapping = gqa_mapping.contiguous()
     prepared_gqa_mapping_long = gqa_mapping.to(dtype=torch.long).contiguous()
-    qwen25_tail_kernel_eligible = (
+    qwen25_canonical_mapping_eligible = (
         head_dim == _QWEN25_DIRECT_HEAD_DIM
         and kv_heads == _QWEN25_DIRECT_KV_HEADS
         and torch.equal(
@@ -1379,7 +1544,7 @@ def prepare_packed_attention_decode(
         gqa_mapping.shape[0],
         head_dim,
         kv_heads,
-        qwen25_tail_kernel_eligible,
+        qwen25_canonical_mapping_eligible,
         attention_scale,
         tuple(tensor.data_ptr() for tensor in constants),
         rotation.device,
