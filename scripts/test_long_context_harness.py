@@ -11,6 +11,7 @@ from scripts.test_long_context import (
     insert_needle,
     make_needle_code,
     build_niah_prompt_and_metadata,
+    build_niah_input_ids_and_metadata,
     summarize_paired_results,
     select_niah_contexts,
 )
@@ -85,6 +86,24 @@ def test_build_prompt_metadata_keeps_needle_at_4k_budget():
     )
     assert metadata["needle_present_after_tokenization"] is True
     assert metadata["input_token_count"] == 4096
+
+
+def test_token_level_builder_keeps_exact_4k_and_8k_lengths_with_the_needle():
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+    for context_tokens in (4096, 8192):
+        for needle_depth in (0.1, 0.5, 0.9):
+            input_ids, metadata = build_niah_input_ids_and_metadata(
+                tokenizer=tokenizer,
+                context_tokens=context_tokens,
+                needle_depth=needle_depth,
+                trial_seed=0,
+            )
+
+            assert len(input_ids) == context_tokens
+            assert metadata["input_token_count"] == context_tokens
+            assert metadata["needle_present_after_tokenization"] is True
+            assert metadata["needle_token_index"] >= 0
+            assert abs(metadata["needle_depth_actual"] - needle_depth) <= 1 / metadata["haystack_target_tokens"]
 
 
 def test_select_niah_contexts_includes_requested_max_when_needed():

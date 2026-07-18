@@ -111,87 +111,100 @@ def _find_subsequence(haystack_ids, needle_ids) -> int:
     return -1
 
 
-def build_niah_prompt_and_metadata(
+def build_niah_input_ids_and_metadata(
     tokenizer,
     context_tokens: int,
     needle_depth: float,
     trial_seed: int = 0,
 ):
-    """Build a NIAH prompt and return metadata about post-tokenization needle presence."""
+    """Build exact model-input IDs with a verified needle position.
+
+    Benchmark context is a model-input token count, not a character estimate.
+    Constructing and then re-tokenizing a rendered string can underfill the
+    requested budget or move the needle across a tokenizer boundary, so the
+    paired runner consumes these IDs directly.
+    """
+    if context_tokens <= 0:
+        raise ValueError("context_tokens must be positive")
+    if not 0.0 <= needle_depth <= 1.0:
+        raise ValueError("needle_depth must be between zero and one")
     code = make_needle_code(context_tokens, needle_depth, trial_seed)
     needle = NEEDLE_TEMPLATES[trial_seed % len(NEEDLE_TEMPLATES)].format(code=code)
 
-    def _render_prompt(document_text: str) -> str:
-        return f"""<|im_start|>system
+    prefix = """<|im_start|>system
 You are a helpful assistant. Read the document carefully and answer questions accurately.
 <|im_end|>
 <|im_start|>user
 Here is a document:
 
-{document_text}
+"""
+    suffix = """
 
 Question: What is the secret code mentioned in the document above?
 Answer with just the code, nothing else.
 <|im_end|>
 <|im_start|>assistant
 """
+    prefix_ids = list(tokenizer.encode(prefix, add_special_tokens=False))
+    needle_section_ids = list(
+        tokenizer.encode(f"\n\n{needle}\n\n", add_special_tokens=False)
+    )
+    suffix_ids = list(tokenizer.encode(suffix, add_special_tokens=False))
+    filler_ids = list(tokenizer.encode(HAYSTACK_PARAGRAPH, add_special_tokens=False))
+    if not filler_ids:
+        raise ValueError("tokenizer produced an empty NIAH haystack")
+    fixed_tokens = len(prefix_ids) + len(needle_section_ids) + len(suffix_ids)
+    if fixed_tokens > context_tokens:
+        raise ValueError("context_tokens is too small for the NIAH prompt framing")
 
-    needle_ids = tokenizer.encode(code, add_special_tokens=False)
-    needle_ids_spaced = tokenizer.encode(" " + code, add_special_tokens=False)
+    filler_budget = context_tokens - fixed_tokens
+    before_needle = round(filler_budget * needle_depth)
 
-    # Target the requested *model input* budget. The prompt framing adds a
-    # modest fixed overhead, so the tokenizer truncates at exactly
-    # ``context_tokens`` while the depth-specific needle remains inside it.
-    haystack_target = max(64, context_tokens)
-    step = 128
-    attempts = 0
-    max_attempts = 6
+    def filler(count: int) -> list[int]:
+        return (filler_ids * (count // len(filler_ids) + 1))[:count]
 
-    best_prompt = ""
-    best_input_ids = []
-    best_all_ids = []
-    best_needle_pos = -1
-
-    while attempts < max_attempts:
-        haystack = create_haystack(tokenizer, haystack_target)
-        document = insert_needle(haystack, needle, needle_depth)
-        prompt = _render_prompt(document)
-
-        all_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        input_ids = tokenizer.encode(
-            prompt,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=context_tokens,
-        )
-        needle_pos = _find_subsequence(input_ids, needle_ids)
-        if needle_pos < 0:
-            needle_pos = _find_subsequence(input_ids, needle_ids_spaced)
-        decoded_input = tokenizer.decode(input_ids, skip_special_tokens=False)
-        needle_present = needle_pos >= 0 or (code in decoded_input)
-
-        best_prompt = prompt
-        best_input_ids = input_ids
-        best_all_ids = all_ids
-        best_needle_pos = needle_pos
-
-        if needle_present:
-            break
-
-        haystack_target = max(64, haystack_target - step)
-        attempts += 1
+    input_ids = (
+        prefix_ids
+        + filler(before_needle)
+        + needle_section_ids
+        + filler(filler_budget - before_needle)
+        + suffix_ids
+    )
+    needle_ids = list(tokenizer.encode(code, add_special_tokens=False))
+    needle_ids_spaced = list(tokenizer.encode(" " + code, add_special_tokens=False))
+    needle_pos = _find_subsequence(input_ids, needle_ids)
+    if needle_pos < 0:
+        needle_pos = _find_subsequence(input_ids, needle_ids_spaced)
 
     metadata = {
         "needle_code": code,
-        "needle_present_after_tokenization": best_needle_pos >= 0
-        or (code in tokenizer.decode(best_input_ids, skip_special_tokens=False)),
-        "needle_token_index": best_needle_pos,
-        "input_token_count": len(best_input_ids),
-        "truncated": len(best_all_ids) > len(best_input_ids),
-        "haystack_target_tokens": haystack_target,
-        "attempts": attempts + 1,
+        "needle_present_after_tokenization": needle_pos >= 0,
+        "needle_token_index": needle_pos,
+        "needle_depth_actual": 0.0
+        if filler_budget == 0
+        else before_needle / filler_budget,
+        "input_token_count": len(input_ids),
+        "truncated": False,
+        "haystack_target_tokens": filler_budget,
+        "attempts": 1,
+        "construction": "verified_token_ids",
     }
-    return best_prompt, metadata
+    if len(input_ids) != context_tokens or needle_pos < 0:
+        raise RuntimeError("NIAH token builder failed its exact-context invariant")
+    return input_ids, metadata
+
+
+def build_niah_prompt_and_metadata(
+    tokenizer,
+    context_tokens: int,
+    needle_depth: float,
+    trial_seed: int = 0,
+):
+    """Compatibility renderer for callers that need display text, not model input."""
+    input_ids, metadata = build_niah_input_ids_and_metadata(
+        tokenizer, context_tokens, needle_depth, trial_seed
+    )
+    return tokenizer.decode(input_ids, skip_special_tokens=False), metadata
 
 
 def create_haystack(tokenizer, target_tokens: int) -> str:
@@ -244,7 +257,7 @@ def run_niah_test(
     """Run a single Needle-in-Haystack test."""
     device = torch.device("cuda")
 
-    prompt, metadata = build_niah_prompt_and_metadata(
+    input_ids, metadata = build_niah_input_ids_and_metadata(
         tokenizer=tokenizer,
         context_tokens=context_tokens,
         needle_depth=needle_depth,
@@ -253,9 +266,7 @@ def run_niah_test(
     code = metadata["needle_code"]
 
     # Tokenize
-    inputs = tokenizer(
-        prompt, return_tensors="pt", truncation=True, max_length=context_tokens
-    ).to(device)
+    inputs = {"input_ids": torch.tensor([input_ids], dtype=torch.long, device=device)}
     actual_tokens = inputs["input_ids"].shape[1]
 
     # Clear cache
@@ -332,6 +343,53 @@ def summarize_paired_results(rows: list[dict]) -> dict:
     }
 
 
+def _eos_token_ids(model, tokenizer) -> set[int]:
+    """Resolve the same EOS IDs used by the model's greedy generation config."""
+    raw_ids = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+    if raw_ids is None:
+        raw_ids = getattr(tokenizer, "eos_token_id", None)
+    if raw_ids is None:
+        return set()
+    if isinstance(raw_ids, int):
+        return {raw_ids}
+    return {int(token_id) for token_id in raw_ids}
+
+
+def _termination_reason(output_token_ids: list[int], eos_token_ids: set[int]) -> str:
+    if output_token_ids and output_token_ids[-1] in eos_token_ids:
+        return "eos"
+    return "max_new_tokens"
+
+
+def collect_greedy_session_output(
+    session,
+    first_logits: torch.Tensor,
+    *,
+    max_new_tokens: int,
+    eos_token_ids: set[int],
+) -> tuple[list[int], str]:
+    """Match greedy ``generate(max_new_tokens=...)`` token accounting.
+
+    ``first_logits`` predicts t1 from the prefill. Include t1 before calling
+    ``decode_one`` so a paired direct run does not compare t2..t31 with the
+    baseline's t1..t30 sequence. Stop immediately after emitting EOS.
+    """
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be positive")
+    token_ids = first_logits[:, -1:].argmax(dim=-1)
+    output_token_ids: list[int] = []
+    for generated_count in range(max_new_tokens):
+        token_id = int(token_ids.item())
+        output_token_ids.append(token_id)
+        if token_id in eos_token_ids:
+            return output_token_ids, "eos"
+        if generated_count + 1 == max_new_tokens:
+            break
+        result = session.decode_one(token_ids)
+        token_ids = result.logits[:, -1:].argmax(dim=-1)
+    return output_token_ids, "max_new_tokens"
+
+
 def run_niah_paired_test(
     model,
     tokenizer,
@@ -349,18 +407,13 @@ def run_niah_paired_test(
 ) -> dict:
     """Run one paired NIAH case: baseline and TurboQuant on the exact same prompt."""
     device = torch.device("cuda")
-    prompt, metadata = build_niah_prompt_and_metadata(
+    input_ids, metadata = build_niah_input_ids_and_metadata(
         tokenizer=tokenizer,
         context_tokens=context_tokens,
         needle_depth=depth,
         trial_seed=trial_seed,
     )
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=context_tokens,
-    ).to(device)
+    inputs = {"input_ids": torch.tensor([input_ids], dtype=torch.long, device=device)}
 
     case = {
         "context_target": context_tokens,
@@ -393,10 +446,17 @@ def run_niah_paired_test(
         torch.cuda.synchronize()
         case["baseline_time_s"] = time.perf_counter() - t0
 
-    baseline_answer = tokenizer.decode(
-        out_base[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
-    ).strip()
+    eos_token_ids = _eos_token_ids(model, tokenizer)
+    baseline_output_token_ids = [
+        int(token_id)
+        for token_id in out_base[0][inputs["input_ids"].shape[1] :].tolist()
+    ]
+    baseline_answer = tokenizer.decode(baseline_output_token_ids, skip_special_tokens=True).strip()
     case["baseline_answer"] = baseline_answer
+    case["baseline_output_token_ids"] = baseline_output_token_ids
+    case["baseline_termination_reason"] = _termination_reason(
+        baseline_output_token_ids, eos_token_ids
+    )
     case["baseline_correct"] = metadata["needle_code"] in baseline_answer
 
     torch.cuda.empty_cache()
@@ -411,17 +471,21 @@ def run_niah_paired_test(
     with torch.no_grad():
         t0 = time.perf_counter()
         direct = session.prefill(inputs["input_ids"])
-        token = direct.logits[:, -1:].argmax(dim=-1)
-        generated = []
-        for _ in range(30):
-            direct = session.decode_one(token)
-            token = direct.logits[:, -1:].argmax(dim=-1)
-            generated.append(token)
+        turboquant_output_token_ids, turboquant_termination_reason = (
+            collect_greedy_session_output(
+                session,
+                direct.logits,
+                max_new_tokens=30,
+                eos_token_ids=eos_token_ids,
+            )
+        )
         torch.cuda.synchronize()
         case["turboquant_time_s"] = time.perf_counter() - t0
 
-    tq_answer = tokenizer.decode(torch.cat(generated, dim=1)[0], skip_special_tokens=True).strip()
+    tq_answer = tokenizer.decode(turboquant_output_token_ids, skip_special_tokens=True).strip()
     case["turboquant_answer"] = tq_answer
+    case["turboquant_output_token_ids"] = turboquant_output_token_ids
+    case["turboquant_termination_reason"] = turboquant_termination_reason
     case["turboquant_correct"] = metadata["needle_code"] in tq_answer
 
     return case

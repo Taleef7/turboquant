@@ -22,6 +22,8 @@ class FakeAttention:
         self.layer_idx = layer_idx
         self.config = config
         self.scaling = 1 / config.head_dim**0.5
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.is_causal = True
 
 
 class FakeQwen:
@@ -58,7 +60,7 @@ class FakeQwen:
         output, _ = qwen25_packed_attention(
             module, query, key, value, None, scaling=module.scaling
         )
-        assert output.shape == query.shape
+        assert output.shape == (1, tokens, 28, 128)
         return SimpleNamespace(logits=torch.zeros((1, tokens, 11), dtype=torch.float16))
 
 

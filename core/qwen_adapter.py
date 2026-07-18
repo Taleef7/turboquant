@@ -9,7 +9,6 @@ import math
 from typing import Any, Iterator
 
 import torch
-import torch.nn.functional as F
 
 from core.capabilities import (
     DecodeRequest,
@@ -57,17 +56,26 @@ def _attention_layers(model: object) -> list[object]:
 
 
 def _standard_causal_attention(
-    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attention_mask: torch.Tensor | None
+    module: object,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    **kwargs: Any,
 ) -> torch.Tensor:
-    if query.shape[1] != key.shape[1]:
-        if query.shape[1] % key.shape[1]:
-            raise UnsupportedCapabilityError("unsupported Qwen2.5 grouped-query attention layout.")
-        repeat = query.shape[1] // key.shape[1]
-        key = key.repeat_interleave(repeat, dim=1)
-        value = value.repeat_interleave(repeat, dim=1)
-    return F.scaled_dot_product_attention(
-        query, key, value, attn_mask=attention_mask, is_causal=attention_mask is None
+    """Delegate prefill exactly to the pinned Transformers SDPA interface.
+
+    Qwen2 expects its attention function to return ``[batch, query, heads,
+    head_dim]`` before its own reshape.  The Transformers helper also owns the
+    version-specific GQA repeat, mask slicing, explicit scaling, dropout, and
+    causal decision, so duplicating those details here risks divergence.
+    """
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+    output, _ = sdpa_attention_forward(
+        module, query, key, value, attention_mask, **kwargs
     )
+    return output
 
 
 def qwen25_packed_attention(
@@ -87,7 +95,12 @@ def qwen25_packed_attention(
     query_length = query.shape[-2]
     if query_length > 1:
         session.metrics.standard_prefill_calls += 1
-        return _standard_causal_attention(query, key, value, attention_mask), None
+        return (
+            _standard_causal_attention(
+                module, query, key, value, attention_mask, **kwargs
+            ),
+            None,
+        )
     if query_length != 1 or session.phase != "decode":
         raise UnsupportedCapabilityError("direct packed attention requires a standard prompt prefill first.")
     output = session.packed_decode(module, query, scale=kwargs.get("scaling"))
@@ -217,7 +230,7 @@ class PackedAttentionSession:
                 scale=float(scale) if scale is not None else None,
             )
             self.metrics.packed_reference_decode_calls += 1
-            return reference
+            return reference.transpose(1, 2).contiguous()
         blocks = (
             PackedAttentionBlock(
                 packed_keys=block.keys.indices.reshape(query.shape[1] // self.capabilities.num_key_value_groups, block.logical_tokens, -1),
@@ -260,7 +273,7 @@ class PackedAttentionSession:
             self.metrics.packed_reference_max_error = float(
                 (output.unsqueeze(0).float() - reference.float()).abs().max().item()
             )
-        return output.unsqueeze(0)
+        return output.unsqueeze(0).transpose(1, 2).contiguous()
 
 
 def install_qwen25_packed_backend(
