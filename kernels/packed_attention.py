@@ -70,6 +70,15 @@ class PackedAttentionHotPathDebugState:
     rotation_launches: int = 0
     packed_score_launches: int = 0
     packed_value_launches: int = 0
+    tail_kernel_dispatches: int = 0
+
+
+@dataclass
+class PackedAttentionTailDebugState:
+    """Dispatch accounting for the specialized raw Qwen2.5 fp16 tail kernel."""
+
+    dispatches: int = 0
+    tail_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -94,7 +103,101 @@ PACKED_ATTENTION_COMPUTE_SANITIZER_COMMAND = (
 )
 
 
+_QWEN25_DIRECT_HEADS = 28
+_QWEN25_DIRECT_KV_HEADS = 4
+_QWEN25_DIRECT_GQA_RATIO = 7
+_QWEN25_DIRECT_HEAD_DIM = 128
+_QWEN25_DIRECT_MAX_TAIL_TOKENS = 383
+
+
 if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _qwen25_fp16_tail_online_kernel(
+        query_ptr,
+        keys_ptr,
+        values_ptr,
+        old_max_ptr,
+        old_denominator_ptr,
+        old_numerator_ptr,
+        new_max_ptr,
+        new_denominator_ptr,
+        new_numerator_ptr,
+        tail_tokens,
+        SCALE: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+    ):
+        """One program per Q head; stream the bounded raw fp16 tail in registers."""
+        head = tl.program_id(0)
+        kv_head = head // 7
+        dims = tl.arange(0, 128)
+        query = tl.load(
+            query_ptr + head * 128 + dims
+        ).to(tl.float32)
+        running_max = tl.load(old_max_ptr + head).to(tl.float32)
+        running_denominator = tl.load(old_denominator_ptr + head).to(tl.float32)
+        running_numerator = tl.load(
+            old_numerator_ptr + head * 128 + dims
+        ).to(tl.float32)
+        for token_start in tl.static_range(
+            0, 383, BLOCK_T
+        ):
+            tokens = token_start + tl.arange(0, BLOCK_T)
+            token_mask = tokens < tail_tokens
+            offsets = (
+                (kv_head * tail_tokens + tokens)[:, None]
+                * 128
+                + dims[None, :]
+            )
+            keys = tl.load(
+                keys_ptr + offsets,
+                mask=token_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            products = tl.reshape(keys * query[None, :], (BLOCK_T, 8, 16))
+            partial_scores = tl.sum(products, axis=2)
+            scores = tl.zeros((BLOCK_T,), dtype=tl.float32)
+            compensation = tl.zeros((BLOCK_T,), dtype=tl.float32)
+            partial_axis = tl.arange(0, 8)
+            for partial_index in tl.static_range(0, 8):
+                partial = tl.sum(
+                    partial_scores
+                    * (partial_axis[None, :] == partial_index),
+                    axis=1,
+                )
+                compensated = partial - compensation
+                updated = scores + compensated
+                compensation = (updated - scores) - compensated
+                scores = updated
+            scores = scores * SCALE
+            scores = tl.where(token_mask, scores, -float("inf"))
+            block_max = tl.max(scores, axis=0)
+            new_max = tl.maximum(running_max, block_max)
+            old_scale = tl.where(
+                running_max == -float("inf"),
+                0.0,
+                tl.exp(running_max - new_max),
+            )
+            weights = tl.exp(scores - new_max)
+            running_denominator = (
+                running_denominator * old_scale + tl.sum(weights, axis=0)
+            )
+            values = tl.load(
+                values_ptr + offsets,
+                mask=token_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            running_numerator = (
+                running_numerator * old_scale
+                + tl.sum(values * weights[:, None], axis=0)
+            )
+            running_max = new_max
+        tl.store(new_max_ptr + head, running_max)
+        tl.store(new_denominator_ptr + head, running_denominator)
+        tl.store(
+            new_numerator_ptr + head * 128 + dims,
+            running_numerator,
+        )
 
     @triton.jit
     def _rotate_query_kernel(
@@ -869,6 +972,97 @@ def prepare_packed_value_mix(
     )
 
 
+def qwen25_fp16_tail_online_update(
+    query: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    prior_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    scale: float,
+    debug: PackedAttentionTailDebugState | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Merge one raw Qwen2.5 fp16 tail into a packed-attention online state.
+
+    This intentionally targets the direct Qwen2.5 decode layout only: 28 query
+    heads, four KV heads, GQA ratio seven, head dimension 128, and a bounded
+    tail of at most 383 tokens.  The kernel maps query to KV heads internally,
+    so it never materializes an expanded ``[28, tokens, 128]`` K/V tensor.
+    """
+    if (
+        not isinstance(query, torch.Tensor)
+        or query.shape != (_QWEN25_DIRECT_HEADS, 1, _QWEN25_DIRECT_HEAD_DIM)
+        or query.dtype != torch.float16
+    ):
+        raise ValueError(
+            "direct Qwen2.5 fp16 tail requires query [28, 1, 128] torch.float16."
+        )
+    if not (_TRITON_AVAILABLE and torch.cuda.is_available() and query.is_cuda):
+        raise RuntimeError("direct Qwen2.5 fp16 tail update requires CUDA and Triton.")
+    if (
+        not isinstance(keys, torch.Tensor)
+        or not isinstance(values, torch.Tensor)
+        or keys.ndim != 3
+        or keys.shape != values.shape
+        or keys.shape[0] != _QWEN25_DIRECT_KV_HEADS
+        or keys.shape[-1] != _QWEN25_DIRECT_HEAD_DIM
+        or not 1 <= keys.shape[1] <= _QWEN25_DIRECT_MAX_TAIL_TOKENS
+        or keys.dtype != torch.float16
+        or values.dtype != torch.float16
+        or keys.device != query.device
+        or values.device != query.device
+        or not keys.is_contiguous()
+        or not values.is_contiguous()
+    ):
+        raise ValueError(
+            "direct Qwen2.5 fp16 tail requires contiguous K/V [4, tokens, 128] "
+            "torch.float16 tensors on the query device, with 1 <= tokens <= 383."
+        )
+    if not isinstance(prior_state, tuple) or len(prior_state) != 3:
+        raise ValueError("prior_state must be (max, denominator, numerator).")
+    old_max, old_denominator, old_numerator = prior_state
+    if (
+        not all(isinstance(tensor, torch.Tensor) for tensor in prior_state)
+        or old_max.shape != (_QWEN25_DIRECT_HEADS, 1)
+        or old_denominator.shape != (_QWEN25_DIRECT_HEADS, 1)
+        or old_numerator.shape
+        != (_QWEN25_DIRECT_HEADS, 1, _QWEN25_DIRECT_HEAD_DIM)
+        or old_max.dtype != torch.float32
+        or old_denominator.dtype != torch.float32
+        or old_numerator.dtype != torch.float32
+        or any(tensor.device != query.device for tensor in prior_state)
+        or not all(tensor.is_contiguous() for tensor in prior_state)
+    ):
+        raise ValueError(
+            "direct Qwen2.5 fp16 tail requires contiguous fp32 online state "
+            "([28, 1], [28, 1], [28, 1, 128]) on the query device."
+        )
+    if not math.isfinite(scale):
+        raise ValueError("scale must be finite.")
+
+    new_max = torch.empty_like(old_max)
+    new_denominator = torch.empty_like(old_denominator)
+    new_numerator = torch.empty_like(old_numerator)
+    _qwen25_fp16_tail_online_kernel[(_QWEN25_DIRECT_HEADS,)](
+        query.contiguous(),
+        keys,
+        values,
+        old_max,
+        old_denominator,
+        old_numerator,
+        new_max,
+        new_denominator,
+        new_numerator,
+        keys.shape[1],
+        SCALE=float(scale),
+        BLOCK_T=16,
+        num_warps=4,
+    )
+    if debug is not None:
+        debug.dispatches += 1
+        debug.tail_tokens = keys.shape[1]
+    return new_max, new_denominator, new_numerator
+
+
 @dataclass(frozen=True)
 class PreparedPackedAttentionDecode:
     """Validated static packed layout for one Qwen attention layer.
@@ -1038,25 +1232,47 @@ class PreparedPackedAttentionDecode:
                 or window_values.device != query.device
             ):
                 raise ValueError("fp16_window must match the prepared KV-head layout and device.")
-            mapped_keys = window_keys.float()[self.gqa_mapping_long]
-            mapped_values = window_values.float()[self.gqa_mapping_long]
-            window_scores = torch.einsum("hqd,htd->hqt", query.float(), mapped_keys)
-            window_scores = window_scores * self.scale
             old_max, old_denominator, old_numerator = state
-            block_max = window_scores.max(dim=-1).values
-            new_max = torch.maximum(old_max, block_max)
-            old_scale = torch.where(
-                torch.isfinite(old_max),
-                torch.exp(old_max - new_max),
-                torch.zeros_like(old_max),
-            )
-            weights = torch.exp(window_scores - new_max.unsqueeze(-1))
-            state = (
-                new_max,
-                old_denominator * old_scale + weights.sum(dim=-1),
-                old_numerator * old_scale.unsqueeze(-1)
-                + torch.einsum("hqt,htd->hqd", weights, mapped_values),
-            )
+            if (
+                self.heads == _QWEN25_DIRECT_HEADS
+                and self.num_kv_heads == _QWEN25_DIRECT_KV_HEADS
+                and self.head_dim == _QWEN25_DIRECT_HEAD_DIM
+                and query_tokens == 1
+                and query.dtype == torch.float16
+                and window_keys.dtype == torch.float16
+                and window_values.dtype == torch.float16
+                and window_keys.shape[1] <= _QWEN25_DIRECT_MAX_TAIL_TOKENS
+                and window_keys.is_contiguous()
+                and window_values.is_contiguous()
+            ):
+                state = qwen25_fp16_tail_online_update(
+                    query,
+                    window_keys,
+                    window_values,
+                    prior_state=(old_max, old_denominator, old_numerator),
+                    scale=self.scale,
+                )
+                if self.debug is not None:
+                    self.debug.tail_kernel_dispatches += 1
+            else:
+                mapped_keys = window_keys.float()[self.gqa_mapping_long]
+                mapped_values = window_values.float()[self.gqa_mapping_long]
+                window_scores = torch.einsum("hqd,htd->hqt", query.float(), mapped_keys)
+                window_scores = window_scores * self.scale
+                block_max = window_scores.max(dim=-1).values
+                new_max = torch.maximum(old_max, block_max)
+                old_scale = torch.where(
+                    torch.isfinite(old_max),
+                    torch.exp(old_max - new_max),
+                    torch.zeros_like(old_max),
+                )
+                weights = torch.exp(window_scores - new_max.unsqueeze(-1))
+                state = (
+                    new_max,
+                    old_denominator * old_scale + weights.sum(dim=-1),
+                    old_numerator * old_scale.unsqueeze(-1)
+                    + torch.einsum("hqt,htd->hqd", weights, mapped_values),
+                )
             saw_history = True
         if not saw_history:
             raise ValueError("cannot decode packed attention with no KV history.")
