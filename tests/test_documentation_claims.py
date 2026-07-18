@@ -24,7 +24,7 @@ PUBLIC_DOCUMENTS = (
     ROOT / "docs" / "RESULTS.md",
 )
 QUALIFIED_ARTIFACT_ID = re.compile(
-    r"qualified(?:-[a-z0-9]+)?/\d{8}T\d{6}Z-[a-z0-9._-]+", re.IGNORECASE
+    r"qualified(?:-[a-z0-9]+)*/\d{8}T\d{6}Z-[a-z0-9._-]+", re.IGNORECASE
 )
 THIRTY_TWO_K_SUCCESS = re.compile(
     r"(?:\b(?:successful(?:ly)?|passed|succeeded|qualified|validated)"
@@ -98,6 +98,9 @@ def test_docs_do_not_contain_unqualified_legacy_memory_claims() -> None:
 def test_qualified_artifact_reference_rejects_generic_label() -> None:
     assert not has_qualified_artifact_id("a qualified artifact")
     assert has_qualified_artifact_id("qualified-v4/20260718T053419Z-unknown")
+    assert has_qualified_artifact_id(
+        "qualified-semantic-final/20260718T074435Z-5c9d4c34b0f0"
+    )
 
 
 def test_claim_normalization_handles_unicode_multiplication_and_whitespace() -> None:
@@ -142,14 +145,25 @@ def test_readme_links_direct_profile_and_benchmark_protocol() -> None:
     assert "[benchmark protocol](docs/BENCHMARK_PROTOCOL.md)" in readme
 
 
-def test_results_record_the_non_qualified_evidence_outcome() -> None:
+def test_results_record_the_capacity_limited_final_evidence_outcome() -> None:
     results_path = ROOT / "docs" / "RESULTS.md"
     assert results_path.exists()
     results = results_path.read_text(encoding="utf-8")
 
+    assert "qualified-semantic-final/20260718T074435Z-5c9d4c34b0f0" in results
+    assert "5c9d4c34b0f0c31d015e2166ae7ad401858b202d" in results
+    assert "Structural validation:** valid" in results
+    assert "12/12" in results
+    assert "exact baseline/direct output-token-ID agreement" in results
+    assert "233,447,424" in results
+    assert "1.29 tok/s" in results
+    assert "33.99 tok/s" in results
+    assert "12,809,961,472" in results
+    assert "10,405,439,078" in results
+    assert "8k_capacity_admission_failed" in results
+    assert "No 32K quality or systems child was launched." in results
+
+    # The predecessor stays visible only as retired invalid history.
     assert "20260718T053419Z-unknown" in results
-    assert "Current validation status: `invalid`" in results
-    assert "7751/7754" in results
-    assert "not a qualified 8K result" in results
-    assert "32K: skipped" in results
-    assert "not retrieval-safe" in results
+    assert "7,751/7,754" in results
+    assert "retired invalid artifact" in results

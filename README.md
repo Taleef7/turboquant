@@ -17,13 +17,13 @@ The only implemented model adapter is Qwen2.5-7B-Instruct, using the checked-in
 narrow: text-only, batch size one, standard prefill, greedy single-token decode,
 one CUDA device, and full-attention layers.
 
-The latest retained evidence attempt is local artifact
-`artifacts/qualified-v4/20260718T053419Z-unknown`. Its generated report recorded
-`failed`, but the strengthened validator classifies it as **invalid**: its
-requested 4K/8K rows used materially shorter effective inputs and its Git/binding
-provenance is incomplete. Its original 32K leg was skipped. That invalidation is
-the current truth, not a hidden caveat. See
-[results](docs/RESULTS.md) and the [benchmark protocol](docs/BENCHMARK_PROTOCOL.md).
+The current evidence artifact is
+`artifacts/qualified-semantic-final/20260718T074435Z-5c9d4c34b0f0`, bound to
+commit `5c9d4c34b0f0c31d015e2166ae7ad401858b202d`. Its report is structurally
+valid but overall `failed`: the 8K quality matrix is qualified, while 32K
+capacity admission fails and no 32K child is launched. The 8K systems comparison
+also shows no end-to-end speed or VRAM win. See [results](docs/RESULTS.md) and
+the [benchmark protocol](docs/BENCHMARK_PROTOCOL.md).
 
 ## What is implemented and tested
 
@@ -46,11 +46,11 @@ diagnostic evidence only and is not retrieval-safe evidence.
 
 ## What is not claimed
 
-- The shipped Qwen2.5 profile is **not retrieval-qualified**. The retained NIAH
-  artifact is invalid, so it must not be used to support a quality,
-  memory-saving, or throughput claim.
-- There is no verified end-to-end speedup or memory win. Physical bytes, peak
-  allocator memory, and latency are reported only inside named raw artifacts.
+- The shipped Qwen2.5 profile has a qualified **8K** NIAH matrix, but is not
+  32K- or release-qualified: capacity admission failed before a 32K child could
+  run.
+- The named 8K systems artifact reports no end-to-end speedup or VRAM win:
+  Triton-direct is slower and reserves more memory than baseline in that run.
 - Qwen3, Qwen3.5, and Gemma 4 are manifests and fail-closed capability paths,
   not completed adapters. Their promotion requires their own adapter tests and
   evidence run.
@@ -116,8 +116,8 @@ quality gate passes. Use [the protocol](docs/BENCHMARK_PROTOCOL.md) to interpret
 
 ## Documentation map
 
-- [Results](docs/RESULTS.md): current artifact-backed observations, including
-  the invalidated retained run.
+- [Results](docs/RESULTS.md): current artifact-backed 8K result, 32K capacity
+  stop, systems comparison, and retired invalid v4 history.
 - [Benchmark protocol](docs/BENCHMARK_PROTOCOL.md): artifact schema, matrix,
   statistical and invalid-run rules.
 - [Portability](docs/PORTABILITY.md): model capability contracts and adapter

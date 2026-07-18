@@ -1,7 +1,7 @@
 # TurboQuant Forge Issue Tracker
 
 **Last reconciled:** 2026-07-18
-**Evidence baseline:** `artifacts/qualified-v4/20260718T053419Z-unknown`
+**Evidence baseline:** `artifacts/qualified-semantic-final/20260718T074435Z-5c9d4c34b0f0`
 
 This tracker separates implementation closure from evidence promotion. A code
 path is marked resolved only when it has implementation and automated tests; a
@@ -26,13 +26,16 @@ cannot select it and it is not a resolved direct-backend route.
 ## Open issue: Qwen2.5 profile quality promotion
 
 **Priority:** critical
-**Status:** open — current profile is not retrieval-safe
+**Status:** open — qualified at 8K only; no 32K or release qualification
 
-The retained raw quality rows underfill their requested contexts (3,656/3,659
-for 4K and 7,751/7,754 for 8K), so the current validator marks the artifact
-`invalid`; its raw `failed` report is no longer qualifying evidence. The 12/12
-versus 0/12 diagnostic outcome applies only to those underfilled rows. Its raw
-report also skips 32K. Do not use kernel parity or the short model smoke to
+The current bound artifact has an exact 12/12 4K/8K matrix: baseline and direct
+are both correct in every case and their output token IDs agree exactly. Its
+systems child is structurally valid and direct-dispatched, but direct is slower
+(1.29 versus 33.99 tok/s) and reserves more memory (11,876,171,776 versus
+11,293,163,520 bytes) than baseline. Capacity admission then projects
+12,809,961,472 bytes at 32K against an allowed 10,405,439,078-byte budget and
+records `8k_capacity_admission_failed`; no 32K child is launched. Do not use
+kernel parity, the short model smoke, or the retired invalid v4 artifact to
 close this issue.
 
 ### Promotion criteria
@@ -40,7 +43,10 @@ close this issue.
 - A complete, binding-consistent quality matrix with baseline at least 95%.
 - Paired bootstrap upper 95% delta no greater than two percentage points.
 - A structurally valid systems artifact with direct dispatch and no fallback.
-- Calibrated capacity admission before any 32K leg.
+- A passing calibrated capacity admission and complete 32K quality/systems
+  children.
+- An end-to-end comparison that establishes an advantage, if an advantage is
+  claimed.
 - Updated [RESULTS.md](docs/RESULTS.md) naming the resulting raw artifact.
 
 ## Open issue: Qwen3 dense adapter

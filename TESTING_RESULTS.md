@@ -1,73 +1,74 @@
 # TurboQuant Forge — Testing Results
 
-**Evidence status:** the latest retained release attempt is invalid under the
-current artifact contract. This document supersedes historical prototype
-summaries; it does not promote an invalid artifact into a successful result.
+**Evidence status:** the current bound artifact has a qualified 8K quality
+matrix and a complete 8K systems comparison, but the top-level release report
+is `failed` because 32K capacity admission fails. It is not a 32K or release
+qualification.
 
-## Evidence sources
+## Evidence source
 
 Raw release artifacts are intentionally ignored from version control because
-they contain machine-specific logs and measurements. Recreate them with
-`scripts/reproduce_release.py`; the source for the observations below is:
+they contain machine-specific logs and measurements. The observations below are
+from:
 
 ```text
-artifacts/qualified-v4/20260718T053419Z-unknown
+artifacts/qualified-semantic-final/20260718T074435Z-5c9d4c34b0f0
 ```
 
-The artifact was captured on the local RTX 5070 Ti Laptop GPU (12,820,480,000
-bytes reported total VRAM), WSL2, Python 3.12.3, PyTorch 2.7.0+cu128,
-Transformers 4.57.3, and Triton 3.3.0. Its generated `git_commit` field is
-`unknown`, so the directory name and binding hashes—not a claimed revision—are
-the available identifiers for this run.
+The artifact is bound to
+`5c9d4c34b0f0c31d015e2166ae7ad401858b202d` and was captured on the local RTX
+5070 Ti Laptop GPU (12,820,480,000 reported total VRAM), WSL2, Python 3.12.3,
+PyTorch 2.7.0+cu128, Transformers 4.57.3, and Triton 3.3.0.
 
 ## Current release outcome
 
-`repro_report.json` in the raw artifact reports:
+`repro_report.json` records the following state:
 
 | Field | Value |
 | --- | --- |
-| Raw report status | `failed` (recorded before the strengthened contract) |
-| Current validation status | `invalid` |
-| Quality artifact | Invalid: effective inputs miss the required context fidelity floor and the commit/binding is incomplete. |
-| Systems artifact | Invalid: the commit/binding is incomplete under the current contract. |
-| 32K decision | `skipped` in the raw report; not a qualification outcome. |
+| Raw report status | `failed` |
+| Structural validation | Valid under the artifact's bound contract |
+| Quality child | `qualified` |
+| Systems child | `completed` with direct Triton dispatch |
+| 32K decision | `8k_capacity_admission_failed`; skipped before a child launch |
 
-### Quality gate
+### Exact 8K quality gate
 
-The raw rows requested 4K and 8K, but their effective model input lengths are
-3,656/3,659 and 7,751/7,754 tokens, respectively. The contract requires at
-least 99% of each requested context (4,056 for 4K and 8,111 for 8K), so the
-matrix is invalid rather than a valid 4K-8K evaluation. Its recorded diagnostic
-outcomes were baseline 12/12 and direct profile 0/12 across those underfilled
-rows, but those outcomes are **not a qualified 8K result** or a retrieval claim.
+The quality child exercises all 12 required cases: exact 4,096 and 8,192 token
+inputs, depths 0.1/0.5/0.9, and seeds 0/1. Baseline and direct are correct in
+12/12 cases, and their output token IDs match exactly in all 12. The paired
+bootstrap delta is 0.0 percentage points with an upper 95% bound of 0.0
+percentage points (`seed=1729`, `iterations=10000`).
 
-This is useful negative evidence: the harness caught a model-level quality
-regression that kernel parity and a short decode smoke cannot detect.
+This qualifies the exact 4K/8K NIAH matrix in this named artifact. It does not
+generalize to 32K, broad long-context benchmarks, other models, or a paper-level
+claim.
 
-### Systems observation, not a win claim
+### Complete 8K systems comparison, not a win claim
 
-The raw systems artifact recorded one interleaved trial for baseline,
-packed-reference, and Triton-direct backends. Its direct trial reported:
+The direct path physically stores 233,447,424 bytes: 113,770,496 bytes of K
+payload, 85,327,872 of V payload, 15,998,976 of metadata, and 18,350,080 of
+bounded fp16/bf16 tail. Its end-to-end measurements compare unfavorably with
+baseline:
 
-| Measurement | Artifact value |
-| --- | ---: |
-| Physical packed store bytes | 233,447,424 |
-| Peak allocated bytes | 9,278,377,472 |
-| Peak reserved bytes | 11,876,171,776 |
-| Decode p50 / p95 | 719.165 / 1,088.576 ms |
-| Decode rate | 1.240 tok/s |
-| Direct dispatches | 1,792 |
-| Packed blocks consumed | 55,552 |
+| Measurement | Triton-direct | Baseline |
+| --- | ---: | ---: |
+| Decode rate | 1.29 tok/s | 33.99 tok/s |
+| Decode p50 | 727.09 ms | 27.86 ms |
+| Peak allocated | 9,278,377,472 bytes | 9,169,062,400 bytes |
+| Peak reserved | 11,876,171,776 bytes | 11,293,163,520 bytes |
 
-These are diagnostic measurements from the named raw artifact, not an assertion
-of a speed or memory improvement. The artifact is invalid under the current
-provenance contract, so these values cannot support an end-to-end claim.
+Accordingly, the artifact establishes neither an end-to-end speedup nor a VRAM
+win. Physical cache bytes and allocator peaks remain different measurements.
 
-The calibrated 8K-to-32K reservation estimate is 12,809,961,472 bytes against
-a 10,405,439,078-byte safety budget. It fails capacity admission independently
-of the invalid quality artifact. No 32K quality or systems child process was run.
+### 32K capacity stop
 
-## Correctness evidence that did pass
+The admission calculation is based on the valid 8K systems child and projects
+12,809,961,472 bytes at 32K against an allowed 10,405,439,078-byte budget. It
+records `8k_capacity_admission_failed`; `attempt_32k` is false. No 32K quality
+or systems child process was launched.
+
+## Correctness checks separate from release evidence
 
 - CPU tests cover bit packing, codec/store accounting, capability/profile
   validation, blockwise reference attention, artifact validation, and public
@@ -78,15 +79,15 @@ of the invalid quality artifact. No 32K quality or systems child process was run
 - The opt-in Qwen2.5 smoke test uses a 1K-token prefill plus 64 decode tokens,
   checks direct/reference greedy-token agreement, finite logits, packed-block
   consumption, and absence of historical KV concatenation. It observed maximum
-  fp16-logit drift `16.935546875`; that is deliberately emitted, not hidden.
+  fp16-logit drift `16.935546875`; that value is diagnostic only.
 
-## Retired prototype claims
+## Retired invalid v4 artifact
 
-Older documents described a generic legacy `TurboQuantCacheV2` experiment as
-if it established broad multi-model quality, compression, or throughput. Those
-observations are not evidence for Forge's packed direct backend: V2 reconstructs
-historical K/V state and the new profile loader rejects it. They are retained in
-source history only, not in the release claim surface.
+`qualified-v4/20260718T053419Z-unknown` is retained for historical debugging,
+not as release evidence. It is invalid because its requested 4K/8K rows used
+only 3,656/3,659 and 7,751/7,754 effective tokens and its provenance binding
+was incomplete. Older generic `TurboQuantCacheV2` prototype statements are also
+not evidence for Forge's packed direct backend.
 
 For the exact acceptance and invalidation rules, read
 [docs/BENCHMARK_PROTOCOL.md](docs/BENCHMARK_PROTOCOL.md). For a reproduction

@@ -10,18 +10,23 @@ claiming paper-level results.
 | Code provenance | Research implementation and paper | New clean-room Python/Triton implementation under MIT; no GPL code is copied. |
 | KV storage | Quantized cache representations | Physically bit-packed fixed blocks plus bounded fp16/bf16 tail; exact tensor bytes are measured. |
 | Attention execution | Research-specific evaluation | Blockwise PyTorch reference and direct Triton score/value mixing for the pinned Qwen2.5 path. |
-| Quality evaluation | Broad research benchmarks | Paired NIAH runner with explicit invalid/failed states; retained direct evidence is invalid, so no retrieval result is claimed. |
+| Quality evaluation | Broad research benchmarks | Paired NIAH runner with explicit invalid/failed states; the named bound artifact qualifies an exact 4K/8K matrix, while its 32K leg is capacity-rejected. |
 | Model support | Paper-dependent architectures | Qwen2.5 direct adapter only; other listed families have no adapter. |
 | Serving/runtime | Research and production-adjacent contexts | No server, batching, beam search, speculative decoding, paging/offload, or distributed path. |
 
-## Why an invalid quality artifact remains valuable
+## Current bounded evidence and retired invalid evidence
 
-The artifact `qualified-v4/20260718T053419Z-unknown` retains attempted NIAH
-rows, systems logs, and a mechanical 32K admission decision. The corrected
-validator rejects it because effective contexts were materially shorter than
-requested and the commit/binding provenance is incomplete. That makes the next
-engineering step clear: rerun the fixed protocol with full context fidelity and
-resolved provenance before evaluating profile quality.
+`qualified-semantic-final/20260718T074435Z-5c9d4c34b0f0`, bound to commit
+`5c9d4c34b0f0c31d015e2166ae7ad401858b202d`, qualifies its exact 4K/8K NIAH
+matrix (12/12 baseline/direct correctness and exact token-ID agreement). It
+also records a complete 8K systems comparison that is slower and uses higher
+allocator peaks than baseline. The top-level report remains `failed`: its
+32K capacity preflight projects 12,809,961,472 bytes against an allowed
+10,405,439,078-byte budget, so no 32K child was launched.
+
+`qualified-v4/20260718T053419Z-unknown` remains retired invalid history. Its
+effective contexts were materially shorter than requested and its binding was
+incomplete; it must not be combined with the newer artifact to create a claim.
 
 ## Deliberate differences from the legacy prototype
 
@@ -33,8 +38,8 @@ be mutated.
 
 ## Next evidence needed for a closer comparison
 
-1. Produce a Qwen2.5 profile whose complete NIAH matrix satisfies the declared
-   retrieval gate and whose systems artifact remains structurally valid.
+1. Make 32K capacity-admissible, then produce and validate its own quality and
+   systems children before extending the 8K finding.
 2. Benchmark LongBench and RULER with the same model/profile/code bindings.
 3. Add a separately tested QJL residual implementation before comparing
    low-bit operating points.

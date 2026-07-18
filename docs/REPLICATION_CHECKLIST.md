@@ -86,9 +86,12 @@ python scripts/reproduce_release.py --mode qualified --output-dir artifacts/repr
 
 Inspect the timestamped `repro_report.json`, `quality`/`systems` JSON files,
 persisted 32K decision, and stdout/stderr logs. The qualified command returns
-nonzero unless all gates pass. The retained checked evidence is invalid under
-the current context/provenance contract, so a fresh run must not inherit its
-diagnostic outcomes as a success claim.
+nonzero unless all gates pass. The current named artifact,
+`qualified-semantic-final/20260718T074435Z-5c9d4c34b0f0`, is structurally valid
+and has qualified 8K quality evidence, but its top-level report is `failed`
+because 32K capacity admission stopped the run. A fresh result must not inherit
+that partial outcome as a 32K or release claim. The historical v4 artifact is
+retired invalid evidence.
 
 ## 6. Interpret before publishing
 
