@@ -201,7 +201,12 @@ class PackedAttentionSession:
         if prompt_ids.shape[1] <= 1:
             raise UnsupportedCapabilityError("direct packed attention requires a standard prompt prefill first.")
         with self._active("prefill"):
-            result = self.model(prompt_ids, past_key_values=self.cache, use_cache=True)
+            result = self.model(
+                prompt_ids,
+                past_key_values=self.cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
         self._last_logits = result.logits
         return result
 

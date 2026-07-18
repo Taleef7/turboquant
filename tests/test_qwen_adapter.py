@@ -48,9 +48,11 @@ class FakeQwen:
         )
         self.device = torch.device("cpu")
         self.dtype = torch.float16
+        self.forward_kwargs: list[dict[str, object]] = []
 
     def __call__(self, input_ids: torch.Tensor, *, past_key_values, use_cache: bool, **kwargs):
         assert use_cache is True
+        self.forward_kwargs.append(dict(kwargs))
         module = self.model.layers[0].self_attn
         tokens = input_ids.shape[1]
         query = torch.ones((1, 28, tokens, 128), dtype=torch.float16)
@@ -61,7 +63,8 @@ class FakeQwen:
             module, query, key, value, None, scaling=module.scaling
         )
         assert output.shape == (1, tokens, 28, 128)
-        return SimpleNamespace(logits=torch.zeros((1, tokens, 11), dtype=torch.float16))
+        logits_tokens = 1 if kwargs.get("logits_to_keep") == 1 else tokens
+        return SimpleNamespace(logits=torch.zeros((1, logits_tokens, 11), dtype=torch.float16))
 
 
 @pytest.fixture
@@ -103,6 +106,19 @@ def test_decode_dispatches_packed_backend_after_standard_prefill(
     assert session.cache.historical_kv_tokens_returned == 0
     assert session.metrics.packed_reference_max_error is not None
     assert session.metrics.packed_reference_max_error < 1e-3
+
+
+def test_prefill_retains_only_the_final_prompt_logit(
+    fake_qwen: FakeQwen, profile, capabilities
+) -> None:
+    session = install_qwen25_packed_backend(fake_qwen, profile, capabilities)
+
+    result = session.prefill(torch.tensor([[1, 2, 3]]))
+
+    assert fake_qwen.forward_kwargs == [{"logits_to_keep": 1}]
+    assert result.logits.shape == (1, 1, 11)
+    assert session._last_logits is result.logits
+    assert session.cache.sequence_length() == 3
 
 
 def test_layer_stores_have_distinct_rotations(fake_qwen: FakeQwen, profile, capabilities) -> None:

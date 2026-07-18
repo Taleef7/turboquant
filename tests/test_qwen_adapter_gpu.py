@@ -21,6 +21,9 @@ PROMPT = "Reply with one short word: TurboQuant"
 ROOT = Path(__file__).resolve().parents[1]
 PREFILL_LOGIT_RTOL = 5e-4
 PREFILL_LOGIT_ATOL = 5e-4
+# The 4-bit output projection can differ by one fp16 quantization step when
+# its M dimension changes from the full prompt to the last position only.
+ONE_LOGIT_FULL_PREFILL_ATOL = 1e-2
 GENERATION_PARITY_TOKENS = 8
 
 
@@ -66,22 +69,41 @@ def test_qwen25_packed_prefill_matches_baseline_before_packed_decode(
     assert prompt.shape[1] > 1
 
     with torch.inference_mode():
-        baseline = model(prompt, use_cache=True)
+        full_baseline = model(prompt, use_cache=True)
+        one_logit_baseline = model(prompt, use_cache=True, logits_to_keep=1)
         session = install_qwen25_packed_backend(model, profile)
         packed_prefill = session.prefill(prompt)
 
-    max_logit_drift = float(
-        (packed_prefill.logits.float() - baseline.logits.float()).abs().max().item()
-    )
     assert session.metrics.packed_decode_calls == 0
     assert session.metrics.standard_prefill_calls == profile.model_architecture["num_hidden_layers"]
+    assert session.cache.sequence_length() == prompt.shape[1]
+    assert full_baseline.past_key_values.get_seq_length() == prompt.shape[1]
+    assert one_logit_baseline.past_key_values.get_seq_length() == prompt.shape[1]
+    assert one_logit_baseline.logits.shape == packed_prefill.logits.shape == (
+        1,
+        1,
+        full_baseline.logits.shape[-1],
+    )
+    max_logit_drift = float(
+        (packed_prefill.logits.float() - one_logit_baseline.logits.float()).abs().max().item()
+    )
+    torch.testing.assert_close(
+        one_logit_baseline.logits,
+        full_baseline.logits[:, -1:],
+        rtol=0,
+        atol=ONE_LOGIT_FULL_PREFILL_ATOL,
+        msg="one-logit baseline must preserve the full prefill final position within one 4-bit projection step",
+    )
     assert torch.equal(
-        packed_prefill.logits[:, -1].argmax(dim=-1), baseline.logits[:, -1].argmax(dim=-1)
+        packed_prefill.logits[:, 0].argmax(dim=-1), one_logit_baseline.logits[:, 0].argmax(dim=-1)
+    )
+    assert torch.equal(
+        one_logit_baseline.logits[:, 0].argmax(dim=-1), full_baseline.logits[:, -1].argmax(dim=-1)
     )
     assert max_logit_drift <= PREFILL_LOGIT_ATOL
     torch.testing.assert_close(
         packed_prefill.logits,
-        baseline.logits,
+        one_logit_baseline.logits,
         rtol=PREFILL_LOGIT_RTOL,
         atol=PREFILL_LOGIT_ATOL,
         msg=f"Qwen prefill max logit drift: {max_logit_drift}",

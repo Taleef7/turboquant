@@ -83,7 +83,7 @@ def _run_once(model, profile, prompt_ids: torch.Tensor, backend: str, decode_tok
             end = torch.cuda.Event(enable_timing=True)
             start.record()
             if backend == "baseline":
-                prefill = model(prompt_ids, use_cache=True)
+                prefill = model(prompt_ids, use_cache=True, logits_to_keep=1)
                 prefill_ms = _elapsed_ms(start, end)
                 cache = prefill.past_key_values
                 token = prefill.logits[:, -1:].argmax(dim=-1)
