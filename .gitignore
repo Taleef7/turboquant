@@ -45,6 +45,9 @@ results/
 # Local visual brainstorming companion sessions
 .superpowers/
 
+# Local Git worktrees
+.worktrees/
+
 # Optional extra codebooks generated during experiments
 codebooks/codebook_d8_b*.json
 codebooks/codebook_d32_b*.json
