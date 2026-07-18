@@ -102,6 +102,57 @@ def test_qwen25_records_architecture_facts_from_config() -> None:
     assert caps.adapter_status == "direct-adapter"
 
 
+def test_capability_rope_metadata_is_recursively_immutable() -> None:
+    caps = derive_model_capabilities(
+        qwen25_config(rope_scaling={"nested": {"factor": 8.0}}), direct_revision()
+    )
+
+    with pytest.raises(TypeError):
+        caps.rope_settings["rope_scaling"]["nested"]["factor"] = 16.0
+
+
+def test_manifest_metadata_is_recursively_immutable(tmp_path: Path) -> None:
+    payload = json.loads(QWEN25_MANIFEST_PATH.read_text(encoding="utf-8"))
+    payload["rope_scaling"] = {"nested": {"factor": 8.0}}
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    manifest = load_model_manifest(path)
+
+    with pytest.raises(TypeError):
+        manifest.rope_settings["rope_scaling"]["nested"]["factor"] = 16.0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("model_id", 7),
+        ("revision", False),
+        ("model_type", ["qwen2"]),
+        ("adapter_status", 1),
+        ("architecture_complete", 1),
+        ("is_text_model", "true"),
+        ("is_multimodal", 0),
+        ("use_cache", "true"),
+        ("num_hidden_layers", True),
+        ("num_attention_heads", "28"),
+        ("num_key_value_heads", 4.0),
+        ("head_dim", False),
+        ("rope_theta", "1000000"),
+        ("cache_implementation", 7),
+    ],
+)
+def test_manifest_rejects_non_primitive_architecture_truth(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    payload = json.loads(QWEN25_MANIFEST_PATH.read_text(encoding="utf-8"))
+    payload[field] = value
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(UnsupportedCapabilityError, match=field):
+        load_model_manifest(path)
+
+
 def test_manifest_loader_is_available_from_the_core_public_api() -> None:
     assert core.load_model_manifest is load_model_manifest
 

@@ -6,7 +6,6 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any, Mapping
 
 from core.errors import UnsupportedCapabilityError
@@ -36,6 +35,40 @@ _MANIFEST_ARCHITECTURE_FIELDS = frozenset(
     }
 )
 _DIRECT_QWEN25_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+
+
+class FrozenDict(dict[str, Any]):
+    """A JSON-serializable mapping that rejects all mutation operations."""
+
+    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("frozen metadata cannot be mutated")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __ior__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+
+def _freeze_json(value: Any) -> Any:
+    """Recursively freeze JSON-compatible metadata while retaining its shape."""
+    if isinstance(value, Mapping):
+        return FrozenDict({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _thaw_json(value: Any) -> Any:
+    """Return a plain JSON-compatible copy for comparisons and serialization."""
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True)
@@ -77,7 +110,7 @@ class ModelManifest:
             "num_attention_heads": self.num_attention_heads,
             "num_key_value_heads": self.num_key_value_heads,
             "head_dim": self.head_dim,
-            "rope_settings": dict(self.rope_settings),
+            "rope_settings": _thaw_json(self.rope_settings),
             "is_text_model": self.is_text_model,
             "is_multimodal": self.is_multimodal,
             "cache_behavior": self.cache_behavior,
@@ -140,14 +173,14 @@ def _required_fields(payload: Mapping[str, Any], fields: frozenset[str], label: 
 def _manifest_layer_types(payload: Mapping[str, Any]) -> tuple[str, ...]:
     layer_count = payload["num_hidden_layers"]
     layer_types = payload["layer_types"]
-    if not isinstance(layer_count, int) or layer_count <= 0:
+    if type(layer_count) is not int or layer_count <= 0:
         raise UnsupportedCapabilityError("model manifest num_hidden_layers must be positive.")
     if not isinstance(layer_types, list) or len(layer_types) != layer_count:
         raise UnsupportedCapabilityError(
             "model manifest layer_types must contain exactly num_hidden_layers entries."
         )
     valid = {"full_attention", "sliding_attention", "linear_attention"}
-    if any(layer not in valid for layer in layer_types):
+    if any(not isinstance(layer, str) or layer not in valid for layer in layer_types):
         raise UnsupportedCapabilityError("model manifest contains an unknown layer type.")
     return tuple(layer_types)
 
@@ -165,8 +198,14 @@ def load_model_manifest(path: str | Path) -> ModelManifest:
     if not isinstance(payload, dict):
         raise UnsupportedCapabilityError("model manifest must be a JSON object.")
     _required_fields(payload, _MANIFEST_BASE_FIELDS, "model manifest")
-    if payload["schema_version"] != _MANIFEST_SCHEMA_VERSION:
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != _MANIFEST_SCHEMA_VERSION:
         raise UnsupportedCapabilityError("model manifest has an unsupported schema_version.")
+    for field in ("model_id", "revision", "model_type", "adapter_status"):
+        if not isinstance(payload[field], str) or not payload[field]:
+            raise UnsupportedCapabilityError(f"model manifest {field} must be a non-empty string.")
+    for field in ("architecture_complete", "is_text_model", "is_multimodal", "use_cache"):
+        if type(payload[field]) is not bool:
+            raise UnsupportedCapabilityError(f"model manifest {field} must be boolean.")
 
     complete = payload["architecture_complete"]
     if not isinstance(complete, bool):
@@ -175,7 +214,7 @@ def load_model_manifest(path: str | Path) -> ModelManifest:
         _required_fields(payload, _MANIFEST_ARCHITECTURE_FIELDS, "model manifest")
         layer_types = _manifest_layer_types(payload)
         for field in ("num_attention_heads", "num_key_value_heads", "head_dim"):
-            if not isinstance(payload[field], int) or payload[field] <= 0:
+            if type(payload[field]) is not int or payload[field] <= 0:
                 raise UnsupportedCapabilityError(
                     f"model manifest {field} must be a positive integer."
                 )
@@ -187,6 +226,13 @@ def load_model_manifest(path: str | Path) -> ModelManifest:
         layer_count = q_heads = kv_heads = head_dim = None
         layer_types = ()
 
+    if "rope_theta" in payload and (
+        type(payload["rope_theta"]) not in {int, float}
+    ):
+        raise UnsupportedCapabilityError("model manifest rope_theta must be numeric.")
+    for field in ("rope_scaling", "rope_parameters"):
+        if field in payload and not isinstance(payload[field], Mapping):
+            raise UnsupportedCapabilityError(f"model manifest {field} must be a JSON object.")
     rope_settings = {
         name: payload[name]
         for name in ("rope_theta", "rope_scaling", "rope_parameters")
@@ -194,6 +240,10 @@ def load_model_manifest(path: str | Path) -> ModelManifest:
     }
     cache_behavior = "enabled" if payload["use_cache"] else "disabled"
     if payload.get("cache_implementation"):
+        if not isinstance(payload["cache_implementation"], str):
+            raise UnsupportedCapabilityError(
+                "model manifest cache_implementation must be a string."
+            )
         cache_behavior = str(payload["cache_implementation"])
     return ModelManifest(
         path=manifest_path,
@@ -210,7 +260,7 @@ def load_model_manifest(path: str | Path) -> ModelManifest:
         num_attention_heads=q_heads,
         num_key_value_heads=kv_heads,
         head_dim=head_dim,
-        rope_settings=MappingProxyType(rope_settings),
+        rope_settings=_freeze_json(rope_settings),
         is_text_model=payload["is_text_model"],
         is_multimodal=payload["is_multimodal"],
         cache_behavior=cache_behavior,
@@ -292,7 +342,7 @@ def derive_model_capabilities(
         num_key_value_heads=kv_heads,
         head_dim=head_dim,
         num_key_value_groups=groups,
-        rope_settings=MappingProxyType(rope_settings),
+        rope_settings=_freeze_json(rope_settings),
         is_text_model=_field(config, "is_text_model"),
         is_multimodal=bool(_field(config, "is_multimodal", False)),
         cache_behavior=cache_behavior,

@@ -6,10 +6,9 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any, Mapping
 
-from core.capabilities import ModelRevision, load_model_manifest
+from core.capabilities import ModelRevision, _freeze_json, load_model_manifest
 from core.errors import UnsupportedCapabilityError
 
 
@@ -141,7 +140,7 @@ def load_profile(path: str | Path) -> CompressionProfile:
         model_manifest_path=manifest_path,
         model_manifest_sha256=payload["model_manifest_sha256"],
         revision=manifest.revision,
-        model_architecture=MappingProxyType(payload["model_architecture"]),
+        model_architecture=_freeze_json(payload["model_architecture"]),
         block_size=payload["block_size"],
         key_bits=payload["key_bits"],
         value_bits=payload["value_bits"],

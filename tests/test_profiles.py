@@ -62,6 +62,16 @@ def test_checked_in_direct_profile_validates_its_model_manifest() -> None:
     assert profile.fp16_window == 128
 
 
+def test_profile_architecture_metadata_is_recursively_immutable() -> None:
+    profile = load_profile(PROFILE_PATH)
+
+    with pytest.raises(TypeError):
+        profile.model_architecture["layer_types"][0] = "linear_attention"
+    with pytest.raises(TypeError):
+        profile.model_architecture["rope_settings"]["rope_theta"] = 1.0
+    assert json.loads(json.dumps(profile.model_architecture))["layer_types"][0] == "full_attention"
+
+
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
