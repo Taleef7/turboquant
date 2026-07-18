@@ -534,12 +534,12 @@ def validate_qualified_run(
                 expected = quality_artifact.get("expected_matrix")
                 if not isinstance(expected, Mapping) or 32768 not in expected.get("contexts", []):
                     errors.append("32K quality child must declare context_target 32768")
+                result = validate_quality_artifact(quality_artifact, report.get("binding"))
+                if not result.valid:
+                    errors.extend(f"32k quality: {error}" for error in result.errors)
                 if report.get("status") == "qualified":
                     if quality_leg.get("status") != "qualified":
                         errors.append("qualified report requires a qualified 32K quality child")
-                    result = validate_quality_artifact(quality_artifact, report.get("binding"))
-                    if not result.valid:
-                        errors.extend(f"32k quality: {error}" for error in result.errors)
             if not isinstance(systems_artifact, Mapping):
                 errors.append("attempted 32K decision requires a 32K systems child")
             else:
@@ -547,12 +547,12 @@ def validate_qualified_run(
                 trials = systems_artifact.get("trials")
                 if not isinstance(configuration, Mapping) or configuration.get("prompt_tokens") != 32768 or not isinstance(trials, list) or not trials or any(trial.get("context_tokens") != 32768 for trial in trials if isinstance(trial, Mapping)):
                     errors.append("32K systems child must prove 32768 prompt context in configuration and trials")
+                result = validate_systems_artifact(systems_artifact, report.get("binding"))
+                if not result.valid:
+                    errors.extend(f"32k systems: {error}" for error in result.errors)
                 if report.get("status") == "qualified":
                     if systems_leg.get("structurally_valid") is not True:
                         errors.append("qualified report requires a valid 32K systems child")
-                    result = validate_systems_artifact(systems_artifact, report.get("binding"))
-                    if not result.valid:
-                        errors.extend(f"32k systems: {error}" for error in result.errors)
     if report.get("status") == "qualified" and errors:
         errors.append("qualified status cannot accompany invalid child artifacts")
     return ValidationResult(not errors, tuple(errors))

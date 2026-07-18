@@ -303,3 +303,23 @@ def test_qualified_run_rejects_labeled_but_non_32k_children_and_missing_attempte
     result = validate_qualified_run(report)
     assert result.valid is False
     assert any("attempted 32K decision requires 32K child legs" in error for error in result.errors)
+
+
+def test_failed_attempted_32k_run_requires_structural_children_but_allows_quality_failure():
+    report = _qualified_report()
+    report["status"] = "failed"
+    quality = report["legs"]["32k"]["quality"]
+    quality["status"] = "failed"
+    quality["artifact"]["status"] = "failed"
+    quality["artifact"]["rows"][0]["profile_correct"] = False
+
+    assert validate_qualified_run(report).valid is True
+
+    report["legs"]["32k"]["quality"]["artifact"]["rows"] = []
+    report["legs"]["32k"]["systems"]["artifact"]["trials"] = []
+
+    result = validate_qualified_run(report)
+
+    assert result.valid is False
+    assert any(error.startswith("32k quality:") for error in result.errors)
+    assert any(error.startswith("32k systems:") for error in result.errors)
