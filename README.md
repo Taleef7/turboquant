@@ -1,305 +1,134 @@
-# TurboQuant: KV Cache Compression for LLMs
+# TurboQuant Forge
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![arXiv](https://img.shields.io/badge/arXiv-2504.19874-b31b1b.svg)](https://arxiv.org/abs/2504.19874)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-12.8%2B-76B900.svg)](https://pytorch.org/get-started/locally/)
-[![Scope](https://img.shields.io/badge/Validated-Qwen%2032K%20NIAH-success.svg)](TESTING_RESULTS.md)
-[![Repro](https://img.shields.io/badge/Repro-Checklist-blue.svg)](docs/REPLICATION_CHECKLIST.md)
 
-A from-scratch PyTorch implementation of **TurboQuant** ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) for KV-cache compression on consumer GPUs.
+TurboQuant Forge is a clean-room, evidence-first KV-cache research backend for
+Hugging Face Qwen2.5. It physically bit-packs fixed KV blocks and evaluates
+them with blockwise PyTorch reference attention and direct Triton decode
+kernels. The project treats every performance, memory, and quality statement as
+an artifact-backed claim rather than an extrapolation.
 
-> Reproducible, Qwen-focused TurboQuant replication with paired baseline-vs-TurboQuant NIAH validation through 16K in the current release-check path.
+## Current status
 
-## Why This Matters
+The only implemented model adapter is Qwen2.5-7B-Instruct, using the checked-in
+[direct profile](configs/profiles/qwen25-7b-direct-v1.json). It is deliberately
+narrow: text-only, batch size one, standard prefill, greedy single-token decode,
+one CUDA device, and full-attention layers.
 
-Long-context inference is often limited by KV-cache memory and memory bandwidth, not raw compute.
-If you can shrink KV-cache without breaking quality, you can run longer contexts cheaper and faster.
+The latest complete evidence attempt is local artifact
+`artifacts/qualified-v4/20260718T053419Z-unknown`. Its release status is
+**failed**, not qualified: the 8K NIAH gate failed and the 32K leg was skipped.
+That result is the current truth, not a hidden caveat. See
+[results](docs/RESULTS.md) and the [benchmark protocol](docs/BENCHMARK_PROTOCOL.md).
 
-This project is a practical replication effort focused on that tradeoff.
+## What is implemented and tested
 
-```text
-Without KV compression:
-  longer context -> much larger KV cache -> more VRAM pressure / memory traffic
+- A `PackedKVBlockStore` with fixed 256-token blocks, physically packed indices,
+  bounded fp16/bf16 tail storage, and byte accounting by payload category.
+- A blockwise packed PyTorch reference and Triton key-score/value-mix kernels.
+  GPU parity tests compare direct packed dispatch with that reference.
+- A scoped Transformers attention implementation for the pinned Qwen2.5 model:
+  standard causal attention on prefill, direct packed attention only on decode.
+- A validator-first quality/systems harness. It retains failed or invalid runs
+  with command logs and hashes; it never turns a missing row or failed gate into
+  a passing claim.
+- Fail-closed capability and profile validation before cache mutation.
 
-With TurboQuant-style KV compression:
-  longer context -> compressed KV cache -> lower memory footprint -> better practical scaling
-```
+The pinned Qwen model smoke test exercised a 1K-token prefill plus 64-token
+decode on the local GPU. It checks finite logits, packed-block consumption,
+direct/reference greedy-token agreement, and guards against historical KV
+concatenation. Its observed maximum fp16-logit drift was `16.935546875`; this is
+diagnostic evidence only and is not retrieval-safe evidence.
 
-## What This Project Does
+## What is not claimed
 
-- Compresses KV cache online during generation using a TurboQuant-style rotation + Lloyd-Max pipeline.
-- Preserves completion quality with compact settings (`6-bit` keys/values) for generation-heavy workloads.
-- Provides a retrieval-safe profile for long-context NIAH-style tasks.
-- Includes reproducible long-context paired evaluation tooling (`baseline` vs `TurboQuant` on identical prompts).
+- The shipped Qwen2.5 profile is **not retrieval-safe**. The complete 8K NIAH
+  evidence is a regression, so it must not be used to support a quality,
+  memory-saving, or throughput claim.
+- There is no verified end-to-end speedup or memory win. Physical bytes, peak
+  allocator memory, and latency are reported only inside named raw artifacts.
+- Qwen3, Qwen3.5, and Gemma 4 are manifests and fail-closed capability paths,
+  not completed adapters. Their promotion requires their own adapter tests and
+  evidence run.
+- `core/turboquant_cache_v2.py` is a legacy fidelity prototype. It reconstructs
+  historical KV state and is not the direct packed backend or evidence source.
+- This milestone has no server, vLLM/SGLang integration, batching, beam search,
+  sampling, speculative/MTP decode, distributed execution, offload, or
+  multimodal cache path.
 
-## TurboQuant In One Diagram
+## Model portability boundary
 
-```text
-Input token stream
-      |
-      v
-Model computes K,V per layer/head
-      |
-      +--> Baseline cache: store fp16 K,V directly
-      |
-      +--> TurboQuant cache:
-             K: norm -> unit normalize -> random rotate -> Lloyd-Max quantize -> indices (+ optional QJL fields)
-             V: per-group min/max quantize -> indices + scales
-             keep recent window uncompressed (buffer)
-      |
-      v
-Attention step dequantizes on demand for logits/value mix
-```
+| Family | Current state | Promotion requirement |
+| --- | --- | --- |
+| Qwen2.5-7B text | Direct adapter | Keep its pinned manifest/profile and pass the direct GPU/evidence suites. |
+| Qwen3 dense text | Manifest-only | Implement an adapter, prove config/layout parity, then run its own quality and systems artifacts. |
+| Qwen3.5 hybrid | Manifest-only | Compress only full-attention KV layers; preserve linear-attention recurrent state natively. |
+| Gemma 4 E4B | Manifest-only | Build a dedicated adapter, validate multimodal/cache boundaries, and pass capacity preflight plus evidence. |
 
-## Current Validated Scope
+Read [portability](docs/PORTABILITY.md) for the exact capability rules and
+non-KV exclusions.
 
-- Compression: **5.2x** (target 4.5x)
-- Throughput: **61-84%** of baseline depending on model/prompt length
-- Completion quality: **matches baseline** in tested suites
-- Retrieval quality (Qwen2.5-7B): **NIAH gate met through 32K** with `retrieval-safe-v3`
-  - Gate: baseline-vs-TurboQuant delta `<= 2.0pp`
-  - Observed at 32K paired matrix (t6): **1.39pp**
+## Install and verify
 
-Important scope note:
-- Full high-trial retrieval closure is currently **Qwen-focused**.
-- Mistral/Gemma retrieval checks are currently smoke-level and tracked as follow-up.
-
-## Model adapter status
-
-Capability decisions are derived from a pinned configuration and a checked-in
-manifest; they are not inferred from a benchmark script or model name. The
-first direct-decode contract is deliberately narrow: Qwen2.5 text, batch size
-one, greedy decode, full attention, and an enabled text KV cache.
-
-### Qwen2.5 packed decode runtime boundary
-
-`core.install_qwen25_packed_backend` is the first model-attention adapter. It
-supports only the pinned Qwen2.5-7B-Instruct profile, batch-one greedy decode,
-and an enabled cache. Prompt prefill remains standard causal attention; only a
-single-token decode is routed to the measured direct packed backend. It is not
-a server, batch, beam-search, sampling, speculative, or multimodal adapter.
-
-The adapter retains only packed KV blocks plus its bounded fp16/bf16 tail. It
-does not replace the legacy `DynamicCache` integration or promise compatibility
-with it. Qwen3, Qwen3.5, and Gemma 4 entries remain configuration manifests,
-not completed adapters, until their own integration suites pass.
-
-Run the download-free contract tests with:
+The supported GPU path is native WSL with a CUDA-capable NVIDIA GPU. CPU tests
+do not download a model.
 
 ```bash
-python -m pytest tests/test_qwen_adapter.py -q
+python3.12 -m venv ~/.venvs/turboquant-forge
+source ~/.venvs/turboquant-forge/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements/runtime.lock
+python -m pip install pytest ruff
+python -m pytest tests -m "not gpu" -q
 ```
 
-The pinned real-model smoke test is deliberately opt-in because it downloads
-weights and requires CUDA. Once opted in, a missing dependency or fixture is a
-test failure rather than a skip:
+For the kernel suite on a CUDA/Triton environment:
+
+```bash
+python -m pytest tests/test_packed_attention_kernels.py -m gpu -q
+python -m pytest tests/test_packed_attention_benchmark.py -m gpu -q
+```
+
+The real-model smoke test is opt-in because it downloads pinned weights:
 
 ```bash
 TURBOQUANT_RUN_MODEL_TESTS=1 python -m pytest tests/test_qwen_adapter_gpu.py -m gpu -q
 ```
 
-### Packed Triton kernel validation
+## Reproduce evidence
 
-The clean-room packed-score and value-mix kernels are deliberately separate
-from model adapters.  Their GPU parity suite reports a failure if a qualified
-dispatch replaces a kernel with its PyTorch reference path.  For a CI-independent
-memory-safety check from WSL, run:
-
-```bash
-compute-sanitizer --tool memcheck --error-exitcode 1 \
-  /home/taleef/.venvs/turboquant-forge/bin/python -m pytest \
-  tests/test_packed_attention_kernels.py -m gpu -q
-```
-
-| Family | Status | Cache rule |
-| --- | --- | --- |
-| Qwen2.5-7B text | direct adapter | The only eligible direct-decode target; use `configs/profiles/qwen25-7b-direct-v1.json`. |
-| Qwen3 dense text | manifest-only | Its configuration is recorded, but it has no completed attention adapter. |
-| Qwen3.5-9B | manifest-only | Only `full_attention` KV blocks may be compressed; the three linear-attention layers in each hybrid group retain native recurrent state. |
-| Gemma 4 E4B | manifest-only | Requires a dedicated attention adapter and capacity preflight before any promotion. |
-| Unknown models, beams, sampling, speculative/MTP decode, or multimodal caches | not supported | Fail closed before cache storage can be mutated. |
-
-Multimodal processors and vision caches never participate in this repository's
-KV-memory claims.
-
-## Claim Policy (Read This First)
-
-What this repo currently claims:
-- Reproducible paired baseline-vs-TurboQuant evaluation for Qwen.
-- Practical retrieval closure gate for the current release-check scope (through 16K).
-- Reproducible throughput/compression comparisons with provided scripts.
-
-What this repo does not claim yet:
-- Full benchmark parity with all paper/blog experiments (LongBench/RULER/vector-search).
-- Generalized low-bit near-lossless parity across all models and contexts.
-
-See `docs/PAPER_CLAIMS_STATUS.md` and `docs/PAPER_COMPARISON.md`.
-
-## Bits: This Repo vs Original Research
-
-| Topic | Original paper/blog | This repo (current validated scope) |
-|---|---|---|
-| Key path concept | `TurboQuant_prod` uses MSE + 1-bit QJL residual correction | MSE-first path with optional QJL scaffolding |
-| Reported effective bit settings | Commonly highlighted around 2.5/3.5-bit variants in paper benchmarks | Completion default: key=6, value=6 |
-| Retrieval-safe operating point | paper reports near-lossless at lower effective bits in its setup | Qwen paired NIAH through 32K: key=8, value=6, buffer=16384 |
-| Practical note | Theory + specialized benchmark setup | Engineering-focused, reproducible commands/artifacts in this repo |
-
-For an explicit mapping of paper experiments to repo coverage, see `docs/PAPER_COMPARISON.md`.
-
-## Installation and reproducibility contract
-
-Use Python 3.11 or newer. Full CUDA experiments are intended for a native WSL
-Linux checkout with a CUDA-capable NVIDIA GPU; the test contract itself is safe
-on CPU and never downloads a model.
-
-```bash
-git clone https://github.com/Taleef7/turboquant.git
-cd turboquant
-python3.12 -m venv ~/.venvs/turboquant-forge
-source ~/.venvs/turboquant-forge/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements/runtime.lock
-```
-
-`requirements/runtime.lock` is the single pinned runtime source and uses the
-official stable PyTorch CUDA 12.8 wheel index. `requirements.txt` remains a
-compatibility pointer to that lock. Regenerate the lock only with the documented
-command in its header, after verifying `torch.cuda.is_available()` in WSL.
-
-```bash
-nvidia-smi
-python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
-python -c "import accelerate, bitsandbytes, einops, numpy, safetensors, scipy, transformers, triton; print('runtime imports: OK')"
-python -m pip install pytest ruff
-python -m pytest tests -m "not gpu" -q
-python -m compileall core scripts tests
-```
-
-See [SETUP_CUDA.md](SETUP_CUDA.md) and [WSL2_SETUP.md](WSL2_SETUP.md) for the
-native WSL setup and troubleshooting path.
-
-## Reproduction commands
-
-The GPU-aware scripts below require a successful CUDA smoke check first. Their
-artifacts should be written under `artifacts/` (which is ignored except for
-checked-in fixtures).
+Both commands retain raw JSON, CSV, Markdown, stdout, and stderr under the
+ignored output directory. A nonzero exit means the profile was not qualified;
+inspect the retained report rather than treating the command as a success.
 
 ```bash
 python scripts/reproduce_release.py --mode quick --output-dir artifacts/repro_quick
-python scripts/reproduce_release.py --mode full --output-dir artifacts/repro_full
+python scripts/reproduce_release.py --mode qualified --output-dir artifacts/repro_qualified
 ```
 
-## Reproducing Key Claims
+The second command currently exits nonzero because the profile fails its 8K
+quality gate. Use [the protocol](docs/BENCHMARK_PROTOCOL.md) to interpret
+`qualified`, `failed`, `invalid`, and `inconclusive` states.
 
-### A) Qwen paired NIAH retrieval gate (through 32K)
+## Documentation map
 
-```bash
-python scripts/test_long_context.py \
-  --test niah \
-  --mode paired \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --max-context 32768 \
-  --key-bits 8 \
-  --value-bits 6 \
-  --buffer-size 16384 \
-  --trials 6 \
-  --output-prefix .tmp/niah_qwen_k8_v6_b16384_ctx32k_t6
-```
-
-This command directly compares baseline and TurboQuant on identical prompts and writes reproducible artifacts.
-
-Expected outcome:
-- `Delta (baseline-tq)` at or under `2.0pp` for this matrix
-- Most recent observed run: `1.39pp`
-
-For current release-check scope, use the one-command `full` path above (16K) and the checklist in `docs/REPLICATION_CHECKLIST.md`.
-
-### B) Multi-model completion benchmark
-
-```bash
-python scripts/test_multimodel.py --model qwen2.5-7b
-python scripts/test_multimodel.py --model mistral-7b
-python scripts/test_multimodel.py --model llama3.1-8b
-python scripts/test_multimodel.py --model gemma2-9b
-```
-
-## C) Throughput baseline-vs-TurboQuant (Qwen)
-
-```bash
-python scripts/benchmark_throughput.py
-```
-
-## Retrieval-Safe Configuration
-
-`configs/retrieval_profile.json` currently defines:
-- `key_bits=8`
-- `value_bits=6`
-- `buffer_size=16384`
-
-Tradeoff:
-- Larger `buffer_size` improves retrieval robustness but increases uncompressed cache memory.
-
-## What Is Compared Today (for users)
-
-- Baseline vs TurboQuant completion behavior
-- Baseline vs TurboQuant paired NIAH retrieval (`scripts/test_long_context.py --mode paired`)
-- Throughput baseline vs TurboQuant (`scripts/benchmark_throughput.py`)
-
-Not fully implemented yet for one-command parity with paper figures:
-- LongBench(-E) runner
-- RULER runner
-- full multi-method table generation (PQ/KIVI/etc.)
-
-Use `docs/PAPER_COMPARISON.md` to see exactly what is covered vs deferred.
-
-## Project Layout
-
-```text
-turboquant/
-├── core/
-│   ├── turboquant_cache_v2.py      # Main DynamicCache integration
-│   └── turboquant_simple.py        # Quantizers (MSE path + optional QJL scaffolding)
-├── codebooks/                      # Precomputed Lloyd-Max codebooks
-├── configs/
-│   └── retrieval_profile.json      # Retrieval-safe profile
-├── scripts/
-│   ├── test_long_context.py        # Paired NIAH harness
-│   ├── test_long_context_harness.py# Harness unit tests
-│   ├── test_multimodel.py          # Completion benchmark across models
-│   ├── run_baseline.py
-│   └── run_turboquant_v2.py
-├── ISSUES.md                       # Local issue/status tracker
-├── TESTING_RESULTS.md              # Detailed measured results
-└── UPDATED_PLAN.md                 # Current execution/status plan
-```
-
-## Known Limits / Deferred Work
-
-- Retrieval closure beyond 32K (64K/128K) is optional/deferred for now.
-- Full multi-model retrieval closure with higher trial counts is pending.
-- QJL path is scaffolded but not yet shown to improve paired NIAH in current integration.
-
-## References
-
-- Paper: [TurboQuant (arXiv:2504.19874)](https://arxiv.org/abs/2504.19874)
-- Current implementation notes: `TESTING_RESULTS.md`, `UPDATED_PLAN.md`, `ISSUES.md`
-- Paper comparison mapping: `docs/PAPER_COMPARISON.md`
-- Claims status matrix: `docs/PAPER_CLAIMS_STATUS.md`
-- Replication checklist: `docs/REPLICATION_CHECKLIST.md`
-- Contributor guide: `CONTRIBUTING.md`
-- Script index: `scripts/README.md`
-
-## Release Summary
-
-This release stabilizes a reproducible, user-runnable TurboQuant workflow with:
-- clear baseline-vs-TurboQuant paired retrieval evaluation,
-- a documented retrieval-safe configuration (`retrieval-safe-v3`),
-- synchronized docs/status files describing validated scope and remaining optional work.
-
-Practical outcome for current scope:
-- Qwen retrieval gate is closed through 32K with paired NIAH delta within target.
+- [Results](docs/RESULTS.md): current artifact-backed observations, including
+  the failed quality gate.
+- [Benchmark protocol](docs/BENCHMARK_PROTOCOL.md): artifact schema, matrix,
+  statistical and invalid-run rules.
+- [Portability](docs/PORTABILITY.md): model capability contracts and adapter
+  promotion path.
+- [Paper claims status](docs/PAPER_CLAIMS_STATUS.md): paper-to-repository
+  coverage without equivalence claims.
+- [Paper comparison](docs/PAPER_COMPARISON.md): clean-room scope and gaps.
+- [Replication checklist](docs/REPLICATION_CHECKLIST.md): repeatable local
+  verification steps.
+- [Issue tracker](ISSUES.md): resolved implementation work and open promotion
+  tasks.
 
 ## License
 
-MIT - see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). The implementation is clean-room; it does not
+copy GPL-licensed TurboQuant implementations.

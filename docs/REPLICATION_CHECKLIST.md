@@ -1,99 +1,83 @@
-# TurboQuant Replication Checklist (Qwen Scope)
+# TurboQuant Forge Replication Checklist
 
-Use this checklist to verify the current claims in this repository on your own machine.
+This checklist verifies implementation contracts and reproduces the evidence
+ladder. A passed unit test or completed process is not permission to describe a
+profile as qualified; use the status rules in
+[BENCHMARK_PROTOCOL.md](BENCHMARK_PROTOCOL.md).
 
-## Scope Locked for This Checklist
+## 1. Prepare the environment
 
-- Model: `Qwen/Qwen2.5-7B-Instruct`
-- Retrieval closure target in this phase: **through 16K**
-- Gate: baseline-vs-TurboQuant paired NIAH delta `<= 2.0pp`
-
-## Prerequisites
-
-- Python 3.12 virtual environment active
-- Dependencies installed from `requirements.txt`
-- CUDA-capable NVIDIA GPU recommended
-
-## Step 1: Environment sanity
-
-Run:
+Use Python 3.11+ and the pinned runtime lock. The GPU path is supported on
+native WSL with CUDA and Triton.
 
 ```bash
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+python3.12 -m venv ~/.venvs/turboquant-forge
+source ~/.venvs/turboquant-forge/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements/runtime.lock
+python -m pip install pytest ruff
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
-Expect:
-- PyTorch imports cleanly
-- CUDA availability is `True` (for full runs)
+For a GPU run, record the `nvidia-smi` output with the generated artifact.
 
-## Step 2: Fast harness/config tests
-
-Run:
+## 2. Run download-free CPU verification
 
 ```bash
-pytest scripts/test_long_context_harness.py scripts/test_cache_config.py scripts/test_qjl_config.py -q
+python -m pytest tests -m "not gpu" -q
+python -m pytest tests/test_documentation_claims.py -q
+git diff --check
 ```
 
-Expect:
-- All tests pass
+These tests cover the packed storage/reference/capability/profile and artifact
+contracts. They do not establish model-level retrieval quality.
 
-## Step 3: Qwen paired NIAH gate (16K)
-
-Run:
+## 3. Run GPU mechanics verification
 
 ```bash
-python scripts/test_long_context.py \
-  --test niah \
-  --mode paired \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --max-context 16384 \
-  --key-bits 8 \
-  --value-bits 6 \
-  --buffer-size 12288 \
-  --trials 6 \
-  --output-prefix .tmp/niah_qwen_k8_v6_b12288_ctx16k_t6
+python -m pytest tests/test_packed_attention_kernels.py -m gpu -q
+python -m pytest tests/test_packed_attention_benchmark.py -m gpu -q
 ```
 
-Expect:
-- Paired summary printed at end
-- `Delta (baseline-tq)` at or below `2.0` percentage points
+The first command is direct-kernel parity against the packed PyTorch reference.
+The benchmark command labels its output as a kernel microbenchmark; it is not
+end-to-end throughput evidence.
 
-Artifacts:
-- `.tmp/niah_qwen_k8_v6_b12288_ctx16k_t6.json`
-- `.tmp/niah_qwen_k8_v6_b12288_ctx16k_t6.csv`
-
-## Step 4: Throughput baseline vs TurboQuant
-
-Run:
+For a manual memory-safety pass when Compute Sanitizer is installed:
 
 ```bash
-python scripts/benchmark_throughput.py
+compute-sanitizer --tool memcheck --error-exitcode 1 \
+  python -m pytest tests/test_packed_attention_kernels.py -m gpu -q
 ```
 
-Expect:
-- Baseline and TurboQuant tokens/sec printed for prompt lengths
-- Memory/compression summary printed
-
-## Step 5: One-command reproducibility report
-
-Run:
+## 4. Run the pinned model smoke test
 
 ```bash
-python scripts/reproduce_release.py --mode full --output-dir results/repro_qwen
+TURBOQUANT_RUN_MODEL_TESTS=1 python -m pytest tests/test_qwen_adapter_gpu.py -m gpu -q
 ```
 
-Expect:
-- `results/repro_qwen/repro_report.json`
-- `results/repro_qwen/repro_report.md`
+This is opt-in because it downloads the pinned Qwen2.5 weights. It must fail,
+not silently skip, if explicitly requested dependencies are unavailable.
 
-## Pass/Fail Criteria for This Scope
+## 5. Reproduce release evidence
 
-- Paired NIAH gate through 16K meets `<= 2.0pp` delta
-- Repro report generated successfully
-- Harness/config tests pass
+```bash
+python scripts/reproduce_release.py --mode quick --output-dir artifacts/repro_quick
+python scripts/reproduce_release.py --mode qualified --output-dir artifacts/repro_qualified
+```
 
-## Deferred in This Scope
+Inspect the timestamped `repro_report.json`, `quality`/`systems` JSON files,
+persisted 32K decision, and stdout/stderr logs. The qualified command returns
+nonzero unless all gates pass. The current checked evidence is a failed quality
+result, so reproducing that current profile should retain failure evidence—not
+produce a success claim.
 
-- 32K/64K/128K retrieval closure
-- Multi-model retrieval closure at high trial counts
-- Full LongBench/RULER parity runners
+## 6. Interpret before publishing
+
+- Run `python scripts/validate_artifact.py path/to/artifact.json` for structural
+  and binding validation.
+- Treat `failed`, `invalid`, and `inconclusive` as non-qualifying states.
+- Cite the raw artifact ID with any physical-byte, peak-memory, latency, or
+  quality statement.
+- Do not promote Qwen3, Qwen3.5, or Gemma 4 from a manifest-only entry without
+  the adapter/evidence steps in [PORTABILITY.md](PORTABILITY.md).

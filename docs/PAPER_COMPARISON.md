@@ -1,92 +1,44 @@
-# TurboQuant Paper vs This Repo
+# TurboQuant Paper Comparison
 
-This document maps the original TurboQuant evaluations to what is currently implemented in this repository, so users can quickly reproduce comparable baselines and understand remaining gaps.
+The original TurboQuant research describes a broader algorithm and evaluation
+surface than this repository. Forge intentionally starts with a narrow,
+auditable direct-decode path instead of copying a reference implementation or
+claiming paper-level results.
 
-Primary references:
-- Paper markdown in repo: `2504.19874v1.md`
-- Google Research blog: `https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/`
+| Dimension | Original research scope | Forge implementation scope |
+| --- | --- | --- |
+| Code provenance | Research implementation and paper | New clean-room Python/Triton implementation under MIT; no GPL code is copied. |
+| KV storage | Quantized cache representations | Physically bit-packed fixed blocks plus bounded fp16/bf16 tail; exact tensor bytes are measured. |
+| Attention execution | Research-specific evaluation | Blockwise PyTorch reference and direct Triton score/value mixing for the pinned Qwen2.5 path. |
+| Quality evaluation | Broad research benchmarks | Complete paired NIAH matrix with explicit invalid/failed states; current direct profile fails it. |
+| Model support | Paper-dependent architectures | Qwen2.5 direct adapter only; other listed families have no adapter. |
+| Serving/runtime | Research and production-adjacent contexts | No server, batching, beam search, speculative decoding, paging/offload, or distributed path. |
 
-## At-a-Glance Mapping
+## Why a failed quality artifact remains valuable
 
-| Paper experiment area | In this repo | Status |
-|---|---|---|
-| Needle-In-A-Haystack (NIAH) long-context retrieval | `scripts/test_long_context.py --mode paired` | **Implemented** |
-| End-to-end generation on LongBench(-E) | No direct LongBench runner yet | **Not yet implemented** |
-| RULER benchmark | No direct RULER runner yet | **Not yet implemented** |
-| Product variant (`TurboQuant_prod`) with QJL focus | Optional QJL scaffolding exists, not yet validated as better | **Partial** |
-| Memory/compression and throughput comparisons | `scripts/benchmark_throughput.py`, docs summaries | **Implemented (project-specific)** |
-| Near-neighbor search experiments (PQ/RabitQ vs TurboQuant) | No ANN benchmark script yet | **Not yet implemented** |
+The artifact `qualified-v4/20260718T053419Z-unknown` contains a complete 8K
+NIAH matrix, a structurally valid systems run, logs, and a mechanical 32K
+admission decision. It reports a failed retrieval gate rather than masking the
+regression with short-completion output. That makes the next engineering step
+clear: improve or replace the profile, then rerun the same fixed protocol.
 
-## What Users Can Reproduce Today
+## Deliberate differences from the legacy prototype
 
-## 1) Paired NIAH (Baseline vs TurboQuant)
+`TurboQuantCacheV2` is retained only to preserve historical experiments. It
+dequantizes historical K/V state and reconstructs it for attention, so it is
+not the Forge direct backend. The new profile loader accepts only
+`packed_kv_block_store`; an attempt to select V2 fails before the new cache can
+be mutated.
 
-Goal: Compare retrieval quality on identical prompts, with deterministic seeds and auditable outputs.
+## Next evidence needed for a closer comparison
 
-Run:
+1. Produce a Qwen2.5 profile whose complete NIAH matrix satisfies the declared
+   retrieval gate and whose systems artifact remains structurally valid.
+2. Benchmark LongBench and RULER with the same model/profile/code bindings.
+3. Add a separately tested QJL residual implementation before comparing
+   low-bit operating points.
+4. Promote each additional architecture only after its adapter, capability,
+   quality, and systems evidence are all present.
 
-```bash
-source venv312/bin/activate
-python scripts/test_long_context.py \
-  --test niah \
-  --mode paired \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --max-context 16384 \
-  --key-bits 8 \
-  --value-bits 6 \
-  --buffer-size 12288 \
-  --trials 6 \
-  --output-prefix .tmp/niah_qwen_k8_v6_b12288_ctx16k_t6
-```
-
-Outputs:
-- `.tmp/niah_qwen_k8_v6_b12288_ctx16k_t6.json`
-- `.tmp/niah_qwen_k8_v6_b12288_ctx16k_t6.csv`
-
-Main metric:
-- `Delta (baseline-tq)` in percentage points (`<= 2.0pp` target for this project)
-
-## 2) Throughput + memory-oriented comparison
-
-Goal: Compare decode throughput and rough memory behavior for baseline vs TurboQuant configurations.
-
-Run:
-
-```bash
-source venv312/bin/activate
-python scripts/benchmark_throughput.py
-```
-
-## 3) Multi-model completion checks
-
-Goal: Verify completion quality and throughput trends across supported model configs.
-
-Run:
-
-```bash
-source venv312/bin/activate
-python scripts/test_multimodel.py --model qwen2.5-7b
-python scripts/test_multimodel.py --model mistral-7b
-python scripts/test_multimodel.py --model llama3.1-8b
-python scripts/test_multimodel.py --model gemma2-9b
-```
-
-## Important Differences vs Paper Setup
-
-- This repo currently emphasizes a practical Qwen-focused retrieval closure path through 16K (paired NIAH) rather than full paper benchmark parity.
-- Paper reports include LongBench(-E), additional method comparisons, and explicit `TurboQuant_prod` analysis at low bit budgets.
-- Here, optional QJL path is present in code but not yet shown to outperform the MSE-first path in current NIAH measurements.
-
-## If You Want Paper-Style Side-by-Side Comparisons
-
-Recommended next additions:
-1. LongBench(-E) runner with baseline/TurboQuant paired scoring.
-2. RULER task runner with the same paired output format.
-3. Standardized comparison table generator (full-cache vs TurboQuant configs) emitted from JSON artifacts.
-4. Optional ANN benchmark script for the paper's near-neighbor experiment style.
-
-Until those land, use this document as the source of truth for what is directly reproducible in this repository.
-
-Also see:
-- `docs/REPLICATION_CHECKLIST.md`
-- `docs/PAPER_CLAIMS_STATUS.md`
+Read [BENCHMARK_PROTOCOL.md](BENCHMARK_PROTOCOL.md) before comparing a Forge
+artifact with results from another project.
