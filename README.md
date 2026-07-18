@@ -72,6 +72,33 @@ manifest; they are not inferred from a benchmark script or model name. The
 first direct-decode contract is deliberately narrow: Qwen2.5 text, batch size
 one, greedy decode, full attention, and an enabled text KV cache.
 
+### Qwen2.5 packed decode runtime boundary
+
+`core.install_qwen25_packed_backend` is the first model-attention adapter. It
+supports only the pinned Qwen2.5-7B-Instruct profile, batch-one greedy decode,
+and an enabled cache. Prompt prefill remains standard causal attention; only a
+single-token decode is routed to the measured direct packed backend. It is not
+a server, batch, beam-search, sampling, speculative, or multimodal adapter.
+
+The adapter retains only packed KV blocks plus its bounded fp16/bf16 tail. It
+does not replace the legacy `DynamicCache` integration or promise compatibility
+with it. Qwen3, Qwen3.5, and Gemma 4 entries remain configuration manifests,
+not completed adapters, until their own integration suites pass.
+
+Run the download-free contract tests with:
+
+```bash
+python -m pytest tests/test_qwen_adapter.py -q
+```
+
+The pinned real-model smoke test is deliberately opt-in because it downloads
+weights and requires CUDA. Once opted in, a missing dependency or fixture is a
+test failure rather than a skip:
+
+```bash
+TURBOQUANT_RUN_MODEL_TESTS=1 python -m pytest tests/test_qwen_adapter_gpu.py -m gpu -q
+```
+
 ### Packed Triton kernel validation
 
 The clean-room packed-score and value-mix kernels are deliberately separate

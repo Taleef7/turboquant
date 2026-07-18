@@ -425,3 +425,23 @@ def require_direct_decode_support(
             "direct decode configuration does not match the pinned manifest layout."
         )
     return capabilities
+
+
+def require_qwen25_packed_layout(capabilities: ModelCapabilities) -> ModelCapabilities:
+    """Require the model-specific layout consumed by the first packed adapter.
+
+    This remains distinct from general decode eligibility so future manifests do
+    not accidentally inherit Qwen2.5's direct packed-attention implementation.
+    """
+    if (
+        capabilities.model_type != "qwen2"
+        or capabilities.revision is None
+        or capabilities.revision.model_id != _DIRECT_QWEN25_MODEL_ID
+        or capabilities.adapter_status != "direct-adapter"
+    ):
+        raise UnsupportedCapabilityError(
+            "direct packed attention is implemented only for Qwen2.5-7B-Instruct."
+        )
+    if capabilities.num_key_value_groups is None or capabilities.num_key_value_groups < 1:
+        raise UnsupportedCapabilityError("direct packed attention requires Qwen2.5 grouped-query heads.")
+    return capabilities

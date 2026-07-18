@@ -8,6 +8,7 @@ from core.capabilities import (
     derive_model_capabilities,
     load_model_manifest,
     require_direct_decode_support,
+    require_qwen25_packed_layout,
 )
 from core.errors import UnsupportedCapabilityError
 from core.codec import KeyCodec, KeyLayout, PackedKeyPayload, PackedValuePayload, ValueCodec, ValueLayout
@@ -25,6 +26,8 @@ from core.reference_attention import (
     ReferenceAttentionLayout,
     packed_reference_decode,
 )
+from core.packed_cache import PackedDynamicCache
+from core.qwen_adapter import PackedAttentionSession, install_qwen25_packed_backend
 
 __all__ = [
     "CompressionProfile",
@@ -37,6 +40,8 @@ __all__ = [
     "KeyLayout",
     "PackedKeyPayload",
     "PackedKVBlock",
+    "PackedDynamicCache",
+    "PackedAttentionSession",
     "PackedKVBlockStore",
     "PackedStoreRuntimeLayout",
     "PackedValuePayload",
@@ -52,6 +57,8 @@ __all__ = [
     "packed_reference_decode",
     "pack_sign_bits",
     "require_direct_decode_support",
+    "require_qwen25_packed_layout",
+    "install_qwen25_packed_backend",
     "tensor_nbytes",
     "unpack_indices",
     "unpack_sign_bits",
