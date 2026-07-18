@@ -18,13 +18,20 @@ import gc
 import json
 import csv
 import hashlib
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 
-sys.path.insert(0, "/home/taleef/projects/turboquant")
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from core.turboquant_cache_v2 import TurboQuantCacheV2
+from core.profiles import load_profile
+from core.qwen_adapter import install_qwen25_packed_backend
+from scripts.benchmark_schema import calculate_paired_bootstrap, quality_retrieval_safe
+from scripts.repro_utils import benchmark_binding, capture_env_metadata
 
 
 # ============================================================================
@@ -383,31 +390,25 @@ def run_niah_paired_test(
     torch.cuda.empty_cache()
     gc.collect()
 
-    cache = TurboQuantCacheV2(
-        head_dim=head_dim,
-        key_bits=key_bits,
-        value_bits=value_bits,
-        buffer_size=buffer_size,
-        key_norm_dtype=key_norm_dtype,
-        key_use_qjl=key_use_qjl,
-        key_qjl_dim=key_qjl_dim,
-        key_qjl_seed=key_qjl_seed,
-    )
+    profile = load_profile(ROOT / "configs/profiles/qwen25-7b-direct-v1.json")
+    if (key_bits, value_bits, buffer_size) != (
+        profile.key_bits, profile.value_bits, profile.fp16_window
+    ):
+        raise ValueError("paired evidence must use the hash-bound direct profile settings")
+    session = install_qwen25_packed_backend(model, profile)
     with torch.no_grad():
         t0 = time.perf_counter()
-        out_tq = model.generate(
-            **inputs,
-            max_new_tokens=30,
-            do_sample=False,
-            past_key_values=cache,
-            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-        )
+        direct = session.prefill(inputs["input_ids"])
+        token = direct.logits[:, -1:].argmax(dim=-1)
+        generated = []
+        for _ in range(30):
+            direct = session.decode_one(token)
+            token = direct.logits[:, -1:].argmax(dim=-1)
+            generated.append(token)
         torch.cuda.synchronize()
         case["turboquant_time_s"] = time.perf_counter() - t0
 
-    tq_answer = tokenizer.decode(
-        out_tq[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
-    ).strip()
+    tq_answer = tokenizer.decode(torch.cat(generated, dim=1)[0], skip_special_tokens=True).strip()
     case["turboquant_answer"] = tq_answer
     case["turboquant_correct"] = metadata["needle_code"] in tq_answer
 
@@ -430,16 +431,16 @@ def run_niah_matrix(
     key_qjl_seed: int,
 ) -> list[dict]:
     """Run paired NIAH matrix and return detailed rows."""
-    rows = []
-    for ctx in context_lengths:
-        print(f"\n--- Context {ctx:,} ---")
-        for depth in depths:
-            depth_name = {0.1: "beginning", 0.5: "middle", 0.9: "end"}.get(
-                depth, str(depth)
-            )
-            for seed in seeds:
-                try:
-                    row = run_niah_paired_test(
+    rows = build_expected_niah_rows(context_lengths, depths, seeds)
+    last_context = None
+    for row in rows:
+        ctx, depth, seed = row["context_target"], row["depth"], row["trial_seed"]
+        if ctx != last_context:
+            print(f"\n--- Context {ctx:,} ---")
+            last_context = ctx
+        depth_name = {0.1: "beginning", 0.5: "middle", 0.9: "end"}.get(depth, str(depth))
+        try:
+            result = run_niah_paired_test(
                         model=model,
                         tokenizer=tokenizer,
                         context_tokens=ctx,
@@ -454,8 +455,9 @@ def run_niah_matrix(
                         key_qjl_dim=key_qjl_dim,
                         key_qjl_seed=key_qjl_seed,
                     )
-                    rows.append(row)
-                    status = (
+            row.update(result)
+            row.update({"status": "completed", "oom": False, "exception": None, "profile_correct": result["turboquant_correct"]})
+            status = (
                         "SKIP"
                         if not row["needle_present_after_tokenization"]
                         else (
@@ -464,17 +466,42 @@ def run_niah_matrix(
                             else "DIFF"
                         )
                     )
-                    print(
+            print(
                         f"  depth={depth_name:<9} seed={seed:02d} [{status}] "
                         f"base={int(row['baseline_correct'])} tq={int(row['turboquant_correct'])} "
                         f"needle_present={row['needle_present_after_tokenization']}"
                     )
-                except torch.cuda.OutOfMemoryError:
-                    print(f"  depth={depth_name:<9} seed={seed:02d} [OOM]")
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                except Exception as e:
-                    print(f"  depth={depth_name:<9} seed={seed:02d} [ERROR] {e}")
+        except torch.cuda.OutOfMemoryError:
+            print(f"  depth={depth_name:<9} seed={seed:02d} [OOM]")
+            row.update({"status": "oom", "oom": True, "exception": "CUDA out of memory"})
+            torch.cuda.empty_cache()
+            gc.collect()
+        except Exception as e:
+            print(f"  depth={depth_name:<9} seed={seed:02d} [ERROR] {e}")
+            row.update({"status": "error", "oom": False, "exception": f"{type(e).__name__}: {e}"})
+    return rows
+
+
+def build_expected_niah_rows(contexts: list[int], depths: list[float], seeds: list[int]) -> list[dict]:
+    """Materialize every matrix coordinate before model execution begins."""
+    return [
+        {"context_target": context, "depth": depth, "trial_seed": seed,
+         "status": "pending", "oom": False, "exception": None,
+         "needle_present_after_tokenization": False,
+         "baseline_correct": None, "profile_correct": None}
+        for context in contexts for depth in depths for seed in seeds
+    ]
+
+
+def execute_expected_niah_rows(expected_rows: list[dict], execute_case) -> list[dict]:
+    """CPU-testable complete-matrix executor retaining every expected row."""
+    rows = [dict(row) for row in expected_rows]
+    for row in rows:
+        try:
+            row.update(execute_case(row))
+            row.update({"status": "completed", "oom": False, "exception": None})
+        except Exception as exc:
+            row.update({"status": "error", "oom": False, "exception": f"{type(exc).__name__}: {exc}"})
     return rows
 
 
@@ -489,7 +516,7 @@ def select_niah_contexts(max_context: int) -> list[int]:
     return selected
 
 
-def write_matrix_results(rows: list[dict], output_prefix: str):
+def write_matrix_results(rows: list[dict], output_prefix: str, expected_matrix: dict | None = None, *, status: str = "completed"):
     """Write matrix rows to JSON and CSV files."""
     if not output_prefix:
         return
@@ -498,7 +525,8 @@ def write_matrix_results(rows: list[dict], output_prefix: str):
     csv_path = f"{output_prefix}.csv"
 
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=2)
+        artifact = {"artifact_type": "quality_matrix", "schema_version": 1, "binding": benchmark_binding(ROOT), "metadata": capture_env_metadata(), "status": status, "expected_matrix": expected_matrix, "rows": rows} if expected_matrix else rows
+        json.dump(artifact, f, indent=2)
 
     if rows:
         fields = list(rows[0].keys())
@@ -687,6 +715,8 @@ def main():
         default="",
         help="Optional output prefix for paired matrix result files",
     )
+    parser.add_argument("--bootstrap-seed", type=int, default=1729)
+    parser.add_argument("--bootstrap-iterations", type=int, default=10000)
     args = parser.parse_args()
 
     # Load model
@@ -763,13 +793,27 @@ def main():
                 key_qjl_seed=args.key_qjl_seed,
             )
             summary = summarize_paired_results(rows)
-            write_matrix_results(rows, args.output_prefix)
-
+            expected_matrix = {"contexts": niah_contexts, "depths": depths, "seeds": seeds}
             print("\n--- Paired NIAH Summary ---")
             print(f"Eligible cases:      {summary['eligible_cases']}")
             print(f"Baseline accuracy:   {summary['baseline_accuracy'] * 100.0:.2f}%")
             print(f"TurboQ accuracy:     {summary['turboquant_accuracy'] * 100.0:.2f}%")
             print(f"Delta (baseline-tq): {summary['delta_pp']:.2f} percentage points")
+            artifact = {
+                "artifact_type": "quality_matrix", "schema_version": 1,
+                "binding": benchmark_binding(ROOT), "metadata": capture_env_metadata(), "status": "completed", "expected_matrix": expected_matrix, "rows": rows,
+            }
+            safe, bootstrap, validation = quality_retrieval_safe(
+                artifact, bootstrap_seed=args.bootstrap_seed, iterations=args.bootstrap_iterations
+            )
+            print(f"Validator:           {'valid' if validation.valid else 'invalid'}")
+            if bootstrap is not None:
+                print(f"Bootstrap upper 95%: {bootstrap.upper_95_pp:.2f}pp (seed={bootstrap.seed})")
+            artifact["status"] = "qualified" if safe else ("failed" if validation.valid else "invalid")
+            write_matrix_results(rows, args.output_prefix, expected_matrix, status=artifact["status"])
+            if not safe:
+                print("RETRIEVAL-SAFE GATE FAILED")
+                raise SystemExit(1)
         else:
             niah_results = []
 

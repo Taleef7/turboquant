@@ -46,6 +46,9 @@ results/
 artifacts/*
 !artifacts/fixtures/
 !artifacts/fixtures/**
+# Release evidence command captures are generated alongside JSON artifacts.
+artifacts/**/*.stdout.log
+artifacts/**/*.stderr.log
 
 # Local visual brainstorming companion sessions
 .superpowers/

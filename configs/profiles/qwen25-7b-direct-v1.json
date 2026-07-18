@@ -37,6 +37,10 @@
   "value_bits": 6,
   "value_group_size": 32,
   "fp16_window": 128,
+  "evidence_codebooks": [
+    "../../codebooks/codebook_d128_b8.json",
+    "../../codebooks/codebook_d128_b6.json"
+  ],
   "cache_implementation": "packed_kv_block_store",
-  "profile_sha256": "0b00e6ac66bb4c89cec421c341abe91f483dc8240d15e7ac6d3ee02c5e1da7f7"
+  "profile_sha256": "8b6b7e149a46e4f176c41b5b791b87eb03153536b1decc1d6eb52d68ae7a40a4"
 }

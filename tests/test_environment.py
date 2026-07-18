@@ -60,6 +60,7 @@ def test_capture_cuda_metadata_has_explicit_cpu_safe_schema() -> None:
         "gpu_name",
         "gpu_sm_capability",
         "gpu_total_vram_bytes",
+        "gpu_free_vram_bytes",
         "driver_version",
         "tf32_allow_tf32",
         "cudnn_allow_tf32",

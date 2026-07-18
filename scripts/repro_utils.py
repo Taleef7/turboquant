@@ -42,6 +42,45 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def benchmark_binding(root: str | Path) -> dict[str, str]:
+    """Hash every direct-evidence input that can affect observed behavior.
+
+    The codebook digest is a hash of both direct-profile codebooks in a stable
+    order, so a run cannot accidentally compare different quantizers.
+    """
+    root_path = Path(root)
+    profile = root_path / "configs" / "profiles" / "qwen25-7b-direct-v1.json"
+    manifest = root_path / "configs" / "models" / "qwen25-7b.json"
+    codebooks = (
+        root_path / "codebooks" / "codebook_d128_b8.json",
+        root_path / "codebooks" / "codebook_d128_b6.json",
+    )
+    combined = hashlib.sha256()
+    for codebook in codebooks:
+        combined.update(codebook.name.encode("utf-8"))
+        combined.update(codebook.read_bytes())
+    behavior_paths = (
+        root_path / "scripts" / "test_long_context.py",
+        root_path / "scripts" / "run_direct_benchmark.py",
+        root_path / "core" / "qwen_adapter.py",
+        root_path / "core" / "packed_cache.py",
+        root_path / "core" / "packed_store.py",
+        root_path / "kernels" / "packed_attention.py",
+    )
+    behavior = hashlib.sha256()
+    for source in behavior_paths:
+        behavior.update(source.relative_to(root_path).as_posix().encode("utf-8"))
+        behavior.update(source.read_bytes())
+    runner = root_path / "scripts" / "run_direct_benchmark.py"
+    return {
+        "model_sha256": sha256_file(manifest),
+        "profile_sha256": sha256_file(profile),
+        "codebook_sha256": combined.hexdigest(),
+        "code_sha256": behavior.hexdigest(),
+        "runner_sha256": sha256_file(runner),
+    }
+
+
 def package_version(name: str) -> str | None:
     """Return an installed distribution version or an explicit null equivalent."""
     try:
@@ -107,6 +146,7 @@ def capture_cuda_metadata() -> dict[str, bool | int | str | None]:
         "gpu_name": None,
         "gpu_sm_capability": None,
         "gpu_total_vram_bytes": None,
+        "gpu_free_vram_bytes": None,
         "driver_version": None,
         "tf32_allow_tf32": None,
         "cudnn_allow_tf32": None,
@@ -135,11 +175,13 @@ def capture_cuda_metadata() -> dict[str, bool | int | str | None]:
         return schema
 
     props = torch.cuda.get_device_properties(0)
+    free_bytes, _ = torch.cuda.mem_get_info(0)
     schema.update(
         {
             "gpu_name": props.name,
             "gpu_sm_capability": f"sm_{props.major}{props.minor}",
             "gpu_total_vram_bytes": props.total_memory,
+            "gpu_free_vram_bytes": free_bytes,
         }
     )
     return schema
