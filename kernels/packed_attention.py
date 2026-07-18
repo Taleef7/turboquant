@@ -115,32 +115,22 @@ _QWEN25_DIRECT_MAX_TAIL_TOKENS = 383
 if _TRITON_AVAILABLE:
 
     @triton.jit
-    def _qwen25_packed_page_online_kernel(
-        query_ptr,
+    def _qwen25_packed_page_online_inner(
+        query,
+        kv_head,
         packed_keys_ptr,
         key_codebook_ptr,
         key_norms_ptr,
         packed_values_ptr,
         value_mins_ptr,
         value_scales_ptr,
-        old_max_ptr,
-        old_denominator_ptr,
-        old_numerator_ptr,
-        new_max_ptr,
-        new_denominator_ptr,
-        new_numerator_ptr,
+        old_max,
+        old_denominator,
+        old_numerator,
         SCALE: tl.constexpr,
         BLOCK_T: tl.constexpr,
     ):
-        """Fuse one canonical Qwen packed page into an fp32 online state."""
-        head = tl.program_id(0)
-        kv_head = head // 7
         dims = tl.arange(0, 128)
-        query = tl.load(query_ptr + head * 128 + dims).to(tl.float32)
-        old_max = tl.load(old_max_ptr + head).to(tl.float32)
-        old_denominator = tl.load(old_denominator_ptr + head).to(tl.float32)
-        old_numerator = tl.load(old_numerator_ptr + head * 128 + dims).to(tl.float32)
-
         block_max = -float("inf")
         for token_start in tl.static_range(0, 256, BLOCK_T):
             tokens = token_start + tl.arange(0, BLOCK_T)
@@ -201,15 +191,124 @@ if _TRITON_AVAILABLE:
             )
             numerator_contribution = numerator_updated
 
-        tl.store(new_max_ptr + head, new_max)
-        tl.store(
-            new_denominator_ptr + head,
+        return (
+            new_max,
             old_denominator * old_scale + denominator_contribution,
-        )
-        tl.store(
-            new_numerator_ptr + head * 128 + dims,
             old_numerator * old_scale + numerator_contribution,
         )
+
+    @triton.jit
+    def _qwen25_packed_page_online_kernel(
+        query_ptr,
+        packed_keys_ptr,
+        key_codebook_ptr,
+        key_norms_ptr,
+        packed_values_ptr,
+        value_mins_ptr,
+        value_scales_ptr,
+        old_max_ptr,
+        old_denominator_ptr,
+        old_numerator_ptr,
+        new_max_ptr,
+        new_denominator_ptr,
+        new_numerator_ptr,
+        SCALE: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+    ):
+        """Fuse one canonical Qwen packed page into an fp32 online state."""
+        head = tl.program_id(0)
+        dims = tl.arange(0, 128)
+        query = tl.load(query_ptr + head * 128 + dims).to(tl.float32)
+        old_max = tl.load(old_max_ptr + head).to(tl.float32)
+        old_denominator = tl.load(old_denominator_ptr + head).to(tl.float32)
+        old_numerator = tl.load(old_numerator_ptr + head * 128 + dims).to(tl.float32)
+        new_max, new_denominator, new_numerator = _qwen25_packed_page_online_inner(
+            query,
+            head // 7,
+            packed_keys_ptr,
+            key_codebook_ptr,
+            key_norms_ptr,
+            packed_values_ptr,
+            value_mins_ptr,
+            value_scales_ptr,
+            old_max,
+            old_denominator,
+            old_numerator,
+            SCALE=SCALE,
+            BLOCK_T=BLOCK_T,
+        )
+        tl.store(new_max_ptr + head, new_max)
+        tl.store(new_denominator_ptr + head, new_denominator)
+        tl.store(new_numerator_ptr + head * 128 + dims, new_numerator)
+
+    @triton.jit
+    def _qwen25_two_packed_pages_online_kernel(
+        query_ptr,
+        first_packed_keys_ptr,
+        first_key_codebook_ptr,
+        first_key_norms_ptr,
+        first_packed_values_ptr,
+        first_value_mins_ptr,
+        first_value_scales_ptr,
+        second_packed_keys_ptr,
+        second_key_codebook_ptr,
+        second_key_norms_ptr,
+        second_packed_values_ptr,
+        second_value_mins_ptr,
+        second_value_scales_ptr,
+        old_max_ptr,
+        old_denominator_ptr,
+        old_numerator_ptr,
+        new_max_ptr,
+        new_denominator_ptr,
+        new_numerator_ptr,
+        SCALE: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+    ):
+        """Fuse two chronological canonical Qwen pages into one online-state write."""
+        head = tl.program_id(0)
+        dims = tl.arange(0, 128)
+        query = tl.load(query_ptr + head * 128 + dims).to(tl.float32)
+        running_max = tl.load(old_max_ptr + head).to(tl.float32)
+        running_denominator = tl.load(old_denominator_ptr + head).to(tl.float32)
+        running_numerator = tl.load(old_numerator_ptr + head * 128 + dims).to(tl.float32)
+        running_max, running_denominator, running_numerator = (
+            _qwen25_packed_page_online_inner(
+                query,
+                head // 7,
+                first_packed_keys_ptr,
+                first_key_codebook_ptr,
+                first_key_norms_ptr,
+                first_packed_values_ptr,
+                first_value_mins_ptr,
+                first_value_scales_ptr,
+                running_max,
+                running_denominator,
+                running_numerator,
+                SCALE=SCALE,
+                BLOCK_T=BLOCK_T,
+            )
+        )
+        running_max, running_denominator, running_numerator = (
+            _qwen25_packed_page_online_inner(
+                query,
+                head // 7,
+                second_packed_keys_ptr,
+                second_key_codebook_ptr,
+                second_key_norms_ptr,
+                second_packed_values_ptr,
+                second_value_mins_ptr,
+                second_value_scales_ptr,
+                running_max,
+                running_denominator,
+                running_numerator,
+                SCALE=SCALE,
+                BLOCK_T=BLOCK_T,
+            )
+        )
+        tl.store(new_max_ptr + head, running_max)
+        tl.store(new_denominator_ptr + head, running_denominator)
+        tl.store(new_numerator_ptr + head * 128 + dims, running_numerator)
 
     @triton.jit
     def _qwen25_fp16_tail_online_kernel(
@@ -1289,16 +1388,59 @@ class PreparedPackedAttentionDecode:
             ),
         )
         saw_history = False
-        for block in self.blocks:
+        use_canonical_qwen_pages = (
+            self.qwen25_canonical_mapping_eligible
+            and self.heads == _QWEN25_DIRECT_HEADS
+            and self.num_kv_heads == _QWEN25_DIRECT_KV_HEADS
+            and self.head_dim == _QWEN25_DIRECT_HEAD_DIM
+            and query_tokens == 1
+        )
+        block_index = 0
+        while block_index < len(self.blocks):
+            block = self.blocks[block_index]
             tokens = block.packed_keys.shape[1]
             if (
-                self.qwen25_canonical_mapping_eligible
-                and self.heads == _QWEN25_DIRECT_HEADS
-                and self.num_kv_heads == _QWEN25_DIRECT_KV_HEADS
-                and self.head_dim == _QWEN25_DIRECT_HEAD_DIM
-                and query_tokens == 1
+                use_canonical_qwen_pages
+                and block_index + 1 < len(self.blocks)
                 and _is_qwen25_packed_page(block)
+                and _is_qwen25_packed_page(self.blocks[block_index + 1])
             ):
+                second_block = self.blocks[block_index + 1]
+                old_max, old_denominator, old_numerator = state
+                new_max = torch.empty_like(old_max, dtype=torch.float32)
+                new_denominator = torch.empty_like(old_denominator, dtype=torch.float32)
+                new_numerator = torch.empty_like(old_numerator, dtype=torch.float32)
+                _qwen25_two_packed_pages_online_kernel[(_QWEN25_DIRECT_HEADS,)](
+                    rotated_query,
+                    block.packed_keys,
+                    block.key_codebook,
+                    block.key_norms,
+                    block.packed_values,
+                    block.value_mins,
+                    block.value_scales,
+                    second_block.packed_keys,
+                    second_block.key_codebook,
+                    second_block.key_norms,
+                    second_block.packed_values,
+                    second_block.value_mins,
+                    second_block.value_scales,
+                    old_max,
+                    old_denominator,
+                    old_numerator,
+                    new_max,
+                    new_denominator,
+                    new_numerator,
+                    SCALE=self.scale,
+                    BLOCK_T=16,
+                    num_warps=4,
+                )
+                state = (new_max, new_denominator, new_numerator)
+                if self.debug is not None:
+                    self.debug.fused_packed_page_launches += 1
+                saw_history = True
+                block_index += 2
+                continue
+            if use_canonical_qwen_pages and _is_qwen25_packed_page(block):
                 old_max, old_denominator, old_numerator = state
                 new_max = torch.empty_like(old_max, dtype=torch.float32)
                 new_denominator = torch.empty_like(old_denominator, dtype=torch.float32)
@@ -1325,6 +1467,7 @@ class PreparedPackedAttentionDecode:
                 if self.debug is not None:
                     self.debug.fused_packed_page_launches += 1
                 saw_history = True
+                block_index += 1
                 continue
             scores = torch.empty(
                 (self.heads, query_tokens, tokens),
@@ -1384,6 +1527,7 @@ class PreparedPackedAttentionDecode:
                 self.debug.packed_score_launches += 1
                 self.debug.packed_value_launches += 1
             saw_history = True
+            block_index += 1
         if fp16_window is not None:
             window_keys, window_values = fp16_window
             if (
