@@ -114,6 +114,7 @@ def capture_cuda_metadata() -> dict[str, bool | int | str | None]:
         "cudnn_deterministic": None,
         "cudnn_benchmark": None,
     }
+    schema["driver_version"] = _nvidia_driver_version()
     torch = _import_torch()
     if torch is None:
         return schema
@@ -139,7 +140,6 @@ def capture_cuda_metadata() -> dict[str, bool | int | str | None]:
             "gpu_name": props.name,
             "gpu_sm_capability": f"sm_{props.major}{props.minor}",
             "gpu_total_vram_bytes": props.total_memory,
-            "driver_version": _nvidia_driver_version(),
         }
     )
     return schema
