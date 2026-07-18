@@ -37,5 +37,6 @@
   "value_bits": 6,
   "value_group_size": 32,
   "fp16_window": 128,
-  "profile_sha256": "bae0710a94373ece443002554004c427da5946cf15ee378ac03d9c3c21332b3f"
+  "cache_implementation": "packed_kv_block_store",
+  "profile_sha256": "0b00e6ac66bb4c89cec421c341abe91f483dc8240d15e7ac6d3ee02c5e1da7f7"
 }

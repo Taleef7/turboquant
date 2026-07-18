@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from core.codec import KeyCodec, KeyLayout, ValueCodec, ValueLayout
-from core.packing import tensor_nbytes, unpack_indices
+from core.packing import tensor_nbytes, unpack_indices, unpack_sign_bits
 
 
 def test_key_codec_packs_discrete_indices_and_reconstructs_requested_dtype() -> None:
@@ -57,6 +57,9 @@ def test_qjl_uses_lower_mse_width_and_one_bit_sign_payload() -> None:
         tensor_nbytes(tensor)
         for tensor in (payload.indices, payload.norms, payload.qjl_signs, payload.qjl_gamma)
     )
+    decoded_signs = unpack_sign_bits(payload.qjl_signs, tokens * qjl_dim)
+    assert torch.all((decoded_signs == -1) | (decoded_signs == 1))
+    assert torch.isfinite(payload.unpack_reference()).all()
 
 
 def test_value_codec_group_metadata_and_exact_reference_decode() -> None:

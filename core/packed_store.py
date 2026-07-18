@@ -7,8 +7,17 @@ from typing import Iterator
 
 import torch
 
-from core.codec import KeyCodec, PackedKeyPayload, PackedValuePayload, ValueCodec
+from core.codec import (
+    KeyCodec,
+    KeyLayout,
+    PackedKeyPayload,
+    PackedValuePayload,
+    ValueCodec,
+    ValueLayout,
+)
+from core.errors import UnsupportedCapabilityError
 from core.packing import tensor_nbytes
+from core.profiles import CacheImplementation, CompressionProfile
 
 
 _BLOCK_SIZE = 256
@@ -92,6 +101,27 @@ class PackedKVBlock:
         return self.values
 
 
+@dataclass(frozen=True)
+class PackedStoreRuntimeLayout:
+    """Runtime K/V layout facts that a profile cannot safely infer on its own."""
+
+    head_dim: int
+    num_kv_heads: int
+    norm_dtype: torch.dtype
+    qjl_enabled: bool = False
+    qjl_dim: int | None = None
+
+    def __post_init__(self) -> None:
+        _require_int(self.head_dim, "head_dim", minimum=3)
+        _require_int(self.num_kv_heads, "num_kv_heads", minimum=1)
+        if self.norm_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise TypeError("norm_dtype must be fp16, bf16, or fp32.")
+        if type(self.qjl_enabled) is not bool:
+            raise TypeError("qjl_enabled must be a bool.")
+        if self.qjl_dim is not None:
+            _require_int(self.qjl_dim, "qjl_dim", minimum=1)
+
+
 class PackedKVBlockStore:
     """Own chronological packed blocks plus one bounded, unencoded tail.
 
@@ -106,6 +136,7 @@ class PackedKVBlockStore:
         *,
         block_size: int = _BLOCK_SIZE,
         fp16_window: int = 0,
+        num_kv_heads: int | None = None,
     ) -> None:
         if not isinstance(key_codec, KeyCodec):
             raise TypeError("key_codec must be a KeyCodec.")
@@ -118,9 +149,12 @@ class PackedKVBlockStore:
         fp16_window = _require_int(fp16_window, "fp16_window")
         if fp16_window > _BLOCK_SIZE:
             raise ValueError(f"fp16_window cannot exceed {_BLOCK_SIZE}.")
+        if num_kv_heads is not None:
+            _require_int(num_kv_heads, "num_kv_heads", minimum=1)
         self._key_codec = key_codec
         self._value_codec = value_codec
         self._fp16_window = fp16_window
+        self._num_kv_heads = num_kv_heads
         self._blocks: list[PackedKVBlock] = []
         self._pending_keys: torch.Tensor | None = None
         self._pending_values: torch.Tensor | None = None
@@ -145,6 +179,8 @@ class PackedKVBlockStore:
                 raise TypeError(f"{label} must use fp16 or bf16 to preserve the tail.")
         if keys.shape != values.shape:
             raise ValueError("keys and values must have identical shapes.")
+        if self._num_kv_heads is not None and keys.shape[1] != self._num_kv_heads:
+            raise ValueError("keys and values must match the configured num_kv_heads.")
         if keys.device != values.device or keys.dtype != values.dtype:
             raise ValueError("keys and values must have the same device and dtype.")
         if self._pending_keys is not None and (
@@ -236,3 +272,46 @@ class PackedKVBlockStore:
             fp16_window=window_bytes,
             padding=0,
         )
+
+
+def create_packed_kv_block_store(
+    profile: CompressionProfile, runtime: PackedStoreRuntimeLayout
+) -> PackedKVBlockStore:
+    """Build the only supported packed-store backend from validated profile data."""
+    if not isinstance(profile, CompressionProfile):
+        raise TypeError("profile must be a CompressionProfile.")
+    if not isinstance(runtime, PackedStoreRuntimeLayout):
+        raise TypeError("runtime must be a PackedStoreRuntimeLayout.")
+    if profile.cache_implementation is not CacheImplementation.PACKED_KV_BLOCK_STORE:
+        raise UnsupportedCapabilityError(
+            f"cache_implementation {profile.cache_implementation!r} is not supported."
+        )
+    profile_head_dim = profile.model_architecture.get("head_dim")
+    profile_kv_heads = profile.model_architecture.get("num_key_value_heads")
+    if runtime.head_dim != profile_head_dim:
+        raise UnsupportedCapabilityError("runtime head_dim does not match the profile binding.")
+    if runtime.num_kv_heads != profile_kv_heads:
+        raise UnsupportedCapabilityError(
+            "runtime num_kv_heads does not match the profile binding."
+        )
+    return PackedKVBlockStore(
+        KeyCodec(
+            KeyLayout(
+                head_dim=runtime.head_dim,
+                bits=profile.key_bits,
+                norm_dtype=runtime.norm_dtype,
+                qjl_enabled=runtime.qjl_enabled,
+            ),
+            qjl_dim=runtime.qjl_dim,
+        ),
+        ValueCodec(
+            ValueLayout(
+                head_dim=runtime.head_dim,
+                bits=profile.value_bits,
+                group_size=profile.value_group_size,
+            )
+        ),
+        block_size=profile.block_size,
+        fp16_window=profile.fp16_window,
+        num_kv_heads=runtime.num_kv_heads,
+    )

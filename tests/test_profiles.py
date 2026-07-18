@@ -7,9 +7,15 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
 from core.errors import UnsupportedCapabilityError
-from core.profiles import load_profile
+from core.packed_store import (
+    PackedKVBlockStore,
+    PackedStoreRuntimeLayout,
+    create_packed_kv_block_store,
+)
+from core.profiles import CacheImplementation, load_profile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,6 +66,34 @@ def test_checked_in_direct_profile_validates_its_model_manifest() -> None:
     assert profile.value_bits == 6
     assert profile.value_group_size == 32
     assert profile.fp16_window == 128
+    assert profile.cache_implementation is CacheImplementation.PACKED_KV_BLOCK_STORE
+
+
+def test_profile_driven_factory_creates_the_packed_store() -> None:
+    profile = load_profile(PROFILE_PATH)
+
+    store = create_packed_kv_block_store(
+        profile,
+        PackedStoreRuntimeLayout(
+            head_dim=128,
+            num_kv_heads=4,
+            norm_dtype=torch.float16,
+        ),
+    )
+
+    assert type(store) is PackedKVBlockStore
+    store.append(
+        torch.zeros((1, 4, 1, 128), dtype=torch.float16),
+        torch.zeros((1, 4, 1, 128), dtype=torch.float16),
+    )
+
+
+@pytest.mark.parametrize("cache_implementation", ["TurboQuantCacheV2", "unknown"])
+def test_profile_rejects_legacy_or_unknown_cache_implementation(
+    tmp_path: Path, cache_implementation: str
+) -> None:
+    with pytest.raises(UnsupportedCapabilityError, match="cache_implementation"):
+        load_profile(write_profile(tmp_path, cache_implementation=cache_implementation))
 
 
 def test_profile_architecture_metadata_is_recursively_immutable() -> None:

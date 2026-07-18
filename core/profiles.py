@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -15,6 +16,14 @@ from core.errors import UnsupportedCapabilityError
 _SCHEMA_VERSION = 1
 _SUPPORTED_BITS = frozenset({2, 3, 4, 5, 6, 8})
 _DIRECT_BLOCK_SIZE = 256
+
+
+class CacheImplementation(str, Enum):
+    """Cache backend names accepted by signed direct-decode profiles."""
+
+    PACKED_KV_BLOCK_STORE = "packed_kv_block_store"
+
+
 _REQUIRED_PROFILE_FIELDS = frozenset(
     {
         "schema_version",
@@ -29,6 +38,7 @@ _REQUIRED_PROFILE_FIELDS = frozenset(
         "value_bits",
         "value_group_size",
         "fp16_window",
+        "cache_implementation",
         "profile_sha256",
     }
 )
@@ -48,12 +58,8 @@ class CompressionProfile:
     value_bits: int
     value_group_size: int
     fp16_window: int
+    cache_implementation: CacheImplementation
     profile_sha256: str
-
-    @property
-    def cache_implementation(self) -> str:
-        """The fail-closed direct profile never selects the legacy V2 cache."""
-        return "PackedKVBlockStore"
 
 
 def _canonical_hash(payload: Mapping[str, Any], omitted_field: str) -> str:
@@ -96,6 +102,12 @@ def load_profile(path: str | Path) -> CompressionProfile:
     expected_profile_hash = _canonical_hash(payload, "profile_sha256")
     if payload["profile_sha256"] != expected_profile_hash:
         raise UnsupportedCapabilityError("profile hash does not match the profile contents.")
+    try:
+        cache_implementation = CacheImplementation(payload["cache_implementation"])
+    except (TypeError, ValueError) as exc:
+        raise UnsupportedCapabilityError(
+            "cache_implementation must select the packed_kv_block_store backend."
+        ) from exc
 
     for field in ("key_bits", "value_bits"):
         if payload[field] not in _SUPPORTED_BITS:
@@ -151,5 +163,6 @@ def load_profile(path: str | Path) -> CompressionProfile:
         value_bits=payload["value_bits"],
         value_group_size=payload["value_group_size"],
         fp16_window=payload["fp16_window"],
+        cache_implementation=cache_implementation,
         profile_sha256=payload["profile_sha256"],
     )

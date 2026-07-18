@@ -11,12 +11,19 @@ from core.capabilities import (
 )
 from core.errors import UnsupportedCapabilityError
 from core.codec import KeyCodec, KeyLayout, PackedKeyPayload, PackedValuePayload, ValueCodec, ValueLayout
-from core.packed_store import PackedKVBlock, PackedKVBlockStore, PhysicalByteBreakdown
+from core.packed_store import (
+    PackedKVBlock,
+    PackedKVBlockStore,
+    PackedStoreRuntimeLayout,
+    PhysicalByteBreakdown,
+    create_packed_kv_block_store,
+)
 from core.packing import pack_indices, pack_sign_bits, tensor_nbytes, unpack_indices, unpack_sign_bits
-from core.profiles import CompressionProfile, load_profile
+from core.profiles import CacheImplementation, CompressionProfile, load_profile
 
 __all__ = [
     "CompressionProfile",
+    "CacheImplementation",
     "DecodeRequest",
     "ModelCapabilities",
     "ModelManifest",
@@ -26,10 +33,12 @@ __all__ = [
     "PackedKeyPayload",
     "PackedKVBlock",
     "PackedKVBlockStore",
+    "PackedStoreRuntimeLayout",
     "PackedValuePayload",
     "PhysicalByteBreakdown",
     "UnsupportedCapabilityError",
     "derive_model_capabilities",
+    "create_packed_kv_block_store",
     "load_profile",
     "load_model_manifest",
     "pack_indices",
