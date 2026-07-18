@@ -3,15 +3,39 @@
   "name": "qwen25-7b-direct-v1",
   "adapter_status": "direct-adapter",
   "model_manifest_path": "../models/qwen25-7b.json",
-  "model_manifest_sha256": "122012ea4fdca94d6520d66d423603745734fc904f3993f63e2cbf0a64ec7aa6",
+  "model_manifest_sha256": "33f61124cb880a2465c48d1e15f1daba0b2cd547291ae34c2c257483176c59ee",
   "model_revision": {
     "model_id": "Qwen/Qwen2.5-7B-Instruct",
     "revision": "qwen25-7b-direct-v1"
+  },
+  "model_architecture": {
+    "model_type": "qwen2",
+    "adapter_status": "direct-adapter",
+    "architecture_complete": true,
+    "num_hidden_layers": 28,
+    "layer_types": [
+      "full_attention", "full_attention", "full_attention", "full_attention",
+      "full_attention", "full_attention", "full_attention", "full_attention",
+      "full_attention", "full_attention", "full_attention", "full_attention",
+      "full_attention", "full_attention", "full_attention", "full_attention",
+      "full_attention", "full_attention", "full_attention", "full_attention",
+      "full_attention", "full_attention", "full_attention", "full_attention",
+      "full_attention", "full_attention", "full_attention", "full_attention"
+    ],
+    "num_attention_heads": 28,
+    "num_key_value_heads": 4,
+    "head_dim": 128,
+    "rope_settings": {
+      "rope_theta": 1000000.0
+    },
+    "is_text_model": true,
+    "is_multimodal": false,
+    "cache_behavior": "enabled"
   },
   "block_size": 256,
   "key_bits": 8,
   "value_bits": 6,
   "value_group_size": 32,
   "fp16_window": 128,
-  "profile_sha256": "9e9e64901fed452f10ceb8f76f7ec96cc912dd49483e16e7336e226189da6243"
+  "profile_sha256": "bae0710a94373ece443002554004c427da5946cf15ee378ac03d9c3c21332b3f"
 }

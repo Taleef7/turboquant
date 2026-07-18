@@ -1,9 +1,13 @@
 {
+  "schema_version": 1,
   "model_id": "google/gemma-4-e4b",
   "revision": "gemma4-e4b-manifest-v1",
   "model_type": "gemma4",
   "adapter_status": "manifest-only",
+  "architecture_complete": false,
+  "is_text_model": false,
   "is_multimodal": true,
+  "use_cache": false,
   "capacity_preflight_required": true,
   "vision_cache_in_kv_claims": false
 }

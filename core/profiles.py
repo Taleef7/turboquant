@@ -6,9 +6,10 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping
 
-from core.capabilities import ModelRevision
+from core.capabilities import ModelRevision, load_model_manifest
 from core.errors import UnsupportedCapabilityError
 
 
@@ -23,6 +24,7 @@ _REQUIRED_PROFILE_FIELDS = frozenset(
         "model_manifest_path",
         "model_manifest_sha256",
         "model_revision",
+        "model_architecture",
         "block_size",
         "key_bits",
         "value_bits",
@@ -31,11 +33,6 @@ _REQUIRED_PROFILE_FIELDS = frozenset(
         "profile_sha256",
     }
 )
-_REQUIRED_MANIFEST_FIELDS = frozenset(
-    {"model_id", "revision", "model_type", "head_dim", "adapter_status"}
-)
-
-
 @dataclass(frozen=True)
 class CompressionProfile:
     """Validated settings for the sole direct-decode profile currently shipped."""
@@ -46,6 +43,7 @@ class CompressionProfile:
     model_manifest_path: Path
     model_manifest_sha256: str
     revision: ModelRevision
+    model_architecture: Mapping[str, Any]
     block_size: int
     key_bits: int
     value_bits: int
@@ -117,15 +115,21 @@ def load_profile(path: str | Path) -> CompressionProfile:
         raise UnsupportedCapabilityError(f"Cannot read target model manifest at {manifest_path}: {exc}") from exc
     if payload["model_manifest_sha256"] != actual_manifest_hash:
         raise UnsupportedCapabilityError("target model manifest hash does not match the profile.")
-    manifest = _read_json(manifest_path, "model manifest")
-    _require_fields(manifest, _REQUIRED_MANIFEST_FIELDS, "model manifest")
-    if manifest["model_id"] != model_revision["model_id"] or manifest["revision"] != model_revision["revision"]:
+    manifest = load_model_manifest(manifest_path)
+    if (
+        manifest.revision.model_id != model_revision["model_id"]
+        or manifest.revision.revision != model_revision["revision"]
+    ):
         raise UnsupportedCapabilityError("model_revision does not match the target model manifest.")
-    if manifest["adapter_status"] != "direct-adapter" or payload["adapter_status"] != "direct-adapter":
+    if manifest.adapter_status != "direct-adapter" or payload["adapter_status"] != "direct-adapter":
         raise UnsupportedCapabilityError("profile requires a direct-adapter target model manifest.")
+    if payload["model_architecture"] != manifest.architecture_binding():
+        raise UnsupportedCapabilityError(
+            "target model manifest architecture does not match the profile binding."
+        )
     if not isinstance(payload["value_group_size"], int) or payload["value_group_size"] <= 0:
         raise UnsupportedCapabilityError("value_group_size must be a positive integer.")
-    if manifest["head_dim"] % payload["value_group_size"] != 0:
+    if manifest.head_dim is None or manifest.head_dim % payload["value_group_size"] != 0:
         raise UnsupportedCapabilityError(
             "value_group_size must be divisible into the target model head_dim."
         )
@@ -136,11 +140,8 @@ def load_profile(path: str | Path) -> CompressionProfile:
         adapter_status=payload["adapter_status"],
         model_manifest_path=manifest_path,
         model_manifest_sha256=payload["model_manifest_sha256"],
-        revision=ModelRevision(
-            model_id=model_revision["model_id"],
-            revision=model_revision["revision"],
-            manifest_sha256=actual_manifest_hash,
-        ),
+        revision=manifest.revision,
+        model_architecture=MappingProxyType(payload["model_architecture"]),
         block_size=payload["block_size"],
         key_bits=payload["key_bits"],
         value_bits=payload["value_bits"],
