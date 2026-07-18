@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![arXiv](https://img.shields.io/badge/arXiv-2504.19874-b31b1b.svg)](https://arxiv.org/abs/2504.19874)
-[![Python](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-12.8%2B-76B900.svg)](https://pytorch.org/get-started/locally/)
 [![Scope](https://img.shields.io/badge/Validated-Qwen%2032K%20NIAH-success.svg)](TESTING_RESULTS.md)
 [![Repro](https://img.shields.io/badge/Repro-Checklist-blue.svg)](docs/REPLICATION_CHECKLIST.md)
@@ -89,97 +89,47 @@ See `docs/PAPER_CLAIMS_STATUS.md` and `docs/PAPER_COMPARISON.md`.
 
 For an explicit mapping of paper experiments to repo coverage, see `docs/PAPER_COMPARISON.md`.
 
-## Requirements (Step-by-Step)
+## Installation and reproducibility contract
 
-## 1) Hardware / runtime
-
-- NVIDIA GPU strongly recommended for full benchmarks.
-- For RTX 50-series Blackwell (`sm_120`), use PyTorch nightly `cu128` builds.
-- VRAM:
-  - ~12-16 GB: practical for current Qwen scope (through 32K paired tests may still be slow/heavy)
-  - higher VRAM helps for larger context and multi-model sweeps
-
-## 2) System dependencies
-
-- Python 3.12
-- `pip`
-- CUDA-compatible NVIDIA driver
-
-## 3) Python packages
-
-This repo uses `requirements.txt`:
-- `torch`
-- `transformers`
-- `triton`
-- `bitsandbytes`
-- `datasets`
-- `einops`
-- `accelerate`
-
-## 4) Hugging Face access (if needed)
-
-- Qwen and Mistral are generally accessible directly.
-- Llama-3.1 requires accepted model terms + auth token.
-- If you plan to run gated models:
-
-```bash
-pip install -U "huggingface_hub[cli]"
-huggingface-cli login
-```
-
-## Quickstart
-
-## Quick Verify (10-20 min)
-
-```bash
-source venv312/bin/activate
-python scripts/reproduce_release.py --mode quick --output-dir results/repro_quick
-```
-
-Outputs:
-- `results/repro_quick/repro_report.json`
-- `results/repro_quick/repro_report.md`
-
-## Full Verify (Qwen release-check path)
-
-```bash
-source venv312/bin/activate
-python scripts/reproduce_release.py --mode full --output-dir results/repro_full
-```
-
-`full` mode is currently pinned to Qwen paired NIAH through 16K with higher trials.
-
-### 1) Environment
+Use Python 3.11 or newer. Full CUDA experiments are intended for a native WSL
+Linux checkout with a CUDA-capable NVIDIA GPU; the test contract itself is safe
+on CPU and never downloads a model.
 
 ```bash
 git clone https://github.com/Taleef7/turboquant.git
 cd turboquant
-python -m venv venv312
-source venv312/bin/activate
-pip install -r requirements.txt
+python3.12 -m venv ~/.venvs/turboquant-forge
+source ~/.venvs/turboquant-forge/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements/runtime.lock
 ```
 
-If you are on RTX 50-series/Blackwell, install PyTorch nightly `cu128` first (then install requirements):
+`requirements/runtime.lock` is the single pinned runtime source and uses the
+official stable PyTorch CUDA 12.8 wheel index. `requirements.txt` remains a
+compatibility pointer to that lock. Regenerate the lock only with the documented
+command in its header, after verifying `torch.cuda.is_available()` in WSL.
 
 ```bash
-pip install --upgrade pip
-pip install torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
-pip install -r requirements.txt
+nvidia-smi
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+python -c "import accelerate, bitsandbytes, einops, numpy, safetensors, scipy, transformers, triton; print('runtime imports: OK')"
+python -m pip install pytest ruff
+python -m pytest tests -m "not gpu" -q
+python -m compileall core scripts tests
 ```
 
-### 2) Unit Tests (fast sanity)
+See [SETUP_CUDA.md](SETUP_CUDA.md) and [WSL2_SETUP.md](WSL2_SETUP.md) for the
+native WSL setup and troubleshooting path.
+
+## Reproduction commands
+
+The GPU-aware scripts below require a successful CUDA smoke check first. Their
+artifacts should be written under `artifacts/` (which is ignored except for
+checked-in fixtures).
 
 ```bash
-pytest scripts/test_math.py scripts/test_kernels.py -v
-pytest scripts/test_long_context_harness.py -q
-pytest scripts/test_cache_config.py scripts/test_qjl_config.py -q
-```
-
-### 3) Baseline and TurboQuant demos
-
-```bash
-python scripts/run_baseline.py
-python scripts/run_turboquant_v2.py
+python scripts/reproduce_release.py --mode quick --output-dir artifacts/repro_quick
+python scripts/reproduce_release.py --mode full --output-dir artifacts/repro_full
 ```
 
 ## Reproducing Key Claims

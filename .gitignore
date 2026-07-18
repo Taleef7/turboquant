@@ -42,6 +42,11 @@ results/
 # Local experiment artifacts
 .tmp/
 
+# Generated benchmark artifacts (keep fixtures explicitly under artifacts/fixtures/)
+artifacts/*
+!artifacts/fixtures/
+!artifacts/fixtures/**
+
 # Local visual brainstorming companion sessions
 .superpowers/
 

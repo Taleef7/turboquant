@@ -1,0 +1,11 @@
+# Resolve this input in a verified WSL CUDA environment; see runtime.lock.
+torch
+transformers
+triton
+accelerate
+bitsandbytes
+safetensors
+numpy
+scipy
+einops
+

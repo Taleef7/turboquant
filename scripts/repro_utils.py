@@ -2,13 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
 import json
 import os
+import platform
+import random
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import torch
+_PACKAGE_NAMES = (
+    "torch",
+    "transformers",
+    "triton",
+    "bitsandbytes",
+    "numpy",
+    "scipy",
+)
 
 
 def git_commit_sha() -> str:
@@ -21,24 +33,132 @@ def git_commit_sha() -> str:
         return "unknown"
 
 
-def capture_env_metadata() -> dict:
+def sha256_file(path: str | Path) -> str:
+    """Return the SHA-256 digest of a file without loading it all into memory."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def package_version(name: str) -> str | None:
+    """Return an installed distribution version or an explicit null equivalent."""
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _import_torch():
+    try:
+        import torch
+
+        return torch
+    except ImportError:
+        return None
+
+
+def _nvidia_driver_version() -> str | None:
+    """Return the active NVIDIA driver version when nvidia-smi is available."""
+    try:
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        return output.strip().splitlines()[0]
+    except (FileNotFoundError, IndexError, subprocess.CalledProcessError):
+        return None
+
+
+def seed_everything(seed: int, deterministic: bool = True) -> None:
+    """Seed available random generators and configure deterministic torch modes."""
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+
+    try:
+        import numpy as np
+
+        np.random.seed(seed)
+    except ImportError:
+        pass
+
+    torch = _import_torch()
+    if torch is None:
+        return
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.use_deterministic_algorithms(deterministic, warn_only=True)
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cuda.matmul.allow_tf32 = not deterministic
+    torch.backends.cudnn.allow_tf32 = not deterministic
+
+
+def capture_cuda_metadata() -> dict[str, bool | int | str | None]:
+    """Capture CUDA and determinism state without allocating a GPU tensor."""
+    schema: dict[str, bool | int | str | None] = {
+        "cuda_available": None,
+        "cuda_runtime": None,
+        "gpu_name": None,
+        "gpu_sm_capability": None,
+        "gpu_total_vram_bytes": None,
+        "driver_version": None,
+        "tf32_allow_tf32": None,
+        "cudnn_allow_tf32": None,
+        "deterministic_algorithms": None,
+        "cudnn_deterministic": None,
+        "cudnn_benchmark": None,
+    }
+    torch = _import_torch()
+    if torch is None:
+        return schema
+
     cuda_available = torch.cuda.is_available()
-    meta = {
+    schema.update(
+        {
+            "cuda_available": cuda_available,
+            "cuda_runtime": torch.version.cuda,
+            "tf32_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "cudnn_deterministic": torch.backends.cudnn.deterministic,
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        }
+    )
+    if not cuda_available:
+        return schema
+
+    props = torch.cuda.get_device_properties(0)
+    schema.update(
+        {
+            "gpu_name": props.name,
+            "gpu_sm_capability": f"sm_{props.major}{props.minor}",
+            "gpu_total_vram_bytes": props.total_memory,
+            "driver_version": _nvidia_driver_version(),
+        }
+    )
+    return schema
+
+
+def capture_env_metadata() -> dict[str, bool | int | str | None]:
+    """Return the explicit, JSON-serializable reproducibility metadata schema."""
+    cuda = capture_cuda_metadata()
+    meta: dict[str, bool | int | str | None] = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "git_commit": git_commit_sha(),
-        "torch_version": torch.__version__,
-        "cuda_available": cuda_available,
-        "python_executable": os.environ.get("PYTHON_EXECUTABLE", "python"),
+        "python_executable": sys.executable,
+        "python_version": platform.python_version(),
+        "operating_system": platform.platform(),
+        "deterministic": cuda["deterministic_algorithms"],
     }
-    if cuda_available:
-        props = torch.cuda.get_device_properties(0)
-        meta.update(
-            {
-                "gpu_name": props.name,
-                "gpu_vram_gb": round(props.total_memory / (1024**3), 2),
-                "cuda_runtime": torch.version.cuda,
-            }
-        )
+    for package in _PACKAGE_NAMES:
+        meta[f"{package}_version"] = package_version(package)
+    meta.update(cuda)
     return meta
 
 
