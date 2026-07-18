@@ -72,6 +72,19 @@ manifest; they are not inferred from a benchmark script or model name. The
 first direct-decode contract is deliberately narrow: Qwen2.5 text, batch size
 one, greedy decode, full attention, and an enabled text KV cache.
 
+### Packed Triton kernel validation
+
+The clean-room packed-score and value-mix kernels are deliberately separate
+from model adapters.  Their GPU parity suite reports a failure if a qualified
+dispatch replaces a kernel with its PyTorch reference path.  For a CI-independent
+memory-safety check from WSL, run:
+
+```bash
+compute-sanitizer --tool memcheck --error-exitcode 1 \
+  /home/taleef/.venvs/turboquant-forge/bin/python -m pytest \
+  tests/test_packed_attention_kernels.py -m gpu -q
+```
+
 | Family | Status | Cache rule |
 | --- | --- | --- |
 | Qwen2.5-7B text | direct adapter | The only eligible direct-decode target; use `configs/profiles/qwen25-7b-direct-v1.json`. |
