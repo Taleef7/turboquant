@@ -66,8 +66,7 @@ class PackedAttentionHotPathDebugState:
 
     static_validation_passes: int = 0
     static_validation_reductions: int = 0
-    hot_path_validation_reductions: int = 0
-    hot_path_device_constant_transfers: int = 0
+    constant_residency_checks: int = 0
     rotation_launches: int = 0
     packed_score_launches: int = 0
     packed_value_launches: int = 0
@@ -888,7 +887,29 @@ class PreparedPackedAttentionDecode:
     head_dim: int
     num_kv_heads: int
     scale: float
+    static_constant_ptrs: tuple[int, ...]
+    static_constant_device: torch.device
     debug: PackedAttentionHotPathDebugState | None = None
+
+    def _assert_static_constants_resident(self) -> None:
+        """Reject a mutated prepared plan before entering its unchecked kernels."""
+        constants = (
+            self.rotation,
+            self.gqa_mapping,
+            self.gqa_mapping_long,
+            *(block.key_codebook for block in self.blocks),
+        )
+        if (
+            len(constants) != len(self.static_constant_ptrs)
+            or any(
+                tensor.device != self.static_constant_device
+                or tensor.data_ptr() != pointer
+                for tensor, pointer in zip(constants, self.static_constant_ptrs, strict=True)
+            )
+        ):
+            raise RuntimeError("prepared packed-attention constants lost device residency.")
+        if self.debug is not None:
+            self.debug.constant_residency_checks += 1
 
     def launch(
         self,
@@ -897,6 +918,7 @@ class PreparedPackedAttentionDecode:
         fp16_window: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Run one decode token without revalidating static GPU inputs."""
+        self._assert_static_constants_resident()
         if (
             not isinstance(query, torch.Tensor)
             or query.ndim != 3
@@ -1106,15 +1128,26 @@ def prepare_packed_attention_decode(
             raise TypeError("debug must be PackedAttentionHotPathDebugState or None.")
         debug.static_validation_passes += 1
         debug.static_validation_reductions += 2
+    prepared_rotation = rotation.float().contiguous()
+    prepared_gqa_mapping = gqa_mapping.contiguous()
+    prepared_gqa_mapping_long = gqa_mapping.to(dtype=torch.long).contiguous()
+    constants = (
+        prepared_rotation,
+        prepared_gqa_mapping,
+        prepared_gqa_mapping_long,
+        *(block.key_codebook for block in prepared_blocks),
+    )
     return PreparedPackedAttentionDecode(
         prepared_blocks,
-        rotation.float().contiguous(),
-        gqa_mapping.contiguous(),
-        gqa_mapping.to(dtype=torch.long).contiguous(),
+        prepared_rotation,
+        prepared_gqa_mapping,
+        prepared_gqa_mapping_long,
         gqa_mapping.shape[0],
         head_dim,
         kv_heads,
         attention_scale,
+        tuple(tensor.data_ptr() for tensor in constants),
+        rotation.device,
         debug,
     )
 
