@@ -302,6 +302,12 @@ def derive_model_capabilities(
     """Derive facts from the actual config; a manifest governs adapter eligibility."""
     raw_model_type = _field(config, "model_type")
     model_type = str(raw_model_type) if raw_model_type is not None else None
+    configured_is_text_model = _field(config, "is_text_model")
+    # Stock Qwen2Config does not expose this repository-specific architecture
+    # fact. A matching pinned text manifest supplies it; unknown configs remain
+    # unqualified rather than being guessed from their model name.
+    if configured_is_text_model is None and manifest is not None and manifest.model_type == model_type:
+        configured_is_text_model = manifest.is_text_model
     raw_count = _field(config, "num_hidden_layers")
     layer_count = int(raw_count) if isinstance(raw_count, int) else None
     layer_types = _layer_types(config, layer_count)
@@ -316,6 +322,10 @@ def derive_model_capabilities(
     kv_heads = int(raw_kv_heads) if isinstance(raw_kv_heads, int) else None
     raw_head_dim = _field(config, "head_dim")
     head_dim = int(raw_head_dim) if isinstance(raw_head_dim, int) else None
+    if head_dim is None and q_heads:
+        hidden_size = _field(config, "hidden_size")
+        if isinstance(hidden_size, int) and hidden_size > 0 and hidden_size % q_heads == 0:
+            head_dim = hidden_size // q_heads
     groups = q_heads // kv_heads if q_heads and kv_heads and q_heads % kv_heads == 0 else None
     rope_settings = {
         name: value
@@ -343,7 +353,7 @@ def derive_model_capabilities(
         head_dim=head_dim,
         num_key_value_groups=groups,
         rope_settings=_freeze_json(rope_settings),
-        is_text_model=_field(config, "is_text_model"),
+        is_text_model=configured_is_text_model,
         is_multimodal=bool(_field(config, "is_multimodal", False)),
         cache_behavior=cache_behavior,
     )

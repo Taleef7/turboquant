@@ -40,7 +40,7 @@ class PackedAttentionMetrics:
     standard_prefill_calls: int = 0
     packed_decode_calls: int = 0
     packed_blocks_consumed: int = 0
-    full_history_cat_attempted: bool = False
+    packed_reference_decode_calls: int = 0
     max_logit_drift: float | None = None
     packed_reference_max_error: float | None = None
 
@@ -108,15 +108,30 @@ class PackedAttentionSession:
             raise UnsupportedCapabilityError(_UNSUPPORTED_LAYOUT)
         self._layer_ids = {id(module): index for index, module in enumerate(self.layers)}
         self.cache = PackedDynamicCache(profile, layer_count=len(self.layers))
+        self.cache.set_update_guard(self._require_permitted_cache_update)
         self.metrics = PackedAttentionMetrics()
         self.phase = "idle"
         self._token: object | None = None
         self._previous_implementation: object | None = None
         self._last_logits: torch.Tensor | None = None
         self.compare_packed_reference = False
+        self.use_packed_reference_backend = False
 
     def owns(self, module: object) -> bool:
         return id(module) in self._layer_ids
+
+    def _require_permitted_cache_update(self, key_states: torch.Tensor, layer_idx: int) -> None:
+        """Reject unsupported attention calls before a K/V append can occur."""
+        if _ACTIVE_SESSION.get() is not self:
+            raise UnsupportedCapabilityError("Qwen2.5 packed cache requires its active session.")
+        tokens = key_states.shape[-2]
+        if self.phase == "prefill" and tokens > 1:
+            return
+        if self.phase == "decode" and tokens == 1 and self.cache.sequence_length() > 0:
+            return
+        raise UnsupportedCapabilityError(
+            "Qwen2.5 packed cache updates require active prefill or greedy decode."
+        )
 
     def __enter__(self) -> "PackedAttentionSession":
         active = _ACTIVE_SESSION.get()
@@ -188,6 +203,21 @@ class PackedAttentionSession:
         store = self.cache.store_for(layer_idx)
         if store.sequence_length() < 1:
             raise UnsupportedCapabilityError("direct packed attention requires a standard prompt prefill first.")
+        if self.use_packed_reference_backend:
+            from core.reference_attention import ReferenceAttentionLayout, packed_reference_decode
+
+            reference = packed_reference_decode(
+                query,
+                store,
+                ReferenceAttentionLayout(
+                    head_dim=query.shape[-1],
+                    num_attention_heads=query.shape[1],
+                    num_key_value_heads=self.capabilities.num_key_value_heads or 0,
+                ),
+                scale=float(scale) if scale is not None else None,
+            )
+            self.metrics.packed_reference_decode_calls += 1
+            return reference
         blocks = (
             PackedAttentionBlock(
                 packed_keys=block.keys.indices.reshape(query.shape[1] // self.capabilities.num_key_value_groups, block.logical_tokens, -1),

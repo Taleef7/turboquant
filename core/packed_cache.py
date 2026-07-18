@@ -7,7 +7,7 @@ full-history fp16 tensor.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 
@@ -27,6 +27,14 @@ class PackedDynamicCache:
         self._stores: list[PackedKVBlockStore | None] = [None] * layer_count
         self._device: torch.device | None = None
         self._dtype: torch.dtype | None = None
+        self._update_guard: Callable[[torch.Tensor, int], None] | None = None
+        self.rejected_updates = 0
+        self.max_returned_kv_tokens = 0
+        self.historical_kv_tokens_returned = 0
+
+    def set_update_guard(self, guard: Callable[[torch.Tensor, int], None]) -> None:
+        """Bind the owning session's pre-append phase contract."""
+        self._update_guard = guard
 
     def _validate_update(
         self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int
@@ -84,6 +92,12 @@ class PackedDynamicCache:
         """
         _ = cache_kwargs
         self._validate_update(key_states, value_states, layer_idx)
+        if self._update_guard is not None:
+            try:
+                self._update_guard(key_states, layer_idx)
+            except UnsupportedCapabilityError:
+                self.rejected_updates += 1
+                raise
         store = self._stores[layer_idx]
         if store is None:
             store = self._new_store(key_states, layer_idx)
@@ -93,6 +107,9 @@ class PackedDynamicCache:
         self._stores[layer_idx] = store
         self._device = key_states.device
         self._dtype = key_states.dtype
+        # Returning the incoming local segment is the only cache-facing K/V
+        # contract. Historical packed data is consumed by the custom backend.
+        self.max_returned_kv_tokens = max(self.max_returned_kv_tokens, key_states.shape[-2])
         return key_states, value_states
 
     def store_for(self, layer_idx: int) -> PackedKVBlockStore:
@@ -123,4 +140,3 @@ class PackedDynamicCache:
 
     def sequence_length(self) -> int:
         return self.get_seq_length(0)
-
