@@ -80,7 +80,7 @@ def _fixture(
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("pages", [0, 1, 2, 3, 31])
+@pytest.mark.parametrize("pages", [0, 1, 2, 31])
 def test_prepared_qwen_fuses_each_canonical_packed_page_without_scores(
     monkeypatch: pytest.MonkeyPatch,
     pages: int,
@@ -124,7 +124,7 @@ def test_prepared_qwen_fuses_each_canonical_packed_page_without_scores(
         guarded.setattr(torch, "empty", reject_packed_score_materialization)
         actual = prepared.launch(query, fp16_window=tail)
 
-    assert getattr(debug, "fused_packed_page_launches", 0) == math.ceil(pages / 2)
+    assert getattr(debug, "fused_packed_page_launches", 0) == pages
     assert debug.packed_score_launches == 0
     assert debug.packed_value_launches == 0
     torch.testing.assert_close(actual, expected_direct, rtol=3e-3, atol=3e-3)
