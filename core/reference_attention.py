@@ -52,9 +52,9 @@ class ReferenceAttentionDebugState:
             raise ValueError("temporary token count must be a positive built-in int.")
         self.max_temporary_tokens = max(self.max_temporary_tokens, tokens)
         self.max_temporary_elements = max(self.max_temporary_elements, elements)
+        if tokens > block_size:
+            raise AssertionError("reference attention segment exceeded one packed block.")
         if decoded:
-            if tokens > block_size:
-                raise AssertionError("reference decoding exceeded one packed block.")
             self.max_decoded_tokens = max(self.max_decoded_tokens, tokens)
 
 
@@ -183,16 +183,41 @@ def packed_reference_decode(
         running_max = new_max
         saw_history = True
 
+    def consume_in_block_chunks(
+        rotated_keys: torch.Tensor,
+        values: torch.Tensor,
+        key_norms: torch.Tensor | None,
+        *,
+        decoded: bool,
+    ) -> None:
+        total_tokens = rotated_keys.shape[-2]
+        for start in range(0, total_tokens, store.block_size):
+            stop = min(start + store.block_size, total_tokens)
+            segment_norms = None
+            if key_norms is not None:
+                segment_norms = key_norms.reshape(
+                    layout.num_key_value_heads, total_tokens
+                )[..., start:stop]
+            consume_segment(
+                rotated_keys[..., start:stop, :],
+                values[..., start:stop, :],
+                segment_norms,
+                decoded=decoded,
+            )
+
     for block in store.iter_blocks():
-        consume_segment(
-            block.keys.unpack_rotated_reference(),
-            block.values.unpack_reference(),
-            block.keys.norms,
+        decoded_keys = block.keys.unpack_reference_fp32()
+        consume_in_block_chunks(
+            store.key_codec.rotate_reference_vectors(decoded_keys),
+            block.values.unpack_reference().float(),
+            None,
             decoded=True,
         )
     for key_window, value_window in store.iter_fp16_window():
-        rotated_window = store.key_codec.rotate_query_reference(key_window)
-        consume_segment(rotated_window, value_window, None, decoded=False)
+        rotated_window = store.key_codec.rotate_reference_vectors(key_window)
+        consume_in_block_chunks(
+            rotated_window, value_window.float(), None, decoded=False
+        )
 
     if not saw_history:
         raise ValueError("cannot decode attention from an empty packed store.")

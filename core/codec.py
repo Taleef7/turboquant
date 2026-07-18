@@ -96,9 +96,6 @@ class PackedKeyPayload:
     _unpack: Callable[[], torch.Tensor] | None = field(
         default=None, repr=False, compare=False
     )
-    _unpack_rotated: Callable[[], torch.Tensor] | None = field(
-        default=None, repr=False, compare=False
-    )
 
     def physical_nbytes(self) -> int:
         return sum(
@@ -113,11 +110,9 @@ class PackedKeyPayload:
             raise RuntimeError("payload has no reference decoder.")
         return self._unpack()
 
-    def unpack_rotated_reference(self) -> torch.Tensor:
-        """Reconstruct one block in the key-codec's rotated unit-vector space."""
-        if self._unpack_rotated is None:
-            raise RuntimeError("payload has no rotated reference decoder.")
-        return self._unpack_rotated()
+    def unpack_reference_fp32(self) -> torch.Tensor:
+        """Return the explicit fp32 representation used by reference attention."""
+        return self.unpack_reference().float()
 
 
 @dataclass
@@ -187,18 +182,26 @@ class KeyCodec:
             torch.uint8
         )
 
-    def rotate_query_reference(self, query: torch.Tensor) -> torch.Tensor:
-        """Rotate query vectors into the key-codec coordinate system in fp32."""
-        if not isinstance(query, torch.Tensor):
-            raise TypeError("query must be a torch.Tensor.")
-        if query.ndim != 4 or query.shape[0] != 1 or query.shape[-1] != self.layout.head_dim:
+    def rotate_reference_vectors(self, vectors: torch.Tensor) -> torch.Tensor:
+        """Rotate fp16/bf16/fp32 query or decoded-key vectors into fp32 space."""
+        if not isinstance(vectors, torch.Tensor):
+            raise TypeError("vectors must be a torch.Tensor.")
+        if (
+            vectors.ndim != 4
+            or vectors.shape[0] != 1
+            or vectors.shape[-1] != self.layout.head_dim
+        ):
             raise ValueError(
-                "query must have shape [1, num_attention_heads, tokens, "
-                f"{self.layout.head_dim}], got {tuple(query.shape)}."
+                "vectors must have shape [1, heads, tokens, "
+                f"{self.layout.head_dim}], got {tuple(vectors.shape)}."
             )
-        if query.dtype not in _FLOAT_DTYPES:
-            raise TypeError("query must use fp16, bf16, or fp32.")
-        return query.float() @ self._rotation.to(query.device, dtype=torch.float32).T
+        if vectors.dtype not in _FLOAT_DTYPES:
+            raise TypeError("vectors must use fp16, bf16, or fp32.")
+        return vectors.float() @ self._rotation.to(vectors.device, dtype=torch.float32).T
+
+    def rotate_query_reference(self, query: torch.Tensor) -> torch.Tensor:
+        """Compatibility wrapper for rotating a query into key-codec space."""
+        return self.rotate_reference_vectors(query)
 
     def encode(self, keys: torch.Tensor) -> PackedKeyPayload:
         heads, tokens = _validate_kv_tensor(keys, self.layout.head_dim, "keys")
@@ -253,26 +256,6 @@ class KeyCodec:
                 output_dtype
             )
 
-        def unpack_rotated() -> torch.Tensor:
-            decoded_indices = unpack_indices(
-                packed_indices, self.mse_bits, self.layout.head_dim
-            ).long()
-            reconstructed = centroids[decoded_indices]
-            if packed_signs is not None and gamma is not None:
-                assert self._qjl_projection is not None
-                qjl_signs = unpack_sign_bits(packed_signs, tokens * self.qjl_dim).reshape(
-                    -1, self.qjl_dim
-                ).float()
-                correction = qjl_signs @ self._qjl_projection.to(device)
-                rotated_correction = correction @ rotation.T
-                reconstructed = reconstructed + (
-                    (torch.pi / 2.0) ** 0.5
-                    / self.qjl_dim
-                    * gamma.float().unsqueeze(-1)
-                    * rotated_correction
-                )
-            return reconstructed.reshape(1, heads, tokens, self.layout.head_dim)
-
         return PackedKeyPayload(
             indices=packed_indices,
             norms=stored_norms,
@@ -280,7 +263,6 @@ class KeyCodec:
             qjl_gamma=gamma,
             logical_tokens=tokens,
             _unpack=unpack,
-            _unpack_rotated=unpack_rotated,
         )
 
 

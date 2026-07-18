@@ -29,23 +29,23 @@ def make_store(*, head_dim: int, fp16_window: int = 0) -> PackedKVBlockStore:
 def sdpa_on_unpacked_quantized_history(
     query: torch.Tensor, store: PackedKVBlockStore, layout: ReferenceAttentionLayout
 ) -> torch.Tensor:
-    """Oracle intentionally permitted to materialize full quantized history."""
-    keys = [block.keys.unpack_reference() for block in store.iter_blocks()]
-    values = [block.values.unpack_reference() for block in store.iter_blocks()]
+    """Oracle over the backend's explicit fp32 decoded-key representation."""
+    keys = [block.keys.unpack_reference_fp32() for block in store.iter_blocks()]
+    values = [block.values.unpack_reference().float() for block in store.iter_blocks()]
     for key_window, value_window in store.iter_fp16_window():
-        keys.append(key_window)
-        values.append(value_window)
+        keys.append(key_window.float())
+        values.append(value_window.float())
     all_keys = torch.cat(keys, dim=-2)
     all_values = torch.cat(values, dim=-2)
     repeat = layout.num_attention_heads // layout.num_key_value_heads
     return F.scaled_dot_product_attention(
-        query,
+        query.float(),
         all_keys.repeat_interleave(repeat, dim=1),
         all_values.repeat_interleave(repeat, dim=1),
         dropout_p=0.0,
         is_causal=False,
         scale=1 / math.sqrt(layout.head_dim),
-    )
+    ).to(query.dtype)
 
 
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
@@ -95,6 +95,43 @@ def test_blockwise_reference_handles_mixed_packed_and_fp16_window_history() -> N
         rtol=2e-3,
         atol=2e-3,
     )
+
+
+def test_large_fp16_window_is_chunked_to_the_block_temporary_bound() -> None:
+    torch.manual_seed(314)
+    layout = ReferenceAttentionLayout(
+        head_dim=64, num_attention_heads=4, num_key_value_heads=2
+    )
+    store = make_store(head_dim=64, fp16_window=256)
+    keys = torch.randn((1, 2, 767, 64), dtype=torch.float16)
+    values = torch.randn_like(keys)
+    query = torch.randn((1, 4, 2, 64), dtype=torch.float16)
+    store.append(keys, values)
+
+    assert len(tuple(store.iter_blocks())) == 1
+    assert next(store.iter_fp16_window())[0].shape[-2] == 511
+    debug = ReferenceAttentionDebugState()
+    output = packed_reference_decode(query, store, layout, debug=debug)
+
+    torch.testing.assert_close(
+        output,
+        sdpa_on_unpacked_quantized_history(query, store, layout),
+        rtol=2e-3,
+        atol=2e-3,
+    )
+    assert debug.max_temporary_tokens <= 256
+
+
+def test_packed_key_fp32_reference_representation_is_explicit() -> None:
+    store = make_store(head_dim=64)
+    keys = torch.randn((1, 2, 256, 64), dtype=torch.float16)
+    store.append(keys, torch.randn_like(keys))
+
+    packed_keys = next(store.iter_blocks()).keys
+    fp32_decoded = packed_keys.unpack_reference_fp32()
+
+    assert fp32_decoded.dtype is torch.float32
+    assert torch.equal(fp32_decoded, packed_keys.unpack_reference().float())
 
 
 def test_extra_old_block_changes_output_without_increasing_decoded_block_bound() -> None:
