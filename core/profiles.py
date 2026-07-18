@@ -50,6 +50,11 @@ class CompressionProfile:
     fp16_window: int
     profile_sha256: str
 
+    @property
+    def cache_implementation(self) -> str:
+        """The fail-closed direct profile never selects the legacy V2 cache."""
+        return "PackedKVBlockStore"
+
 
 def _canonical_hash(payload: Mapping[str, Any], omitted_field: str) -> str:
     content = dict(payload)

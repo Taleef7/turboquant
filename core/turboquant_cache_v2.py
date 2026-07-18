@@ -37,6 +37,10 @@ class TurboQuantCacheV2(DynamicCache):
         buffer_size: Number of recent tokens to keep uncompressed.
     """
 
+    # V2 retains compatibility with historical experiment scripts only.  New
+    # direct-decode profiles route through PackedKVBlockStore instead.
+    LEGACY = True
+
     def __init__(
         self,
         head_dim: int = 128,

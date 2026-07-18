@@ -1,5 +1,5 @@
 """
-TurboQuant Simple: Minimal MSE-only implementation.
+TurboQuant Simple: legacy raw-index MSE implementation.
 
 Based on tonbistudio/turboquant-pytorch reference.
 Key insight: MUST normalize to unit length before rotation.
@@ -7,6 +7,10 @@ Key insight: MUST normalize to unit length before rotation.
 Pipeline:
   COMPRESS:   x → ||x|| (store) → x/||x|| → rotate → quantize → indices
   DECOMPRESS: indices → centroids → unrotate → scale by ||x|| → x_hat
+
+New direct-decode code must use ``core.codec`` and ``core.packed_store``.  This
+module remains unchanged as the numerical reference used by historical V2
+experiments and for the rotation construction shared by the packed codec.
 """
 
 import torch
