@@ -21,7 +21,7 @@
 
 ---
 
-## 1. Establish a reproducible, CPU-testable project contract
+## Task 1: Establish a reproducible, CPU-testable project contract
 
 **Files:**
 - Add: `pyproject.toml`
@@ -83,7 +83,7 @@
   git commit -m "build: add reproducible test and environment contract"
   ```
 
-## 2. Add explicit model capabilities and fail-closed profiles
+## Task 2: Add explicit model capabilities and fail-closed profiles
 
 **Files:**
 - Add: `core/errors.py`
@@ -142,7 +142,7 @@
   git commit -m "feat: add fail-closed model capability profiles"
   ```
 
-## 3. Build the physically packed reference codec and append-only block store
+## Task 3: Build the physically packed reference codec and append-only block store
 
 **Files:**
 - Add: `core/packing.py`
@@ -229,7 +229,7 @@
   git commit -m "feat: add packed KV codec and block store"
   ```
 
-## 4. Establish blockwise reference attention before GPU kernels
+## Task 4: Establish blockwise reference attention before GPU kernels
 
 **Files:**
 - Add: `core/reference_attention.py`
@@ -278,7 +278,7 @@
   git commit -m "feat: add blockwise packed attention reference"
   ```
 
-## 5. Implement and verify Triton packed score and value-mix kernels
+## Task 5: Implement and verify Triton packed score and value-mix kernels
 
 **Files:**
 - Add: `kernels/packed_attention.py`
@@ -325,7 +325,7 @@
   git commit -m "feat: add verified Triton packed attention kernels"
   ```
 
-## 6. Integrate the direct backend with Qwen2.5 greedy decode
+## Task 6: Integrate the direct backend with Qwen2.5 greedy decode
 
 **Files:**
 - Add: `core/packed_cache.py`
@@ -377,7 +377,7 @@
   git commit -m "feat: integrate packed decode for Qwen2.5"
   ```
 
-## 7. Replace permissive benchmarks with self-validating evidence runs
+## Task 7: Replace permissive benchmarks with self-validating evidence runs
 
 **Files:**
 - Add: `scripts/run_direct_benchmark.py`
@@ -434,7 +434,7 @@
   git commit -m "feat: add self-validating quality and systems benchmarks"
   ```
 
-## 8. Reconcile documentation, claims, and portability evidence
+## Task 8: Reconcile documentation, claims, and portability evidence
 
 **Files:**
 - Modify: `README.md`
