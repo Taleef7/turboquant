@@ -1,0 +1,20 @@
+{
+  "model_id": "Qwen/Qwen3.5-9B",
+  "revision": "qwen35-9b-manifest-v1",
+  "model_type": "qwen3_5",
+  "adapter_status": "manifest-only",
+  "num_hidden_layers": 32,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 8,
+  "head_dim": 128,
+  "rope_theta": 1000000.0,
+  "use_cache": true,
+  "layer_pattern": [
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention"
+  ],
+  "linear_state_behavior": "native-only",
+  "compressible_attention_behavior": "full_attention-only"
+}

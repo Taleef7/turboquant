@@ -1,0 +1,21 @@
+{
+  "model_id": "Qwen/Qwen2.5-7B-Instruct",
+  "revision": "qwen25-7b-direct-v1",
+  "model_type": "qwen2",
+  "adapter_status": "direct-adapter",
+  "num_hidden_layers": 28,
+  "num_attention_heads": 28,
+  "num_key_value_heads": 4,
+  "head_dim": 128,
+  "rope_theta": 1000000.0,
+  "use_cache": true,
+  "layer_types": [
+    "full_attention", "full_attention", "full_attention", "full_attention",
+    "full_attention", "full_attention", "full_attention", "full_attention",
+    "full_attention", "full_attention", "full_attention", "full_attention",
+    "full_attention", "full_attention", "full_attention", "full_attention",
+    "full_attention", "full_attention", "full_attention", "full_attention",
+    "full_attention", "full_attention", "full_attention", "full_attention",
+    "full_attention", "full_attention", "full_attention", "full_attention"
+  ]
+}

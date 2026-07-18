@@ -65,6 +65,24 @@ Important scope note:
 - Full high-trial retrieval closure is currently **Qwen-focused**.
 - Mistral/Gemma retrieval checks are currently smoke-level and tracked as follow-up.
 
+## Model adapter status
+
+Capability decisions are derived from a pinned configuration and a checked-in
+manifest; they are not inferred from a benchmark script or model name. The
+first direct-decode contract is deliberately narrow: Qwen2.5 text, batch size
+one, greedy decode, full attention, and an enabled text KV cache.
+
+| Family | Status | Cache rule |
+| --- | --- | --- |
+| Qwen2.5-7B text | direct adapter | The only eligible direct-decode target; use `configs/profiles/qwen25-7b-direct-v1.json`. |
+| Qwen3 dense text | manifest-only | Its configuration is recorded, but it has no completed attention adapter. |
+| Qwen3.5-9B | manifest-only | Only `full_attention` KV blocks may be compressed; the three linear-attention layers in each hybrid group retain native recurrent state. |
+| Gemma 4 E4B | manifest-only | Requires a dedicated attention adapter and capacity preflight before any promotion. |
+| Unknown models, beams, sampling, speculative/MTP decode, or multimodal caches | not supported | Fail closed before cache storage can be mutated. |
+
+Multimodal processors and vision caches never participate in this repository's
+KV-memory claims.
+
 ## Claim Policy (Read This First)
 
 What this repo currently claims:
