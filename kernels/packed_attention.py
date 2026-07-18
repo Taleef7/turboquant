@@ -46,6 +46,15 @@ class PackedAttentionDebugState:
     joined_history_attempted: bool = False
 
 
+@dataclass
+class PackedAttentionBenchmarkDebug:
+    """Instrumentation proving prepared benchmark launches do not validate."""
+
+    validation_passes: int = 0
+    validation_reductions: int = 0
+    timed_launches: int = 0
+
+
 @dataclass(frozen=True)
 class PackedAttentionBlock:
     """One chronological, independently packed KV block for decode coordination."""
@@ -586,6 +595,261 @@ def packed_value_mix(
     result = (new_max, new_denominator, new_numerator)
     execution = PackedAttentionExecution("triton", False)
     return (result, execution) if return_execution else result
+
+
+@dataclass(frozen=True)
+class _PreparedRotateQuery:
+    query: torch.Tensor
+    rotation: torch.Tensor
+    heads: int
+    query_tokens: int
+    head_dim: int
+    debug: PackedAttentionBenchmarkDebug | None = None
+
+    def launch(self) -> torch.Tensor:
+        if self.debug is not None:
+            self.debug.timed_launches += 1
+        output = torch.empty(
+            (self.heads, self.query_tokens, self.head_dim),
+            device=self.query.device,
+            dtype=torch.float32,
+        )
+        grid = (self.heads * self.query_tokens, triton.cdiv(self.head_dim, 32))
+        _rotate_query_kernel[grid](
+            self.query,
+            self.rotation,
+            output,
+            QUERY_TOKENS=self.query_tokens,
+            HEAD_DIM=self.head_dim,
+            BLOCK_OUT=32,
+        )
+        return output
+
+
+@dataclass(frozen=True)
+class _PreparedPackedKeyScores:
+    rotated_query: torch.Tensor
+    packed_keys: torch.Tensor
+    codebook: torch.Tensor
+    norms: torch.Tensor
+    gqa_mapping: torch.Tensor
+    heads: int
+    query_tokens: int
+    head_dim: int
+    tokens: int
+    packed_width: int
+    key_bits: int
+    scale: float
+    debug: PackedAttentionBenchmarkDebug | None = None
+
+    def launch(self) -> torch.Tensor:
+        if self.debug is not None:
+            self.debug.timed_launches += 1
+        output = torch.empty(
+            (self.heads, self.query_tokens, self.tokens),
+            device=self.rotated_query.device,
+            dtype=torch.float32,
+        )
+        grid = lambda meta: (
+            self.heads * self.query_tokens,
+            triton.cdiv(self.tokens, meta["BLOCK_T"]),
+        )
+        _packed_key_scores_kernel[grid](
+            self.rotated_query,
+            self.packed_keys,
+            self.codebook,
+            self.norms,
+            self.gqa_mapping,
+            output,
+            QUERY_TOKENS=self.query_tokens,
+            TOKEN_COUNT=self.tokens,
+            PACKED_WIDTH=self.packed_width,
+            HEAD_DIM=self.head_dim,
+            KEY_BITS=self.key_bits,
+            SCALE=self.scale,
+        )
+        return output
+
+
+@dataclass(frozen=True)
+class _PreparedPackedValueMix:
+    scores: torch.Tensor
+    packed_values: torch.Tensor
+    mins: torch.Tensor
+    scales: torch.Tensor
+    gqa_mapping: torch.Tensor
+    old_max: torch.Tensor
+    old_denominator: torch.Tensor
+    old_numerator: torch.Tensor
+    heads: int
+    query_tokens: int
+    tokens: int
+    head_dim: int
+    value_bits: int
+    group_size: int
+    debug: PackedAttentionBenchmarkDebug | None = None
+
+    def launch(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.debug is not None:
+            self.debug.timed_launches += 1
+        new_max = torch.empty_like(self.old_max, dtype=torch.float32)
+        new_denominator = torch.empty_like(self.old_denominator, dtype=torch.float32)
+        new_numerator = torch.empty_like(self.old_numerator, dtype=torch.float32)
+        _online_state_kernel[(self.heads * self.query_tokens,)](
+            self.scores,
+            self.old_max,
+            self.old_denominator,
+            new_max,
+            new_denominator,
+            QUERY_TOKENS=self.query_tokens,
+            TOKEN_COUNT=self.tokens,
+        )
+        _packed_value_numerator_kernel[(self.heads * self.query_tokens, 1)](
+            self.scores,
+            self.packed_values,
+            self.mins,
+            self.scales,
+            self.gqa_mapping,
+            self.old_max,
+            self.old_numerator,
+            new_max,
+            new_numerator,
+            QUERY_TOKENS=self.query_tokens,
+            TOKEN_COUNT=self.tokens,
+            PACKED_WIDTH=self.packed_values.shape[-1],
+            HEAD_DIM=self.head_dim,
+            GROUP_SIZE=self.group_size,
+            VALUE_BITS=self.value_bits,
+        )
+        return new_max, new_denominator, new_numerator
+
+
+def _benchmark_debug_validation(
+    debug: PackedAttentionBenchmarkDebug | None, *, reductions: int
+) -> None:
+    if debug is not None:
+        debug.validation_passes += 1
+        debug.validation_reductions += reductions
+
+
+def prepare_rotate_query(
+    query: torch.Tensor,
+    rotation: torch.Tensor,
+    *,
+    debug: PackedAttentionBenchmarkDebug | None = None,
+) -> _PreparedRotateQuery:
+    """Validate/prepare a rotation launch once, outside a benchmark timer."""
+    if not (_TRITON_AVAILABLE and isinstance(query, torch.Tensor) and query.is_cuda):
+        raise RuntimeError("prepared rotation launch requires CUDA and Triton.")
+    if (
+        query.ndim != 3
+        or query.dtype not in _FLOAT_DTYPES
+        or rotation.shape != (query.shape[-1], query.shape[-1])
+        or rotation.device != query.device
+    ):
+        raise ValueError("query/rotation must be compatible [heads, tokens, head_dim] tensors.")
+    _benchmark_debug_validation(debug, reductions=0)
+    heads, query_tokens, head_dim = query.shape
+    return _PreparedRotateQuery(
+        query.contiguous(), rotation.float().contiguous(), heads, query_tokens, head_dim, debug
+    )
+
+
+def prepare_packed_key_scores_rotated(
+    rotated_query: torch.Tensor,
+    packed_keys: torch.Tensor,
+    codebook: torch.Tensor,
+    norms: torch.Tensor,
+    gqa_mapping: torch.Tensor,
+    *,
+    key_bits: int,
+    scale: float,
+    debug: PackedAttentionBenchmarkDebug | None = None,
+) -> _PreparedPackedKeyScores:
+    """Validate/prepare a score launch once, excluding reductions from timing."""
+    if not (_TRITON_AVAILABLE and isinstance(rotated_query, torch.Tensor) and rotated_query.is_cuda):
+        raise RuntimeError("prepared score launch requires CUDA and Triton.")
+    _validate_bits(key_bits, "key_bits")
+    _require_packed_tensor(packed_keys, "packed_keys")
+    if rotated_query.ndim != 3:
+        raise ValueError("rotated_query must have shape [heads, query_tokens, head_dim].")
+    heads, query_tokens, head_dim = rotated_query.shape
+    kv_heads, tokens, packed_width = packed_keys.shape
+    if (
+        packed_keys.device != rotated_query.device
+        or codebook.shape != (1 << key_bits,)
+        or codebook.device != rotated_query.device
+        or norms.shape != (kv_heads, tokens)
+        or norms.device != rotated_query.device
+        or gqa_mapping.shape != (heads,)
+        or gqa_mapping.device != rotated_query.device
+        or packed_width != math.ceil(head_dim * key_bits / 8)
+    ):
+        raise ValueError("rotated score inputs have incompatible shapes or devices.")
+    if int(gqa_mapping.min()) < 0 or int(gqa_mapping.max()) >= kv_heads:
+        raise ValueError("gqa_mapping contains an invalid KV-head index.")
+    _benchmark_debug_validation(debug, reductions=2)
+    return _PreparedPackedKeyScores(
+        rotated_query.contiguous(),
+        packed_keys.contiguous(),
+        codebook.float().contiguous(),
+        norms.contiguous(),
+        gqa_mapping.contiguous(),
+        heads,
+        query_tokens,
+        head_dim,
+        tokens,
+        packed_width,
+        key_bits,
+        float(scale),
+        debug,
+    )
+
+
+def prepare_packed_value_mix(
+    scores: torch.Tensor,
+    packed_values: torch.Tensor,
+    mins: torch.Tensor,
+    scales: torch.Tensor,
+    gqa_mapping: torch.Tensor,
+    *,
+    value_bits: int,
+    group_size: int,
+    prior_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    debug: PackedAttentionBenchmarkDebug | None = None,
+) -> _PreparedPackedValueMix:
+    """Validate/prepare the two-kernel online value launch outside timing."""
+    if not (_TRITON_AVAILABLE and isinstance(scores, torch.Tensor) and scores.is_cuda):
+        raise RuntimeError("prepared value launch requires CUDA and Triton.")
+    heads, query_tokens, tokens, head_dim = _validate_value_inputs(
+        scores,
+        packed_values,
+        mins,
+        scales,
+        gqa_mapping,
+        value_bits,
+        group_size,
+        prior_state,
+    )
+    _benchmark_debug_validation(debug, reductions=2)
+    old_max, old_denominator, old_numerator = prior_state
+    return _PreparedPackedValueMix(
+        scores.contiguous(),
+        packed_values.contiguous(),
+        mins.contiguous(),
+        scales.contiguous(),
+        gqa_mapping.contiguous(),
+        old_max.contiguous(),
+        old_denominator.contiguous(),
+        old_numerator.contiguous(),
+        heads,
+        query_tokens,
+        tokens,
+        head_dim,
+        value_bits,
+        group_size,
+        debug,
+    )
 
 
 def packed_attention_decode(

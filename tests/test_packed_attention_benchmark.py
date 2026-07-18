@@ -14,9 +14,10 @@ import torch
 from core.packing import pack_indices
 from kernels.packed_attention import (
     PACKED_ATTENTION_COMPUTE_SANITIZER_COMMAND,
-    packed_key_scores_rotated,
-    packed_value_mix,
-    rotate_query,
+    PackedAttentionBenchmarkDebug,
+    prepare_packed_key_scores_rotated,
+    prepare_packed_value_mix,
+    prepare_rotate_query,
 )
 
 
@@ -38,23 +39,29 @@ def test_packed_kernel_microbenchmark_emits_qualified_json(tmp_path: Path) -> No
     packed_values = pack_indices(torch.randint(0, 1 << value_bits, (kv_heads * tokens, head_dim), device=device, dtype=torch.uint8), value_bits).reshape(kv_heads, tokens, -1)
     mins = torch.zeros((kv_heads, tokens, head_dim // group_size), device=device, dtype=torch.float16)
     scales = torch.ones_like(mins) / 63
+    debug = PackedAttentionBenchmarkDebug()
+    prepared_rotation = prepare_rotate_query(query, rotation, debug=debug)
     for _ in range(3):
-        rotated_query, execution = rotate_query(query, rotation, return_execution=True)
-    assert execution.kernel == "triton" and not execution.used_torch_fallback
+        rotated_query = prepared_rotation.launch()
+    assert rotated_query.is_cuda
+    prepared_scores = prepare_packed_key_scores_rotated(
+        rotated_query, packed_keys, codebook, norms, mapping,
+        key_bits=key_bits, scale=1 / math.sqrt(head_dim), debug=debug,
+    )
     for _ in range(3):
-        scores, execution = packed_key_scores_rotated(
-            rotated_query, packed_keys, codebook, norms, mapping,
-            key_bits=key_bits, scale=1 / math.sqrt(head_dim), return_execution=True,
-        )
-    assert execution.kernel == "triton" and not execution.used_torch_fallback
+        scores = prepared_scores.launch()
+    assert scores.is_cuda
     prior = (
         torch.full_like(scores[..., 0], -torch.inf),
         torch.zeros_like(scores[..., 0]),
         torch.zeros((heads, query_tokens, head_dim), device=device),
     )
+    prepared_values = prepare_packed_value_mix(
+        scores, packed_values, mins, scales, mapping, value_bits=value_bits,
+        group_size=group_size, prior_state=prior, debug=debug,
+    )
     for _ in range(3):
-        _, execution = packed_value_mix(scores, packed_values, mins, scales, mapping, value_bits=value_bits, group_size=group_size, prior_state=prior, return_execution=True)
-    assert execution.kernel == "triton" and not execution.used_torch_fallback
+        prepared_values.launch()
     do_bench = triton.testing.do_bench
 
     def measure(operation: object) -> dict[str, float]:
@@ -70,21 +77,15 @@ def test_packed_kernel_microbenchmark_emits_qualified_json(tmp_path: Path) -> No
             "p95_ms": p95_ms,
         }
 
+    validation_reductions_before_timing = debug.validation_reductions
+    validation_passes_before_timing = debug.validation_passes
     metrics = {
-        "rotate_query": measure(lambda: rotate_query(query, rotation)),
-        "packed_key_scores": measure(
-            lambda: packed_key_scores_rotated(
-                rotated_query, packed_keys, codebook, norms, mapping,
-                key_bits=key_bits, scale=1 / math.sqrt(head_dim),
-            )
-        ),
-        "packed_value_mix": measure(
-            lambda: packed_value_mix(
-                scores, packed_values, mins, scales, mapping, value_bits=value_bits,
-                group_size=group_size, prior_state=prior,
-            )
-        ),
+        "rotate_query": measure(prepared_rotation.launch),
+        "packed_key_scores": measure(prepared_scores.launch),
+        "packed_value_mix": measure(prepared_values.launch),
     }
+    assert debug.validation_reductions == validation_reductions_before_timing
+    assert debug.validation_passes == validation_passes_before_timing
     try:
         source_commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
@@ -103,6 +104,12 @@ def test_packed_kernel_microbenchmark_emits_qualified_json(tmp_path: Path) -> No
         "source_commit": source_commit,
         "reference_tolerance": {"rtol": 3e-3, "atol": 3e-3},
         "used_torch_fallback": False,
+        "benchmark_validation": {
+            "prepared_validation_passes": debug.validation_passes,
+            "prepared_validation_reductions": debug.validation_reductions,
+            "validation_reductions_during_timing": 0,
+            "timed_launches": debug.timed_launches,
+        },
     }
     output = Path(
         os.environ.get(
@@ -120,4 +127,6 @@ def test_packed_kernel_microbenchmark_emits_qualified_json(tmp_path: Path) -> No
     }
     for metric in saved["kernels"].values():
         assert metric["p95_ms"] >= metric["median_ms"] >= 0
+    assert saved["benchmark_validation"]["validation_reductions_during_timing"] == 0
+    assert saved["benchmark_validation"]["prepared_validation_reductions"] == 4
     assert "compute-sanitizer" in PACKED_ATTENTION_COMPUTE_SANITIZER_COMMAND

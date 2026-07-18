@@ -3,6 +3,7 @@
 from .packed_attention import (
     PACKED_ATTENTION_COMPUTE_SANITIZER_COMMAND,
     PackedAttentionBlock,
+    PackedAttentionBenchmarkDebug,
     PackedAttentionDebugState,
     PackedAttentionExecution,
     packed_attention_decode,
@@ -11,12 +12,16 @@ from .packed_attention import (
     packed_key_scores_rotated,
     packed_value_mix,
     packed_value_mix_reference,
+    prepare_packed_key_scores_rotated,
+    prepare_packed_value_mix,
+    prepare_rotate_query,
     rotate_query,
 )
 
 __all__ = [
     "PACKED_ATTENTION_COMPUTE_SANITIZER_COMMAND",
     "PackedAttentionBlock",
+    "PackedAttentionBenchmarkDebug",
     "PackedAttentionDebugState",
     "PackedAttentionExecution",
     "packed_attention_decode",
@@ -25,5 +30,8 @@ __all__ = [
     "packed_key_scores_rotated",
     "packed_value_mix",
     "packed_value_mix_reference",
+    "prepare_packed_key_scores_rotated",
+    "prepare_packed_value_mix",
+    "prepare_rotate_query",
     "rotate_query",
 ]
