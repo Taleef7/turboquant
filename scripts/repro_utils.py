@@ -39,7 +39,9 @@ DIRECT_EVIDENCE_SOURCE_PATHS = (
     "core/reference_attention.py",
     "core/packed_cache.py",
     "core/qwen_adapter.py",
+    "core/turboquant_simple.py",
     "kernels/packed_attention.py",
+    "utils/math_utils.py",
     "configs/profiles/qwen25-7b-direct-v1.json",
     "configs/models/qwen25-7b.json",
 )

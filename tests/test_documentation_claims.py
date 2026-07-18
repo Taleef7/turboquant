@@ -30,7 +30,11 @@ THIRTY_TWO_K_SUCCESS = re.compile(
     r"(?:\b(?:successful(?:ly)?|passed|succeeded|qualified|validated)"
     r"\s+(?:\w+\s+){0,3}32k\b|\b32k\s+(?:\w+\s+){0,4}"
     r"(?:success(?:ful(?:ly)?)?|passed|succeeded|qualified|validated|completed)\b|"
-    r"\b(?:retrieval[- ]safe|validated\s+niah)\s+(?:through|at)\s+32k\b)",
+    r"\b(?:retrieval[- ]safe|validated\s+niah)\s+(?:through|at)\s+32k\b|"
+    r"\bretrieval\s+gate\s+(?:is\s+)?met\s+(?:through|at)\s+32k\b|"
+    r"\b32k\s+(?:retrieval\s+)?gate\s+(?:is\s+)?met\b|"
+    r"\b(?:profile\s+)?qualifies\s+(?:through|at)\s+32k\b|"
+    r"\b32k\s+clears\s+(?:the\s+)?retrieval\s+gate\b)",
     re.IGNORECASE,
 )
 
@@ -64,6 +68,12 @@ def is_32k_success_claim(value: str) -> bool:
             "skipped",
             "not run",
             "failed",
+            "fails",
+            "not met",
+            "does not qualify",
+            "did not qualify",
+            "doesn't qualify",
+            "does not clear",
             "no 32k success",
         )
     ):
@@ -102,8 +112,15 @@ def test_32k_success_detection_covers_natural_language() -> None:
     assert is_32k_success_claim("32K retrieval validation succeeded")
     assert is_32k_success_claim("Validated NIAH through 32K")
     assert is_32k_success_claim("32K completed successfully")
+    assert is_32k_success_claim("The retrieval gate is met through 32K")
+    assert is_32k_success_claim("32K gate is met")
+    assert is_32k_success_claim("The profile qualifies at 32K")
+    assert is_32k_success_claim("32K clears the retrieval gate")
     assert not is_32k_success_claim("32K: skipped")
     assert not is_32k_success_claim("32K is not qualified")
+    assert not is_32k_success_claim("The retrieval gate is not met through 32K")
+    assert not is_32k_success_claim("The profile does not qualify at 32K")
+    assert not is_32k_success_claim("32K fails the retrieval gate")
 
 
 def test_any_future_32k_success_claim_must_name_a_qualified_artifact() -> None:

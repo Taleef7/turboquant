@@ -29,6 +29,7 @@ _GIT_COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 # tokenization. A shortfall below one percent is tolerated for tokenizer
 # boundary effects; anything larger is not evidence at the requested context.
 MIN_CONTEXT_FIDELITY = 0.99
+PHYSICAL_BYTE_CATEGORIES = ("keys", "values", "metadata", "fp16_window", "padding")
 QUALITY_ARTIFACT_TYPE = "quality_matrix"
 SYSTEMS_ARTIFACT_TYPE = "systems_benchmark"
 QUALIFIED_ARTIFACT_TYPE = "qualified_run"
@@ -350,10 +351,15 @@ def validate_systems_artifact(
         elif any(not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0 for value in decode):
             errors.append(f"trial {index} decode_token_ms must contain finite non-negative values")
         physical = trial.get("physical_bytes")
-        if not isinstance(physical, Mapping) or not all(
-            category in physical for category in ("keys", "values", "metadata")
-        ):
-            errors.append(f"trial {index} physical_bytes lacks keys/values/metadata")
+        if not isinstance(physical, Mapping):
+            errors.append(f"trial {index} physical_bytes is required")
+        elif missing_categories := [
+            category for category in PHYSICAL_BYTE_CATEGORIES if category not in physical
+        ]:
+            errors.append(
+                f"trial {index} physical_bytes lacks required categories: "
+                f"{', '.join(missing_categories)}"
+            )
         elif any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in physical.values()):
             errors.append(f"trial {index} physical_bytes must be non-negative integers")
         else:

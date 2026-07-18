@@ -21,6 +21,24 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 
 For a GPU run, record the `nvidia-smi` output with the generated artifact.
 
+### Native WSL worktree Git provenance
+
+Qualified evidence rejects an unresolved Git commit; it never promotes
+`git_commit: unknown` to a valid result. In this Windows-hosted worktree,
+native WSL Git needs the worktree metadata expressed as WSL paths before the
+release command. From this checkout root, run:
+
+```bash
+export GIT_DIR="/mnt/c/Users/talee/OneDrive - Higher Education Commission/projects/turboquant/.git/worktrees/turboquant-forge"
+export GIT_WORK_TREE="$PWD"
+git rev-parse --verify HEAD
+```
+
+The final command must print a 40-character commit SHA. For a different
+checkout, set `GIT_DIR` to that repository's WSL-translated
+`.git/worktrees/<worktree-name>` path and keep `GIT_WORK_TREE` at the checkout
+root. Leave these variables set for the `reproduce_release.py` command below.
+
 ## 2. Run download-free CPU verification
 
 ```bash

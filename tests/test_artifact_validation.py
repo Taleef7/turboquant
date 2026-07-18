@@ -161,6 +161,31 @@ def test_systems_validator_rejects_fake_direct_dispatch_and_byte_mismatch():
     assert any("actual_store_bytes" in error for error in result.errors)
 
 
+def test_systems_validator_requires_every_physical_byte_category_and_full_total():
+    for category in ("fp16_window", "padding"):
+        artifact = _systems_artifact()
+        direct = next(
+            trial for trial in artifact["trials"] if trial["backend"] == "triton_direct"
+        )
+        direct["physical_bytes"].pop(category)
+
+        result = validate_systems_artifact(artifact)
+
+        assert result.valid is False
+        assert any(category in error for error in result.errors)
+
+    artifact = _systems_artifact()
+    direct = next(
+        trial for trial in artifact["trials"] if trial["backend"] == "triton_direct"
+    )
+    direct["physical_bytes"]["fp16_window"] = 4
+
+    result = validate_systems_artifact(artifact)
+
+    assert result.valid is False
+    assert any("actual_store_bytes" in error for error in result.errors)
+
+
 def test_validator_rejects_unknown_git_commit_for_evidence():
     matrix = complete_matrix()
     matrix["metadata"]["git_commit"] = "unknown"

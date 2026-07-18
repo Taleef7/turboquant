@@ -10,7 +10,7 @@ implementation.
 | Low-bit KV representation can be physically stored compactly | Implemented | Fixed packed blocks, byte accounting, and CPU store tests exist. Physical-size conclusions belong only to a named systems artifact. |
 | Compressed attention can be evaluated without full-history reconstruction | Implemented for pinned Qwen2.5 decode | Blockwise reference and direct Triton kernels have parity tests; the legacy V2 cache is excluded. |
 | Compressed KV preserves long-context retrieval quality | Not reproduced | The latest retained NIAH artifact is invalid: its actual inputs fall below the required 99% context-fidelity floor and its provenance binding is incomplete. |
-| End-to-end speed or memory advantage | Not established | The current direct systems artifact is slower than its baseline and is not a performance or memory win claim. |
+| End-to-end speed or memory advantage | Not established | No valid systems artifact establishes an end-to-end speed or memory comparison. |
 | QJL residual path delivers the paper operating point | Not reproduced | Forge has no qualified QJL profile or evidence artifact. |
 | LongBench, RULER, or ANN/vector-search comparisons | Not implemented | No runner or result artifact is shipped for these benchmark families. |
 | Multi-model adapter portability | Not established | Qwen3, Qwen3.5, and Gemma 4 are manifest-only/fail-closed entries. |
