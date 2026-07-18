@@ -3,7 +3,17 @@
 from scripts.reproduce_release import estimate_qualified_capacity, qualified_ladder_decision
 
 
-def test_qualified_ladder_skips_32k_when_preflight_or_8k_gate_fails():
+def test_qualified_ladder_skips_32k_when_preflight_fails():
+    decision = qualified_ladder_decision(
+        preflight_valid=False, eight_k_retrieval_safe=True
+    )
+
+    assert decision["status"] == "skipped"
+    assert decision["attempt_32k"] is False
+    assert decision["reason"] == "preflight_invalid"
+
+
+def test_qualified_ladder_skips_32k_when_8k_retrieval_gate_fails():
     decision = qualified_ladder_decision(
         preflight_valid=True, eight_k_retrieval_safe=False
     )
@@ -22,8 +32,26 @@ def test_qualified_ladder_skips_32k_when_8k_systems_are_not_clean():
     assert decision["reason"] == "8k_systems_invalid_or_failed"
 
 
-def test_qualified_ladder_attempts_32k_only_after_both_required_gates_pass():
-    decision = qualified_ladder_decision(preflight_valid=True, eight_k_retrieval_safe=True, eight_k_systems_valid=True)
+def test_qualified_ladder_distinguishes_failed_8k_capacity_admission():
+    decision = qualified_ladder_decision(
+        preflight_valid=True,
+        eight_k_retrieval_safe=True,
+        eight_k_systems_valid=True,
+        eight_k_capacity_admitted=False,
+    )
+
+    assert decision["status"] == "skipped"
+    assert decision["attempt_32k"] is False
+    assert decision["reason"] == "8k_capacity_admission_failed"
+
+
+def test_qualified_ladder_attempts_32k_only_after_all_required_gates_pass():
+    decision = qualified_ladder_decision(
+        preflight_valid=True,
+        eight_k_retrieval_safe=True,
+        eight_k_systems_valid=True,
+        eight_k_capacity_admitted=True,
+    )
 
     assert decision["status"] == "approved"
     assert decision["attempt_32k"] is True

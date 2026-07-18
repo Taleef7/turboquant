@@ -18,7 +18,13 @@ from scripts.benchmark_schema import quality_retrieval_safe, validate_quality_ar
 from scripts.repro_utils import benchmark_binding, capture_env_metadata, git_commit_sha, write_json, write_markdown
 
 
-def qualified_ladder_decision(*, preflight_valid: bool, eight_k_retrieval_safe: bool, eight_k_systems_valid: bool = False) -> dict:
+def qualified_ladder_decision(
+    *,
+    preflight_valid: bool,
+    eight_k_retrieval_safe: bool,
+    eight_k_systems_valid: bool = False,
+    eight_k_capacity_admitted: bool = False,
+) -> dict:
     """Return the persisted, mechanical decision for the 32K qualified leg."""
     if not preflight_valid:
         return {"status": "skipped", "attempt_32k": False, "reason": "preflight_invalid"}
@@ -26,6 +32,8 @@ def qualified_ladder_decision(*, preflight_valid: bool, eight_k_retrieval_safe: 
         return {"status": "skipped", "attempt_32k": False, "reason": "8k_retrieval_gate_failed"}
     if not eight_k_systems_valid:
         return {"status": "skipped", "attempt_32k": False, "reason": "8k_systems_invalid_or_failed"}
+    if not eight_k_capacity_admitted:
+        return {"status": "skipped", "attempt_32k": False, "reason": "8k_capacity_admission_failed"}
     return {"status": "approved", "attempt_32k": True, "reason": "preflight_and_8k_gate_passed"}
 
 
@@ -155,11 +163,19 @@ def main() -> None:
         else:
             quality, systems, quality_status, safe, bootstrap = ({"structurally_valid": False, "errors": ["not run: preflight failed"], "artifact": None}, {"structurally_valid": False, "errors": ["not run: preflight failed"], "artifact": None}, "invalid", False, None)
         calibrated_estimate = estimate_qualified_capacity(systems["artifact"], target_context=32768, source_context=8192) if systems["structurally_valid"] else None
-        systems_admission = bool(systems["structurally_valid"] and calibrated_estimate and calibrated_estimate["passes"])
+        eight_k_systems_valid = bool(systems["structurally_valid"])
+        eight_k_capacity_admitted = bool(
+            calibrated_estimate and calibrated_estimate["passes"]
+        )
         preflight["eight_k_calibrated_estimate"] = calibrated_estimate
-        admission = {"preflight_passes": preflight_passes, "eight_k_systems_valid": systems["structurally_valid"], "eight_k_capacity_passes": bool(calibrated_estimate and calibrated_estimate["passes"]), "capacity_estimate": calibrated_estimate}
+        admission = {"preflight_passes": preflight_passes, "eight_k_systems_valid": eight_k_systems_valid, "eight_k_capacity_passes": eight_k_capacity_admitted, "capacity_estimate": calibrated_estimate}
         write_json(str(output_dir / "qualified_32k_admission.json"), admission)
-        ladder = qualified_ladder_decision(preflight_valid=preflight_passes, eight_k_retrieval_safe=safe, eight_k_systems_valid=systems_admission)
+        ladder = qualified_ladder_decision(
+            preflight_valid=preflight_passes,
+            eight_k_retrieval_safe=safe,
+            eight_k_systems_valid=eight_k_systems_valid,
+            eight_k_capacity_admitted=eight_k_capacity_admitted,
+        )
         write_json(str(output_dir / "qualified_32k_decision.json"), ladder)
         legs = {"preflight": preflight_systems, "8k": {"quality": quality, "systems": systems, "quality_status": quality_status}}
         if ladder["attempt_32k"]:
