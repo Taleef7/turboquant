@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from dataclasses import dataclass
 
 import pytest
 import torch
 
 from core.packing import pack_indices
+from core.codec import KeyCodec, KeyLayout, ValueCodec, ValueLayout
+from core.packed_store import PackedKVBlockStore
+from core.reference_attention import ReferenceAttentionLayout, packed_reference_decode
 from kernels.packed_attention import (
+    PackedAttentionBlock,
+    PackedAttentionDebugState,
     PackedAttentionExecution,
+    packed_attention_decode,
     packed_key_scores,
     packed_key_scores_reference,
+    packed_key_scores_rotated,
     packed_value_mix,
     packed_value_mix_reference,
+    rotate_query,
 )
 
 
@@ -192,3 +201,108 @@ def test_packed_score_requires_explicit_cpu_reference_fallback() -> None:
     )
     assert execution.kernel == "torch_reference"
     assert execution.used_torch_fallback
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("bits", [4, 6, 8])
+def test_packed_decoder_final_byte_is_explicitly_guarded(bits: int) -> None:
+    """The final index must not issue a `base + 1` load past row storage."""
+    _require_gpu_triton()
+    head_dim, tokens = 64, 1
+    query = torch.ones((1, 1, head_dim), device="cuda", dtype=torch.float16)
+    indices = torch.full((1, head_dim), (1 << bits) - 1, device="cuda", dtype=torch.uint8)
+    packed = pack_indices(indices, bits).reshape(1, tokens, -1)
+    codebook = torch.arange(1 << bits, device="cuda", dtype=torch.float32)
+    norms = torch.ones((1, tokens), device="cuda", dtype=torch.float16)
+    rotation = torch.eye(head_dim, device="cuda")
+    mapping = torch.zeros((1,), device="cuda", dtype=torch.int32)
+    actual, execution = packed_key_scores(
+        query, packed, codebook, norms, rotation, mapping,
+        key_bits=bits, scale=1.0, return_execution=True,
+    )
+    expected = packed_key_scores_reference(
+        query, packed, codebook, norms, rotation, mapping, key_bits=bits, scale=1.0
+    )
+    assert execution.kernel == "triton" and not execution.used_torch_fallback
+    torch.testing.assert_close(actual, expected, rtol=_RTOL, atol=_ATOL)
+    source = Path("kernels/packed_attention.py").read_text(encoding="utf-8")
+    assert "byte_offset[None, :] + 1 < PACKED_WIDTH" in source
+
+
+@pytest.mark.gpu
+def test_triton_rotation_and_rotated_score_match_reference() -> None:
+    _require_gpu_triton()
+    case = _CASES[2]
+    data = _fixture(case)
+    rotated, execution = rotate_query(data["query"], data["rotation"], return_execution=True)
+    expected_rotated = data["query"].float() @ data["rotation"].float().T
+    assert execution.kernel == "triton" and not execution.used_torch_fallback
+    torch.testing.assert_close(rotated, expected_rotated, rtol=_RTOL, atol=_ATOL)
+    scores, execution = packed_key_scores_rotated(
+        rotated, data["packed_keys"], data["codebook"], data["norms"],
+        data["gqa_mapping"], key_bits=case.key_bits, scale=data["scale"],
+        return_execution=True,
+    )
+    expected = packed_key_scores_reference(
+        data["query"], data["packed_keys"], data["codebook"], data["norms"],
+        data["rotation"], data["gqa_mapping"], key_bits=case.key_bits,
+        scale=data["scale"],
+    )
+    assert execution.kernel == "triton" and not execution.used_torch_fallback
+    torch.testing.assert_close(scores, expected, rtol=_RTOL, atol=_ATOL)
+
+
+@pytest.mark.gpu
+def test_packed_decode_matches_task4_blocks_and_fp16_window_without_joining_history() -> None:
+    _require_gpu_triton()
+    torch.manual_seed(2505)
+    head_dim, kv_heads, gqa_ratio, tokens, window = 64, 2, 4, 600, 32
+    dtype = torch.float16
+    key_codec = KeyCodec(KeyLayout(head_dim=head_dim, bits=6, norm_dtype=dtype))
+    value_codec = ValueCodec(ValueLayout(head_dim=head_dim, bits=6, group_size=32))
+    store = PackedKVBlockStore(
+        key_codec, value_codec, fp16_window=window, num_kv_heads=kv_heads
+    )
+    keys = torch.randn((1, kv_heads, tokens, head_dim), device="cuda", dtype=dtype)
+    values = torch.randn_like(keys)
+    store.append(keys, values)
+    query = torch.randn((kv_heads * gqa_ratio, 2, head_dim), device="cuda", dtype=dtype)
+    layout = ReferenceAttentionLayout(
+        head_dim=head_dim,
+        num_attention_heads=kv_heads * gqa_ratio,
+        num_key_value_heads=kv_heads,
+    )
+    expected = packed_reference_decode(query.unsqueeze(0), store, layout).squeeze(0)
+
+    def to_kernel_block(block: object) -> PackedAttentionBlock:
+        payload = block  # Typed locally to keep the test focused on public payload layout.
+        return PackedAttentionBlock(
+            packed_keys=payload.keys.indices.reshape(kv_heads, 256, -1),
+            key_norms=payload.keys.norms.reshape(kv_heads, 256),
+            key_codebook=key_codec._centroids.to("cuda"),
+            key_bits=6,
+            packed_values=payload.values.indices.reshape(kv_heads, 256, -1),
+            value_mins=payload.values.mins.reshape(kv_heads, 256, -1),
+            value_scales=payload.values.scales.reshape(kv_heads, 256, -1),
+            value_bits=6,
+            value_group_size=32,
+        )
+
+    blocks = [to_kernel_block(block) for block in store.iter_blocks()]
+    assert len(blocks) == 2
+    fp16_window = tuple(tensor.squeeze(0) for tensor in next(store.iter_fp16_window()))
+    debug = PackedAttentionDebugState()
+    actual, execution = packed_attention_decode(
+        query,
+        (block for block in blocks),
+        key_codec._rotation.to("cuda"),
+        torch.arange(kv_heads * gqa_ratio, device="cuda", dtype=torch.int32) // gqa_ratio,
+        fp16_window=fp16_window,
+        debug=debug,
+        return_execution=True,
+    )
+    assert execution.kernel == "triton" and not execution.used_torch_fallback
+    assert debug.blocks_consumed == 2
+    assert debug.max_block_tokens == 256
+    assert not debug.joined_history_attempted
+    torch.testing.assert_close(actual, expected, rtol=_RTOL, atol=_ATOL)

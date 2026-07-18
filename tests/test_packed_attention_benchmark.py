@@ -14,8 +14,9 @@ import torch
 from core.packing import pack_indices
 from kernels.packed_attention import (
     PACKED_ATTENTION_COMPUTE_SANITIZER_COMMAND,
-    packed_key_scores,
+    packed_key_scores_rotated,
     packed_value_mix,
+    rotate_query,
 )
 
 
@@ -38,7 +39,13 @@ def test_packed_kernel_microbenchmark_emits_qualified_json(tmp_path: Path) -> No
     mins = torch.zeros((kv_heads, tokens, head_dim // group_size), device=device, dtype=torch.float16)
     scales = torch.ones_like(mins) / 63
     for _ in range(3):
-        scores, execution = packed_key_scores(query, packed_keys, codebook, norms, rotation, mapping, key_bits=key_bits, scale=1 / math.sqrt(head_dim), return_execution=True)
+        rotated_query, execution = rotate_query(query, rotation, return_execution=True)
+    assert execution.kernel == "triton" and not execution.used_torch_fallback
+    for _ in range(3):
+        scores, execution = packed_key_scores_rotated(
+            rotated_query, packed_keys, codebook, norms, mapping,
+            key_bits=key_bits, scale=1 / math.sqrt(head_dim), return_execution=True,
+        )
     assert execution.kernel == "triton" and not execution.used_torch_fallback
     prior = (
         torch.full_like(scores[..., 0], -torch.inf),
@@ -48,17 +55,36 @@ def test_packed_kernel_microbenchmark_emits_qualified_json(tmp_path: Path) -> No
     for _ in range(3):
         _, execution = packed_value_mix(scores, packed_values, mins, scales, mapping, value_bits=value_bits, group_size=group_size, prior_state=prior, return_execution=True)
     assert execution.kernel == "triton" and not execution.used_torch_fallback
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    start.record()
-    packed_key_scores(query, packed_keys, codebook, norms, rotation, mapping, key_bits=key_bits, scale=1 / math.sqrt(head_dim))
-    end.record()
-    torch.cuda.synchronize()
-    cuda_event_ms = start.elapsed_time(end)
     do_bench = triton.testing.do_bench
-    median_ms, p95_ms = do_bench(
-        lambda: packed_key_scores(query, packed_keys, codebook, norms, rotation, mapping, key_bits=key_bits, scale=1 / math.sqrt(head_dim)),
-        quantiles=[0.5, 0.95],
-    )
+
+    def measure(operation: object) -> dict[str, float]:
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        operation()
+        end.record()
+        torch.cuda.synchronize()
+        median_ms, p95_ms = do_bench(operation, quantiles=[0.5, 0.95])
+        return {
+            "cuda_event_ms": start.elapsed_time(end),
+            "median_ms": median_ms,
+            "p95_ms": p95_ms,
+        }
+
+    metrics = {
+        "rotate_query": measure(lambda: rotate_query(query, rotation)),
+        "packed_key_scores": measure(
+            lambda: packed_key_scores_rotated(
+                rotated_query, packed_keys, codebook, norms, mapping,
+                key_bits=key_bits, scale=1 / math.sqrt(head_dim),
+            )
+        ),
+        "packed_value_mix": measure(
+            lambda: packed_value_mix(
+                scores, packed_values, mins, scales, mapping, value_bits=value_bits,
+                group_size=group_size, prior_state=prior,
+            )
+        ),
+    }
     try:
         source_commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
@@ -70,14 +96,11 @@ def test_packed_kernel_microbenchmark_emits_qualified_json(tmp_path: Path) -> No
         ).strip()
     result = {
         "label": "kernel_microbenchmark",
-        "kernel": "packed_key_scores",
+        "kernels": metrics,
         "shapes": {"key_bits": key_bits, "value_bits": value_bits, "head_dim": head_dim, "kv_heads": kv_heads, "gqa_ratio": gqa_ratio, "tokens": tokens, "query_tokens": query_tokens},
         "dtype": str(query.dtype).removeprefix("torch."),
         "gpu": {"name": torch.cuda.get_device_name(), "capability": list(torch.cuda.get_device_capability())},
         "source_commit": source_commit,
-        "cuda_event_ms": cuda_event_ms,
-        "median_ms": median_ms,
-        "p95_ms": p95_ms,
         "reference_tolerance": {"rtol": 3e-3, "atol": 3e-3},
         "used_torch_fallback": False,
     }
@@ -92,5 +115,9 @@ def test_packed_kernel_microbenchmark_emits_qualified_json(tmp_path: Path) -> No
     saved = json.loads(output.read_text(encoding="utf-8"))
     assert saved["label"] == "kernel_microbenchmark"
     assert saved["used_torch_fallback"] is False
-    assert saved["p95_ms"] >= saved["median_ms"] >= 0
+    assert set(saved["kernels"]) == {
+        "rotate_query", "packed_key_scores", "packed_value_mix"
+    }
+    for metric in saved["kernels"].values():
+        assert metric["p95_ms"] >= metric["median_ms"] >= 0
     assert "compute-sanitizer" in PACKED_ATTENTION_COMPUTE_SANITIZER_COMMAND

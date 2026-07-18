@@ -37,6 +37,15 @@ class PackedAttentionExecution:
     used_torch_fallback: bool
 
 
+@dataclass
+class PackedAttentionDebugState:
+    """Bounded-history accounting for the independent decode coordinator."""
+
+    blocks_consumed: int = 0
+    max_block_tokens: int = 0
+    joined_history_attempted: bool = False
+
+
 @dataclass(frozen=True)
 class PackedAttentionBlock:
     """One chronological, independently packed KV block for decode coordination."""
@@ -60,6 +69,32 @@ PACKED_ATTENTION_COMPUTE_SANITIZER_COMMAND = (
 
 
 if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _rotate_query_kernel(
+        query_ptr,
+        rotation_ptr,
+        rotated_query_ptr,
+        QUERY_TOKENS: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        BLOCK_OUT: tl.constexpr,
+    ):
+        pid_hq = tl.program_id(0)
+        pid_out = tl.program_id(1)
+        output_dims = pid_out * BLOCK_OUT + tl.arange(0, BLOCK_OUT)
+        input_dims = tl.arange(0, HEAD_DIM)
+        query = tl.load(query_ptr + pid_hq * HEAD_DIM + input_dims).to(tl.float32)
+        rotation = tl.load(
+            rotation_ptr + output_dims[:, None] * HEAD_DIM + input_dims[None, :],
+            mask=output_dims[:, None] < HEAD_DIM,
+            other=0.0,
+        ).to(tl.float32)
+        rotated = tl.sum(rotation * query[None, :], axis=1)
+        tl.store(
+            rotated_query_ptr + pid_hq * HEAD_DIM + output_dims,
+            rotated,
+            mask=output_dims < HEAD_DIM,
+        )
 
     @triton.autotune(
         configs=[
@@ -100,7 +135,11 @@ if _TRITON_AVAILABLE:
         base = row * PACKED_WIDTH + byte_offset[None, :]
         mask = token[:, None] < TOKEN_COUNT
         low = tl.load(packed_keys_ptr + base, mask=mask, other=0).to(tl.int32)
-        high = tl.load(packed_keys_ptr + base + 1, mask=mask, other=0).to(tl.int32)
+        high = tl.load(
+            packed_keys_ptr + base + 1,
+            mask=mask & (byte_offset[None, :] + 1 < PACKED_WIDTH),
+            other=0,
+        ).to(tl.int32)
         indices = ((low | (high << 8)) >> shift[None, :]) & ((1 << KEY_BITS) - 1)
         values = tl.load(codebook_ptr + indices).to(tl.float32)
         dot = tl.sum(values * query[None, :], axis=1)
@@ -191,7 +230,11 @@ if _TRITON_AVAILABLE:
         base = row * PACKED_WIDTH + byte_offset[None, :]
         mask = token[:, None] < TOKEN_COUNT
         low = tl.load(packed_values_ptr + base, mask=mask, other=0).to(tl.int32)
-        high = tl.load(packed_values_ptr + base + 1, mask=mask, other=0).to(tl.int32)
+        high = tl.load(
+            packed_values_ptr + base + 1,
+            mask=mask & (byte_offset[None, :] + 1 < PACKED_WIDTH),
+            other=0,
+        ).to(tl.int32)
         indices = ((low | (high << 8)) >> shift[None, :]) & ((1 << VALUE_BITS) - 1)
         group = dims // GROUP_SIZE
         metadata = row * (HEAD_DIM // GROUP_SIZE) + group[None, :]
@@ -273,6 +316,107 @@ def packed_key_scores_reference(
     return torch.einsum("hqd,htd->hqt", rotated_query, mapped_keys) * float(scale)
 
 
+def rotate_query(
+    query: torch.Tensor,
+    rotation: torch.Tensor,
+    *,
+    return_execution: bool = False,
+    allow_torch_fallback: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, PackedAttentionExecution]:
+    """Rotate query heads with Triton before packed-key scoring."""
+    if (
+        not isinstance(query, torch.Tensor)
+        or query.ndim != 3
+        or query.dtype not in _FLOAT_DTYPES
+        or rotation.shape != (query.shape[-1], query.shape[-1])
+        or rotation.device != query.device
+    ):
+        raise ValueError("query/rotation must be compatible [heads, tokens, head_dim] tensors.")
+    if not (_TRITON_AVAILABLE and query.is_cuda):
+        if not allow_torch_fallback:
+            raise RuntimeError(
+                "rotate_query requires CUDA and Triton; use allow_torch_fallback=True "
+                "only for unit/reference use."
+            )
+        result = query.float() @ rotation.float().T
+        execution = PackedAttentionExecution("torch_reference", True)
+        return (result, execution) if return_execution else result
+    heads, query_tokens, head_dim = query.shape
+    output = torch.empty(
+        (heads, query_tokens, head_dim), device=query.device, dtype=torch.float32
+    )
+    grid = (heads * query_tokens, triton.cdiv(head_dim, 32))
+    _rotate_query_kernel[grid](
+        query.contiguous(), rotation.float().contiguous(), output,
+        QUERY_TOKENS=query_tokens, HEAD_DIM=head_dim, BLOCK_OUT=32,
+    )
+    execution = PackedAttentionExecution("triton", False)
+    return (output, execution) if return_execution else output
+
+
+def packed_key_scores_rotated(
+    rotated_query: torch.Tensor,
+    packed_keys: torch.Tensor,
+    codebook: torch.Tensor,
+    norms: torch.Tensor,
+    gqa_mapping: torch.Tensor,
+    *,
+    key_bits: int,
+    scale: float,
+    return_execution: bool = False,
+    allow_torch_fallback: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, PackedAttentionExecution]:
+    """Triton score kernel over a query already rotated by :func:`rotate_query`."""
+    _validate_bits(key_bits, "key_bits")
+    _require_packed_tensor(packed_keys, "packed_keys")
+    if not isinstance(rotated_query, torch.Tensor) or rotated_query.ndim != 3:
+        raise ValueError("rotated_query must have shape [heads, query_tokens, head_dim].")
+    heads, query_tokens, head_dim = rotated_query.shape
+    kv_heads, tokens, packed_width = packed_keys.shape
+    if (
+        packed_keys.device != rotated_query.device
+        or codebook.shape != (1 << key_bits,)
+        or codebook.device != rotated_query.device
+        or norms.shape != (kv_heads, tokens)
+        or norms.device != rotated_query.device
+        or gqa_mapping.shape != (heads,)
+        or gqa_mapping.device != rotated_query.device
+        or packed_width != math.ceil(head_dim * key_bits / 8)
+    ):
+        raise ValueError("rotated score inputs have incompatible shapes or devices.")
+    if int(gqa_mapping.min()) < 0 or int(gqa_mapping.max()) >= kv_heads:
+        raise ValueError("gqa_mapping contains an invalid KV-head index.")
+    if not (_TRITON_AVAILABLE and rotated_query.is_cuda):
+        if not allow_torch_fallback:
+            raise RuntimeError(
+                "packed_key_scores_rotated requires CUDA and Triton; use an explicit "
+                "reference function or allow_torch_fallback=True for unit-only use."
+            )
+        decoded = unpack_indices(
+            packed_keys.reshape(-1, packed_width), key_bits, head_dim
+        ).reshape(kv_heads, tokens, head_dim)
+        result = torch.einsum(
+            "hqd,htd->hqt",
+            rotated_query.float(),
+            codebook[decoded.long()].float()[gqa_mapping.long()]
+            * norms.float()[gqa_mapping.long()].unsqueeze(-1),
+        ) * float(scale)
+        execution = PackedAttentionExecution("torch_reference", True)
+        return (result, execution) if return_execution else result
+    output = torch.empty(
+        (heads, query_tokens, tokens), device=rotated_query.device, dtype=torch.float32
+    )
+    grid = lambda meta: (heads * query_tokens, triton.cdiv(tokens, meta["BLOCK_T"]))
+    _packed_key_scores_kernel[grid](
+        rotated_query.contiguous(), packed_keys.contiguous(), codebook.float().contiguous(),
+        norms.contiguous(), gqa_mapping.contiguous(), output,
+        QUERY_TOKENS=query_tokens, TOKEN_COUNT=tokens, PACKED_WIDTH=packed_width,
+        HEAD_DIM=head_dim, KEY_BITS=key_bits, SCALE=float(scale),
+    )
+    execution = PackedAttentionExecution("triton", False)
+    return (output, execution) if return_execution else output
+
+
 def packed_key_scores(
     query: torch.Tensor,
     packed_keys: torch.Tensor,
@@ -287,7 +431,7 @@ def packed_key_scores(
     allow_torch_fallback: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, PackedAttentionExecution]:
     """Score byte-packed, rotated key indices without a decoded-key allocation."""
-    heads, query_tokens, head_dim, tokens = _validate_score_inputs(
+    _validate_score_inputs(
         query, packed_keys, codebook, norms, rotation, gqa_mapping, key_bits
     )
     if not (_TRITON_AVAILABLE and query.is_cuda):
@@ -302,16 +446,18 @@ def packed_key_scores(
         )
         execution = PackedAttentionExecution("torch_reference", True)
         return (result, execution) if return_execution else result
-    rotated_query = (query.float() @ rotation.float().T).contiguous()
-    output = torch.empty((heads, query_tokens, tokens), device=query.device, dtype=torch.float32)
-    grid = lambda meta: (heads * query_tokens, triton.cdiv(tokens, meta["BLOCK_T"]))
-    _packed_key_scores_kernel[grid](
-        rotated_query, packed_keys.contiguous(), codebook.float().contiguous(), norms.contiguous(),
-        gqa_mapping.contiguous(), output, QUERY_TOKENS=query_tokens, TOKEN_COUNT=tokens,
-        PACKED_WIDTH=packed_keys.shape[-1], HEAD_DIM=head_dim, KEY_BITS=key_bits, SCALE=float(scale),
+    rotated_query, rotation_execution = rotate_query(
+        query, rotation, return_execution=True, allow_torch_fallback=False
     )
-    execution = PackedAttentionExecution("triton", False)
-    return (output, execution) if return_execution else output
+    result, score_execution = packed_key_scores_rotated(
+        rotated_query, packed_keys, codebook, norms, gqa_mapping, key_bits=key_bits,
+        scale=scale, return_execution=True, allow_torch_fallback=False,
+    )
+    execution = PackedAttentionExecution(
+        "torch_reference" if rotation_execution.used_torch_fallback else score_execution.kernel,
+        rotation_execution.used_torch_fallback or score_execution.used_torch_fallback,
+    )
+    return (result, execution) if return_execution else result
 
 
 def _validate_value_inputs(
@@ -450,6 +596,7 @@ def packed_attention_decode(
     *,
     scale: float | None = None,
     fp16_window: tuple[torch.Tensor, torch.Tensor] | None = None,
+    debug: PackedAttentionDebugState | None = None,
     return_execution: bool = False,
     allow_torch_fallback: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, PackedAttentionExecution]:
@@ -463,6 +610,8 @@ def packed_attention_decode(
     """
     if not isinstance(query, torch.Tensor) or query.ndim != 3:
         raise ValueError("query must have shape [heads, query_tokens, head_dim].")
+    if debug is not None and not isinstance(debug, PackedAttentionDebugState):
+        raise TypeError("debug must be PackedAttentionDebugState or None.")
     heads, query_tokens, head_dim = query.shape
     attention_scale = 1 / math.sqrt(head_dim) if scale is None else float(scale)
     if not math.isfinite(attention_scale):
@@ -479,6 +628,9 @@ def packed_attention_decode(
             raise TypeError("blocks must yield PackedAttentionBlock instances.")
         if block.packed_keys.shape[:2] != block.packed_values.shape[:2]:
             raise ValueError("packed key and value blocks must share KV-head and token dimensions.")
+        if debug is not None:
+            debug.blocks_consumed += 1
+            debug.max_block_tokens = max(debug.max_block_tokens, block.packed_keys.shape[1])
         scores, score_execution = packed_key_scores(
             query, block.packed_keys, block.key_codebook, block.key_norms, rotation,
             gqa_mapping, key_bits=block.key_bits, scale=attention_scale,
