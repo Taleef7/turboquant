@@ -36,8 +36,10 @@ def _tail_reference(
     prior_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     *,
     scale: float,
+    mapping: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    mapping = torch.arange(_HEADS, device=query.device) // _GQA_RATIO
+    if mapping is None:
+        mapping = torch.arange(_HEADS, device=query.device) // _GQA_RATIO
     mapped_keys = keys.float()[mapping]
     mapped_values = values.float()[mapping]
     scores = torch.einsum("hqd,htd->hqt", query.float(), mapped_keys) * scale
@@ -136,6 +138,45 @@ def test_prepared_qwen_tail_avoids_gqa_expanded_tensor_materialization(monkeypat
     actual = prepared.launch(query, fp16_window=(keys, values))
 
     assert debug.tail_kernel_dispatches == 1
+    torch.testing.assert_close(
+        actual,
+        (expected[2] / expected[1].unsqueeze(-1)).to(query.dtype),
+        rtol=_RTOL,
+        atol=_ATOL,
+    )
+
+
+@pytest.mark.gpu
+def test_prepared_qwen_tail_falls_back_for_permuted_valid_gqa_mapping() -> None:
+    _require_gpu_triton()
+    query, keys, values, prior_state = _tail_fixture(383)
+    canonical_mapping = torch.arange(_HEADS, device="cuda", dtype=torch.int32) // _GQA_RATIO
+    permuted_mapping = canonical_mapping.roll(_GQA_RATIO).contiguous()
+    assert not torch.equal(permuted_mapping, canonical_mapping)
+    expected = _tail_reference(
+        query,
+        keys=keys,
+        values=values,
+        prior_state=(
+            torch.full_like(prior_state[0], -torch.inf),
+            torch.zeros_like(prior_state[1]),
+            torch.zeros_like(prior_state[2]),
+        ),
+        scale=1 / math.sqrt(_HEAD_DIM),
+        mapping=permuted_mapping,
+    )
+    debug = PackedAttentionHotPathDebugState()
+    prepared = prepare_packed_attention_decode(
+        (),
+        torch.eye(_HEAD_DIM, device="cuda"),
+        permuted_mapping,
+        num_kv_heads=_KV_HEADS,
+        debug=debug,
+    )
+
+    actual = prepared.launch(query, fp16_window=(keys, values))
+
+    assert debug.tail_kernel_dispatches == 0
     torch.testing.assert_close(
         actual,
         (expected[2] / expected[1].unsqueeze(-1)).to(query.dtype),

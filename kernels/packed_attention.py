@@ -1080,6 +1080,7 @@ class PreparedPackedAttentionDecode:
     heads: int
     head_dim: int
     num_kv_heads: int
+    qwen25_tail_kernel_eligible: bool
     scale: float
     static_constant_ptrs: tuple[int, ...]
     static_constant_device: torch.device
@@ -1234,7 +1235,8 @@ class PreparedPackedAttentionDecode:
                 raise ValueError("fp16_window must match the prepared KV-head layout and device.")
             old_max, old_denominator, old_numerator = state
             if (
-                self.heads == _QWEN25_DIRECT_HEADS
+                self.qwen25_tail_kernel_eligible
+                and self.heads == _QWEN25_DIRECT_HEADS
                 and self.num_kv_heads == _QWEN25_DIRECT_KV_HEADS
                 and self.head_dim == _QWEN25_DIRECT_HEAD_DIM
                 and query_tokens == 1
@@ -1350,6 +1352,19 @@ def prepare_packed_attention_decode(
     prepared_rotation = rotation.float().contiguous()
     prepared_gqa_mapping = gqa_mapping.contiguous()
     prepared_gqa_mapping_long = gqa_mapping.to(dtype=torch.long).contiguous()
+    qwen25_tail_kernel_eligible = (
+        head_dim == _QWEN25_DIRECT_HEAD_DIM
+        and kv_heads == _QWEN25_DIRECT_KV_HEADS
+        and torch.equal(
+            prepared_gqa_mapping,
+            torch.arange(
+                _QWEN25_DIRECT_HEADS,
+                device=rotation.device,
+                dtype=prepared_gqa_mapping.dtype,
+            )
+            // _QWEN25_DIRECT_GQA_RATIO,
+        )
+    )
     constants = (
         prepared_rotation,
         prepared_gqa_mapping,
@@ -1364,6 +1379,7 @@ def prepare_packed_attention_decode(
         gqa_mapping.shape[0],
         head_dim,
         kv_heads,
+        qwen25_tail_kernel_eligible,
         attention_scale,
         tuple(tensor.data_ptr() for tensor in constants),
         rotation.device,
