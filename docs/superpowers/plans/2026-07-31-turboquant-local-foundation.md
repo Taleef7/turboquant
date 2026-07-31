@@ -297,7 +297,9 @@ git commit -m "feat: add paper-faithful rotation and codebooks"
 
 **Files:**
 - Add: `core/paper_mse.py`
+- Modify: `core/packing.py`
 - Add: `tests/test_paper_mse.py`
+- Modify: `tests/test_packing.py`
 
 **Interfaces:**
 - Consumes: `seeded_haar_rotation()` and `lloyd_max_sphere_codebook()`.
@@ -339,14 +341,26 @@ python -m pytest tests/test_paper_mse.py -q
 
 Expected: FAIL because `core.paper_mse` does not exist.
 
-- [ ] **Step 3: Implement minimal encode/decode**
+- [ ] **Step 3: Extend the shared index packer to one-bit indices**
+
+Add `1` to the generic index-width contract rather than duplicating a private
+paper-only bit packer or misusing the signed QJL packer. Extend
+`tests/test_packing.py` so one-bit indices round-trip, reject values outside
+`[0, 2)`, and zero their final-byte padding for non-byte-aligned widths.
+
+- [ ] **Step 4: Implement minimal encode/decode**
 
 Normalize nonzero rows, rotate unit vectors, choose nearest codebook centroid
 per coordinate, and bit-pack indices with the existing generic packer. Decode
-centroids, inverse-rotate with `R.T`, multiply by stored norms, and preserve
-zero rows exactly. Keep reference calculations on CPU; reject CUDA inputs.
+centroids and apply the inverse consistently with the row-vector convention
+(`unit @ rotation.T` to encode, `centroids @ rotation` to decode), multiply by
+stored norms, and preserve zero rows exactly. Single-vector inputs round-trip
+as one-dimensional vectors; batched inputs round-trip as two-dimensional
+tensors. Store scalar/vector norms as float32 and return decoded reference
+values as CPU float64. Keep reference calculations on CPU; reject CUDA inputs
+and tensor ranks outside one or two.
 
-- [ ] **Step 4: Verify cross-module properties**
+- [ ] **Step 5: Verify cross-module properties**
 
 ```bash
 python -m pytest tests/test_paper_rotation.py tests/test_paper_codebook.py \
@@ -356,10 +370,11 @@ python -m ruff check core/paper_mse.py tests/test_paper_mse.py
 
 Expected: all tests pass with no warnings.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add core/paper_mse.py tests/test_paper_mse.py
+git add core/paper_mse.py core/packing.py \
+  tests/test_paper_mse.py tests/test_packing.py
 git commit -m "feat: add TurboQuant MSE reference codec"
 ```
 
