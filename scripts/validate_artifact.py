@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from benchmark_schema import validate_artifact
+from benchmark_schema import load_strict_json, validate_artifact
 from repro_utils import benchmark_binding
 
 
@@ -22,13 +22,16 @@ def main() -> None:
     parser.add_argument("--no-binding-check", action="store_true")
     args = parser.parse_args()
     try:
-        artifact = json.loads(args.artifact.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        artifact = load_strict_json(args.artifact)
+    except (OSError, UnicodeError, ValueError) as exc:
         print(json.dumps({"valid": False, "errors": [f"cannot read artifact: {exc}"]}))
         raise SystemExit(2)
-    result = validate_artifact(
-        artifact, None if args.no_binding_check else benchmark_binding(ROOT)
+    expected_binding = (
+        None
+        if args.no_binding_check or artifact.get("schema_version") == 2
+        else benchmark_binding(ROOT)
     )
+    result = validate_artifact(artifact, expected_binding, repo_root=ROOT)
     print(json.dumps({"valid": result.valid, "errors": list(result.errors)}, indent=2))
     if not result.valid:
         raise SystemExit(1)

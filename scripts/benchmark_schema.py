@@ -6,11 +6,15 @@ from a partial run or silently drop a failed matrix cell.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass
+import hashlib
+import json
 import math
+from pathlib import Path
 import random
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence, TypedDict
 
 
 REQUIRED_BINDING_KEYS = (
@@ -33,6 +37,145 @@ PHYSICAL_BYTE_CATEGORIES = ("keys", "values", "metadata", "fp16_window", "paddin
 QUALITY_ARTIFACT_TYPE = "quality_matrix"
 SYSTEMS_ARTIFACT_TYPE = "systems_benchmark"
 QUALIFIED_ARTIFACT_TYPE = "qualified_run"
+V2_ROW_STATES = (
+    "passed",
+    "failed",
+    "invalid",
+    "oom",
+    "unsupported",
+    "unavailable",
+)
+DECLARED_EXECUTION_CLASS_NAMES = (
+    "local_rtx5070ti_12gb",
+    "gilbreth_a100_80gb",
+    "gilbreth_a100_40gb",
+    "gilbreth_a30",
+    "gilbreth_a10",
+)
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_V2_ARTIFACT_KEYS = {
+    "artifact_type",
+    "schema_version",
+    "artifact_id",
+    "status",
+    "paper",
+    "source",
+    "execution_class",
+    "identity",
+    "expected_row_ids",
+    "statistics",
+    "rows",
+    "pass_state_counts",
+    "claims",
+    "extensions",
+}
+_V2_IDENTITY_KEYS = {
+    "model_id",
+    "model_revision",
+    "weights_sha256",
+    "profile_id",
+    "profile_sha256",
+    "kv_dtype",
+}
+
+
+ExecutionClassName = Literal[
+    "local_rtx5070ti_12gb",
+    "gilbreth_a100_80gb",
+    "gilbreth_a100_40gb",
+    "gilbreth_a30",
+    "gilbreth_a10",
+]
+
+
+class ExecutionClass(TypedDict):
+    """Declared machine identity for comparable evidence runs."""
+
+    name: ExecutionClassName
+    gpu_name: str
+    total_vram_bytes: int
+    driver_version: str
+    cuda_runtime: str
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate object key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _validate_json_safe(
+    value: Any,
+    *,
+    label: str,
+    errors: list[str],
+    ancestors: set[int] | None = None,
+) -> None:
+    if value is None or isinstance(value, (bool, str, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            errors.append(f"{label} must be finite")
+        return
+    if ancestors is None:
+        ancestors = set()
+    if isinstance(value, (dict, list)):
+        identity = id(value)
+        if identity in ancestors:
+            errors.append(f"{label} is not JSON-safe")
+            return
+        ancestors.add(identity)
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if not isinstance(key, str):
+                    errors.append(f"{label} has a non-string object key")
+                    continue
+                _validate_json_safe(
+                    child,
+                    label=f"{label}.{key}",
+                    errors=errors,
+                    ancestors=ancestors,
+                )
+        else:
+            for index, child in enumerate(value):
+                _validate_json_safe(
+                    child,
+                    label=f"{label}.{index}",
+                    errors=errors,
+                    ancestors=ancestors,
+                )
+        ancestors.remove(identity)
+        return
+    errors.append(f"{label} is not JSON-safe")
+
+
+def load_strict_json(path: str | Path) -> Any:
+    """Load RFC-compatible JSON, rejecting duplicate keys and unsafe values."""
+    payload = json.loads(
+        Path(path).read_text(encoding="utf-8"),
+        object_pairs_hook=_reject_duplicate_json_keys,
+        parse_constant=_reject_json_constant,
+    )
+    errors: list[str] = []
+    _validate_json_safe(payload, label="JSON document", errors=errors)
+    if errors:
+        raise ValueError("; ".join(errors))
+    return payload
+
+
+def _is_exact_schema_version(value: Any, expected: int) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value == expected
+    )
 
 
 @dataclass(frozen=True)
@@ -558,9 +701,522 @@ def validate_qualified_run(
     return ValidationResult(not errors, tuple(errors))
 
 
-def validate_artifact(
-    artifact: Mapping[str, Any], expected_binding: Mapping[str, str] | None = None
+def _unknown_keys(
+    value: Mapping[str, Any],
+    allowed: set[str],
+    *,
+    label: str,
+    errors: list[str],
+) -> None:
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        errors.append(f"{label} has unknown keys: {', '.join(unknown)}")
+
+
+def _validate_extensions(
+    value: Mapping[str, Any], *, label: str, errors: list[str]
+) -> None:
+    extensions = value.get("extensions")
+    if extensions is not None and not isinstance(extensions, Mapping):
+        errors.append(f"{label}.extensions must be an object")
+
+
+def _required_text(
+    value: Mapping[str, Any], key: str, *, label: str, errors: list[str]
+) -> None:
+    if not isinstance(value.get(key), str) or not value[key]:
+        errors.append(f"{label}.{key} is required")
+
+
+def _validate_sha256(
+    value: Mapping[str, Any], key: str, *, label: str, errors: list[str]
+) -> None:
+    digest = value.get(key)
+    if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+        errors.append(f"{label}.{key} is required")
+
+
+def _validate_v2_identity(
+    value: Any, *, label: str, errors: list[str]
+) -> Mapping[str, Any] | None:
+    if not isinstance(value, Mapping):
+        errors.append(f"{label} is required")
+        return None
+    _unknown_keys(
+        value, _V2_IDENTITY_KEYS | {"extensions"}, label=label, errors=errors
+    )
+    for key in ("model_id", "model_revision", "profile_id", "kv_dtype"):
+        _required_text(value, key, label=label, errors=errors)
+    for key in ("weights_sha256", "profile_sha256"):
+        _validate_sha256(value, key, label=label, errors=errors)
+    _validate_extensions(value, label=label, errors=errors)
+    return value
+
+
+def _resolve_dotted_path(value: Any, path: str) -> Any:
+    current = value
+    for component in path.split("."):
+        if not component:
+            raise KeyError(path)
+        if isinstance(current, Mapping):
+            if component not in current:
+                raise KeyError(path)
+            current = current[component]
+        elif isinstance(current, list) and component.isdigit():
+            index = int(component)
+            if index >= len(current):
+                raise KeyError(path)
+            current = current[index]
+        else:
+            raise KeyError(path)
+    return current
+
+
+def _safe_sidecar_path(repo_root: Path, relative: str) -> Path | None:
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        return None
+    resolved_root = repo_root.resolve()
+    candidate = (resolved_root / relative_path).resolve()
+    if not candidate.is_relative_to(resolved_root):
+        return None
+    return candidate
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_v2_paper(value: Any, errors: list[str]) -> None:
+    if not isinstance(value, Mapping):
+        errors.append("paper is required")
+        return
+    _unknown_keys(
+        value,
+        {"paper_id", "source_url", "retrieved_at", "sha256", "extensions"},
+        label="paper",
+        errors=errors,
+    )
+    for key in ("paper_id", "source_url", "retrieved_at"):
+        _required_text(value, key, label="paper", errors=errors)
+    _validate_sha256(value, "sha256", label="paper", errors=errors)
+    _validate_extensions(value, label="paper", errors=errors)
+
+
+def _validate_v2_source(
+    value: Any, *, status: Any, errors: list[str]
+) -> None:
+    if not isinstance(value, Mapping):
+        errors.append("source is required")
+        return
+    _unknown_keys(
+        value,
+        {"git_commit", "dirty", "extensions"},
+        label="source",
+        errors=errors,
+    )
+    commit = value.get("git_commit")
+    if not isinstance(commit, str) or not _GIT_COMMIT_SHA.fullmatch(commit):
+        errors.append("source.git_commit must be a resolved 40-character SHA")
+    if not isinstance(value.get("dirty"), bool):
+        errors.append("source.dirty must be boolean")
+    elif status == "qualified" and value["dirty"]:
+        errors.append("dirty source cannot qualify")
+    _validate_extensions(value, label="source", errors=errors)
+
+
+def _validate_v2_execution_class(value: Any, errors: list[str]) -> None:
+    if not isinstance(value, Mapping):
+        errors.append("execution_class is required")
+        return
+    _unknown_keys(
+        value,
+        {
+            "name",
+            "gpu_name",
+            "total_vram_bytes",
+            "driver_version",
+            "cuda_runtime",
+            "extensions",
+        },
+        label="execution_class",
+        errors=errors,
+    )
+    if value.get("name") not in DECLARED_EXECUTION_CLASS_NAMES:
+        errors.append("execution_class.name is not declared")
+    for key in ("gpu_name", "driver_version", "cuda_runtime"):
+        _required_text(value, key, label="execution_class", errors=errors)
+    if (
+        not isinstance(value.get("total_vram_bytes"), int)
+        or isinstance(value.get("total_vram_bytes"), bool)
+        or value["total_vram_bytes"] <= 0
+    ):
+        errors.append("execution_class.total_vram_bytes must be a positive integer")
+    _validate_extensions(value, label="execution_class", errors=errors)
+
+
+def _validate_v2_statistics(value: Any, errors: list[str]) -> None:
+    if not isinstance(value, Mapping):
+        errors.append("statistics is required")
+        return
+    _unknown_keys(
+        value,
+        {
+            "method",
+            "confidence_level",
+            "seed",
+            "iterations",
+            "extensions",
+        },
+        label="statistics",
+        errors=errors,
+    )
+    _required_text(value, "method", label="statistics", errors=errors)
+    confidence = value.get("confidence_level")
+    if (
+        not isinstance(confidence, (int, float))
+        or isinstance(confidence, bool)
+        or not math.isfinite(confidence)
+        or not 0.0 < confidence < 1.0
+    ):
+        errors.append("statistics.confidence_level must be between 0 and 1")
+    if not isinstance(value.get("seed"), int) or isinstance(value.get("seed"), bool):
+        errors.append("statistics.seed must be an integer")
+    if (
+        not isinstance(value.get("iterations"), int)
+        or isinstance(value.get("iterations"), bool)
+        or value["iterations"] <= 0
+    ):
+        errors.append("statistics.iterations must be a positive integer")
+    _validate_extensions(value, label="statistics", errors=errors)
+
+
+def _validate_v2_sidecars(
+    value: Any,
+    *,
+    row_id: str,
+    repo_root: Path,
+    verify_contents: bool,
+    errors: list[str],
+) -> set[str]:
+    paths: set[str] = set()
+    declared_paths: set[str] = set()
+    if not isinstance(value, list):
+        errors.append(f"row {row_id} sidecars must be a list")
+        return paths
+    for index, sidecar in enumerate(value):
+        label = f"row {row_id} sidecar {index}"
+        if not isinstance(sidecar, Mapping):
+            errors.append(f"{label} is not an object")
+            continue
+        _unknown_keys(
+            sidecar,
+            {"path", "sha256", "available", "extensions"},
+            label=label,
+            errors=errors,
+        )
+        _validate_extensions(sidecar, label=label, errors=errors)
+        relative = sidecar.get("path")
+        if not isinstance(relative, str) or not relative:
+            errors.append(f"{label}.path is required")
+            continue
+        if relative in declared_paths:
+            errors.append(f"row {row_id} duplicates sidecar path: {relative}")
+        declared_paths.add(relative)
+        candidate = _safe_sidecar_path(repo_root, relative)
+        if candidate is None:
+            errors.append(f"row {row_id} sidecar path must be relative to repo_root")
+            continue
+        available = sidecar.get("available")
+        if not isinstance(available, bool):
+            errors.append(f"{label}.available must be boolean")
+            continue
+        if not available:
+            errors.append(f"row {row_id} sidecar is unavailable: {relative}")
+            continue
+        digest = sidecar.get("sha256")
+        if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+            errors.append(f"{label}.sha256 is required")
+            continue
+        if not verify_contents:
+            paths.add(relative)
+            continue
+        if not candidate.is_file():
+            errors.append(f"row {row_id} sidecar does not exist: {relative}")
+        elif _sha256_path(candidate) != digest:
+            errors.append(f"row {row_id} sidecar hash mismatch: {relative}")
+        else:
+            paths.add(relative)
+    return paths
+
+
+def _validate_v2_claims(
+    value: Any,
+    *,
+    artifact_id: Any,
+    rows_by_id: Mapping[str, Mapping[str, Any]],
+    sidecars_by_row: Mapping[str, set[str]],
+    repo_root: Path,
+    resolve_sidecar_queries: bool,
+    errors: list[str],
+) -> None:
+    if not isinstance(value, list):
+        errors.append("claims must be a list")
+        return
+    seen: set[str] = set()
+    for index, claim in enumerate(value):
+        label = f"claim {index}"
+        if not isinstance(claim, Mapping):
+            errors.append(f"{label} is not an object")
+            continue
+        _unknown_keys(
+            claim,
+            {"claim_id", "artifact_id", "row_id", "query", "extensions"},
+            label=label,
+            errors=errors,
+        )
+        _validate_extensions(claim, label=label, errors=errors)
+        claim_id = claim.get("claim_id")
+        if not isinstance(claim_id, str) or not claim_id:
+            errors.append("claim claim_id is required")
+        elif claim_id in seen:
+            errors.append(f"duplicate claim_id: {claim_id}")
+        else:
+            seen.add(claim_id)
+        if claim.get("artifact_id") != artifact_id:
+            errors.append("claim artifact_id does not match artifact")
+        row_id = claim.get("row_id")
+        row = rows_by_id.get(row_id) if isinstance(row_id, str) else None
+        if row is None:
+            errors.append("claim row_id does not reference an artifact row")
+        query = claim.get("query")
+        if not isinstance(query, str) or not query:
+            errors.append("claim query is required")
+            continue
+        if query.startswith("metrics."):
+            if row is None:
+                continue
+            try:
+                _resolve_dotted_path(row, query)
+            except KeyError:
+                errors.append(f"claim query does not resolve for row {row_id}")
+        elif query.startswith("sidecar:") and "#" in query:
+            relative, json_path = query[len("sidecar:") :].split("#", 1)
+            query_is_declared = (
+                row is not None
+                and bool(json_path)
+                and relative in sidecars_by_row.get(row_id, set())
+            )
+            if not query_is_declared:
+                errors.append(f"claim query does not resolve for row {row_id}")
+            elif resolve_sidecar_queries:
+                candidate = _safe_sidecar_path(repo_root, relative)
+                try:
+                    sidecar_payload = load_strict_json(candidate) if candidate else None
+                    _resolve_dotted_path(sidecar_payload, json_path)
+                except (OSError, UnicodeError, ValueError, KeyError):
+                    errors.append(
+                        f"claim sidecar query does not resolve for row {row_id}"
+                    )
+        else:
+            errors.append(f"claim query does not resolve for row {row_id}")
+
+
+def _validate_v2_artifact(
+    payload: dict[str, object],
+    *,
+    repo_root: Path,
+    verify_sidecar_contents: bool,
 ) -> ValidationResult:
+    """Validate strict, row-complete schema-v2 evidence without dropping failures."""
+    errors: list[str] = []
+    if not isinstance(payload, Mapping):
+        return ValidationResult(False, ("artifact must be an object",))
+    _validate_json_safe(payload, label="artifact", errors=errors)
+    _unknown_keys(payload, _V2_ARTIFACT_KEYS, label="artifact", errors=errors)
+    _validate_extensions(payload, label="artifact", errors=errors)
+    if not _is_exact_schema_version(payload.get("schema_version"), 2):
+        errors.append("schema_version must be the exact integer 2")
+    _required_text(payload, "artifact_type", label="artifact", errors=errors)
+    _required_text(payload, "artifact_id", label="artifact", errors=errors)
+    status = payload.get("status")
+    if status not in {"qualified", "partial", "failed", "invalid"}:
+        errors.append("artifact status must be qualified, partial, failed, or invalid")
+    _validate_v2_paper(payload.get("paper"), errors)
+    _validate_v2_source(payload.get("source"), status=status, errors=errors)
+    _validate_v2_execution_class(payload.get("execution_class"), errors)
+    artifact_identity = _validate_v2_identity(
+        payload.get("identity"), label="identity", errors=errors
+    )
+    _validate_v2_statistics(payload.get("statistics"), errors)
+
+    expected = payload.get("expected_row_ids")
+    expected_ids: set[str] = set()
+    if (
+        not isinstance(expected, list)
+        or not expected
+        or any(not isinstance(row_id, str) or not row_id for row_id in expected)
+    ):
+        errors.append("expected_row_ids must be a non-empty list of strings")
+    else:
+        expected_ids = set(expected)
+        if len(expected_ids) != len(expected):
+            errors.append("expected_row_ids must not contain duplicates")
+
+    rows = payload.get("rows")
+    rows_by_id: dict[str, Mapping[str, Any]] = {}
+    sidecars_by_row: dict[str, set[str]] = {}
+    outcomes: Counter[str] = Counter()
+    if not isinstance(rows, list):
+        errors.append("rows must be a list")
+    else:
+        for index, row in enumerate(rows):
+            if not isinstance(row, Mapping):
+                errors.append(f"row {index} is not an object")
+                continue
+            row_id_value = row.get("row_id")
+            row_id = (
+                row_id_value
+                if isinstance(row_id_value, str) and row_id_value
+                else f"index-{index}"
+            )
+            _unknown_keys(
+                row,
+                {
+                    "row_id",
+                    "status",
+                    "reason",
+                    "identity",
+                    "metrics",
+                    "sidecars",
+                    "extensions",
+                },
+                label=f"row {row_id}",
+                errors=errors,
+            )
+            _validate_extensions(row, label=f"row {row_id}", errors=errors)
+            if not isinstance(row_id_value, str) or not row_id_value:
+                errors.append(f"row {index} row_id is required")
+            elif row_id in rows_by_id:
+                errors.append(f"duplicate row ID: {row_id}")
+            else:
+                rows_by_id[row_id] = row
+            row_status = row.get("status")
+            if row_status not in V2_ROW_STATES:
+                errors.append(f"row {row_id} status is not declared")
+            else:
+                outcomes[row_status] += 1
+            reason = row.get("reason")
+            if row_status == "passed":
+                if reason not in (None, ""):
+                    errors.append(f"row {row_id} passed status cannot have a reason")
+            elif row_status in V2_ROW_STATES and (
+                not isinstance(reason, str) or not reason
+            ):
+                errors.append(f"row {row_id} {row_status} status requires a reason")
+            row_identity = _validate_v2_identity(
+                row.get("identity"), label=f"row {row_id} identity", errors=errors
+            )
+            if artifact_identity is not None and row_identity is not None:
+                for key in _V2_IDENTITY_KEYS:
+                    if row_identity.get(key) != artifact_identity.get(key):
+                        errors.append(
+                            f"row {row_id} identity.{key} does not match "
+                            "artifact identity"
+                        )
+            if not isinstance(row.get("metrics"), Mapping):
+                errors.append(f"row {row_id} metrics must be an object")
+            else:
+                _validate_json_safe(
+                    row["metrics"],
+                    label=f"row {row_id} metrics",
+                    errors=errors,
+                )
+            sidecars_by_row[row_id] = _validate_v2_sidecars(
+                row.get("sidecars"),
+                row_id=row_id,
+                repo_root=repo_root,
+                verify_contents=verify_sidecar_contents,
+                errors=errors,
+            )
+
+    seen_ids = set(rows_by_id)
+    if missing := sorted(expected_ids - seen_ids):
+        errors.append(f"missing expected row IDs: {missing}")
+    if unexpected := sorted(seen_ids - expected_ids):
+        errors.append(f"unexpected row IDs: {unexpected}")
+    if status == "qualified" and any(outcomes[state] for state in V2_ROW_STATES[1:]):
+        errors.append("qualified artifact requires every row to pass")
+
+    declared_counts = payload.get("pass_state_counts")
+    if not isinstance(declared_counts, Mapping):
+        errors.append("pass_state_counts is required")
+    else:
+        _unknown_keys(
+            declared_counts,
+            set(V2_ROW_STATES),
+            label="pass_state_counts",
+            errors=errors,
+        )
+        if any(
+            not isinstance(declared_counts.get(state), int)
+            or isinstance(declared_counts.get(state), bool)
+            or declared_counts[state] < 0
+            for state in V2_ROW_STATES
+        ):
+            errors.append(
+                "pass_state_counts must declare non-negative counts for every state"
+            )
+        elif any(
+            declared_counts[state] != outcomes[state] for state in V2_ROW_STATES
+        ):
+            errors.append("pass_state_counts do not match row outcomes")
+
+    _validate_v2_claims(
+        payload.get("claims"),
+        artifact_id=payload.get("artifact_id"),
+        rows_by_id=rows_by_id,
+        sidecars_by_row=sidecars_by_row,
+        repo_root=repo_root,
+        resolve_sidecar_queries=verify_sidecar_contents,
+        errors=errors,
+    )
+    return ValidationResult(not errors, tuple(errors))
+
+
+def validate_v2_artifact(
+    payload: dict[str, object], *, repo_root: Path
+) -> ValidationResult:
+    """Validate all schema-v2 structure plus repo-relative sidecar contents."""
+    return _validate_v2_artifact(
+        payload,
+        repo_root=repo_root,
+        verify_sidecar_contents=True,
+    )
+
+
+def validate_artifact(
+    artifact: Mapping[str, Any],
+    expected_binding: Mapping[str, str] | None = None,
+    *,
+    repo_root: Path | None = None,
+) -> ValidationResult:
+    if "schema_version" in artifact:
+        version = artifact["schema_version"]
+        if not _is_exact_schema_version(version, 1) and not _is_exact_schema_version(
+            version, 2
+        ):
+            return ValidationResult(
+                False, (f"unsupported schema_version {version!r}",)
+            )
+        if _is_exact_schema_version(version, 2):
+            return validate_v2_artifact(
+                dict(artifact), repo_root=repo_root or Path.cwd()
+            )
     kind = artifact.get("artifact_type")
     if kind == QUALITY_ARTIFACT_TYPE:
         return validate_quality_artifact(artifact, expected_binding)

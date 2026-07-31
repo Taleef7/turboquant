@@ -47,14 +47,41 @@ DIRECT_EVIDENCE_SOURCE_PATHS = (
 )
 
 
-def git_commit_sha() -> str:
+def git_commit_sha(root: str | Path | None = None) -> str:
     try:
+        command = ["git"]
+        if root is not None:
+            command.extend(["-C", str(Path(root))])
+        command.extend(["rev-parse", "HEAD"])
         out = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+            command, stderr=subprocess.DEVNULL, text=True
         )
         return out.strip()
     except Exception:
         return "unknown"
+
+
+def capture_source_metadata(root: str | Path) -> dict[str, bool | str]:
+    """Capture the resolved commit and whether tracked or untracked files differ."""
+    root_path = Path(root)
+    commit = git_commit_sha(root_path)
+    try:
+        status = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(root_path),
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        status = ""
+        commit = "unknown"
+    return {"git_commit": commit, "dirty": bool(status.strip())}
 
 
 def sha256_file(path: str | Path) -> str:
