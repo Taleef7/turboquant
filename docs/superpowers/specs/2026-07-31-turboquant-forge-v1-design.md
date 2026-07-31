@@ -169,13 +169,17 @@ LongBench-E reproduction, and DBpedia/GloVe ANN comparisons.
 
 ### Gates and pass counts
 
-Each row is `passed`, `failed`, `invalid`, `oom`, or `unsupported`. Aggregate
-reports show counts for every state and never report only successful rows.
+Each row is `passed`, `failed`, `invalid`, `oom`, `unsupported`, or
+`unavailable`. Aggregate reports show counts for every state and never report
+only successful rows.
 
 - Mathematical reference: orthogonality and deterministic fixtures pass;
-  product estimator signed-bias 95% confidence interval contains zero for the
-  declared synthetic distribution/seed matrix; distortion summaries include
-  confidence intervals rather than a single transform.
+  product estimator signed bias satisfies a predeclared deterministic
+  `abs(mean) <= 4 * SEM + numerical_slack` smoke gate across independent
+  projection seeds, centered on the physically stored float32 residual norm;
+  ordinary 95% confidence intervals are reported rather than misused as a
+  deterministic pass gate; distortion summaries include confidence intervals
+  rather than a single transform.
 - Retrieval-safe: baseline accuracy is at least 95%; every expected row
   completes; per-context baseline-minus-profile accuracy is at most 2
   percentage points; aggregate upper 95% paired-bootstrap bound is at most 2

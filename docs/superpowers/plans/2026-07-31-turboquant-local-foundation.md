@@ -495,6 +495,9 @@ git commit -m "feat: add TurboQuant product reference codec"
 - Add: `scripts/run_codec_reproduction.py`
 - Add: `tests/test_codec_reproduction.py`
 - Add: `configs/benchmarks/codec-local-v1.json`
+- Modify: `pyproject.toml`
+- Modify: `requirements/runtime.in`
+- Modify: `requirements/runtime.lock`
 
 **Interfaces:**
 - Consumes: paper MSE/product codecs and artifact schema v2.
@@ -503,17 +506,74 @@ git commit -m "feat: add TurboQuant product reference codec"
 
 - [ ] **Step 1: Write failing matrix/completeness tests**
 
-The fixed config contains dimensions `64/128/256`; MSE widths `1/2/3/4`;
-product total widths `2/3/4`; distributions
-`sphere/gaussian/heavy_tail/outlier`; transform/projection seed pairs `0..15`;
-and 10,000 vectors per synthetic cell. Product and MSE results at equal total
-width are reported side by side, including whether the product estimator
-improves the declared low-bit high-inner-product fixture, but the comparison
-is never promoted as a theorem or universal pass gate. GloVe uses a pinned
-dataset revision, sample IDs, and `1@k` for `k=1/10/100`.
+The checked-in config materializes 16 independent seed-pair objects:
 
-Tests assert exact expected row IDs/counts, deterministic resumption, invalid
-status on any missing row, and actual byte accounting.
+```text
+pair_id=0..15
+rotation_seed=10000+pair_id
+projection_seed=1000000+pair_id
+```
+
+Do not reuse the same numeric seed for rotation and projection: both begin from
+a Gaussian `d x d` draw, so equal seeds create a deterministic correlation.
+All codecs at one distribution/dimension reuse the same vectors and queries.
+Data, independent-query, and high-inner-product noise use disjoint deterministic
+seed namespaces beginning at `3_000_000`, `4_000_000`, and `5_000_000`.
+
+The synthetic matrix has exactly 1,344 rows:
+
+- MSE: dimensions `64/128/256` x widths `1/2/3/4` x four distributions x
+  16 rotation seeds = 768 rows;
+- Product: dimensions `64/128/256` x total widths `2/3/4` x four
+  distributions x 16 independent seed pairs = 576 rows.
+
+Each row processes 10,000 vectors in chunks of 2,048. Define distributions in
+the config, not only by name:
+
+- `sphere`: normalized IID Gaussian rows;
+- `gaussian`: IID `N(0, 1/d)`;
+- `heavy_tail`: Student-t with three degrees of freedom, scaled by
+  `1/sqrt(3d)`;
+- `outlier`: `(z + 8*s*e_j) / sqrt(65)`, with Gaussian `z`, uniformly selected
+  coordinate `j`, and independent Rademacher sign `s`.
+
+Every synthetic row measures both an independent unit query and a declared
+high-inner-product query
+`q = 0.8*u + 0.6*v`, where `v` is independently generated, orthogonalized
+against unit vector `u`, and normalized.
+
+The GloVe-200 matrix adds exactly 64 rows: codecs `mse/product`, nominal total
+widths `2/4`, and 16 seed pairs. Pin the official ANN-Benchmarks file:
+
+```text
+https://ann-benchmarks.com/glove-200-angular.hdf5
+sha256 4839085e5a8bb293434a1a66e1aa0193afc3f07c6797a85f1dbd91656172da20
+size 962819488
+train (1183514, 200), test (10000, 200), neighbors (10000, 100)
+```
+
+Select 100,000 sorted base IDs without replacement using NumPy PCG64 seed
+`20260731`; persist the exact little-endian uint32 ID list with SHA-256
+`4465179f0175fbc0a43621e61c5472bff7c70361a7512b34245ff3e47b135c40`.
+Use query IDs `0..9999`, whose same-format SHA-256 is
+`9140e019602b8628f6f4a6aac3658bf206e332a92943eb113fb2b465fecc55d6`.
+Normalize both base and queries, recompute exact top-1 ground truth over the
+selected subset, and report `1@k` for `k=1/10/100`. Never reuse
+the file's full-base ground truth after subsetting. This is a
+`v1_partial_reproduction`: arXiv v1 did not publish its sample IDs, transform
+seeds, or which TurboQuant variant produced its GloVe plot.
+
+Canonical row IDs are
+`syn-{distribution}-d{dimension}-{codec}-b{nominal_total_bits}-s{pair_id:02d}`
+and `glove200-{codec}-b{nominal_total_bits}-s{pair_id:02d}`.
+
+Tests assert all 1,408 exact row IDs, counts, uniqueness, data reuse, independent
+seed streams, distribution moments, query geometry, deterministic resumption,
+missing-row placeholders, complete status precedence, actual-versus-formula
+byte accounting, GloVe hash/shape/selection validation, and the exact `1@k`
+definition. Use honest codec-only identity sentinels required by schema v2:
+`model_id="not_applicable:codec-only"`, empty-byte SHA-256 for weights, and the
+config SHA-256 as profile identity.
 
 - [ ] **Step 2: Run RED**
 
@@ -525,29 +585,72 @@ Expected: FAIL because the runner/config do not exist.
 
 - [ ] **Step 3: Implement the resumable runner**
 
-Write one JSONL row atomically per cell, skip only rows whose full identity and
-hashes match, and rebuild the manifest/summary from rows. Metrics are MSE,
-relative MSE, inner-product RMSE, signed bias with 95% CI, encode/decode
-latency, physical bytes/effective bits, and GloVe recall.
+Write each cell as
+`rows/{row_id}.json.tmp -> fsync -> os.replace(rows/{row_id}.json)`, then
+deterministically rebuild sorted `rows.jsonl` and `manifest.json` through the
+same temp-and-replace protocol. Resume only rows in `passed`, `failed`, or
+`unsupported` state whose complete identity/config/input hashes match. Rerun
+`invalid`, `oom`, and `unavailable` rows. A missing expected row becomes an
+explicit `invalid` placeholder with a reason.
+
+Artifact status precedence is `invalid` for corrupt/missing/hash/byte/computation
+errors, then `failed` for a completed predeclared gate failure or OOM, then
+`partial` for unavailable/unsupported rows or dirty source, otherwise
+`qualified`. A measured quality loss or Product-not-better result is still a
+valid `passed` measurement; row pass state is not a marketing outcome.
+
+For each row, aggregate chunks without retaining raw vectors or encoded
+payloads. Report paper-style `mean(||x-x_hat||^2)`, relative squared error,
+encode/decode latency, actual physical bytes, effective physical bits per
+coordinate, and for each query fixture: count, inner-product RMSE, signed bias,
+sample standard deviation, SEM, and Student-t 95% CI. Product rows additionally
+report bias against the finite-float32-residual-norm expectation.
+
+Aggregate seed-level means, not 160,000 vector errors as independent samples.
+Use a deterministic paired seed-block bootstrap with seed `1729` and 10,000
+iterations for Product-minus-MSE comparisons. Report nominal coordinate width
+and physical width separately: Product stores a second float32 norm and is not
+physically bit-equal to MSE at the same nominal width.
+
+Use the official HDF5 directly and read selected sorted rows/chunks with `h5py`
+in read-only mode. Do not add Hugging Face Datasets, PyArrow, FAISS,
+scikit-learn, or ANN-Benchmarks as runtime dependencies. Add only the
+`retrieval` optional dependency `h5py>=3.16,<4`, include it in the certified
+runtime input/lock, and keep the 918 MiB source outside Git. If the dependency
+or verified dataset is unavailable, emit all 64 GloVe rows as `unavailable`;
+never invent a successful sidecar.
 
 - [ ] **Step 4: Execute the local synthetic matrix**
 
 ```bash
 python scripts/run_codec_reproduction.py \
   --config configs/benchmarks/codec-local-v1.json \
-  --output-dir artifacts/codec-local-v1
+  --output-dir artifacts/codec-local-v1 \
+  --dataset-cache ~/.cache/turboquant
 python scripts/validate_artifact.py artifacts/codec-local-v1/manifest.json
 ```
 
-Expected: complete synthetic rows validate. If GloVe is unavailable, its rows
-must be `unavailable` with a persisted reason and the overall artifact remains
-`partial`, never `qualified`.
+Expected: all 1,344 synthetic rows complete and all 1,408 rows are represented.
+If GloVe is unavailable, its 64 rows persist as `unavailable` and the artifact
+is `partial`, never `qualified`. Codec calculations and latency are labeled
+`local_reference_cpu_timing`; optional CUDA chunked retrieval scoring records
+the RTX 5070 Ti execution split and is never presented as GPU indexing time.
+
+Public claims for this artifact carry:
+`forge_local_synthetic`, `not_paper_scale`, `v1_partial_reproduction`,
+`unknown_original_sample_ids`, `unknown_paper_codec_variant`,
+`accepted_revision_protocol_changed`, `external_reproducibility_dispute_open`,
+`local_reference_cpu_timing`, and `nominal_width_not_physical_bit_parity`.
+Task 6 does not add RaBitQ/PQ baselines or adjudicate the 2026 reproducibility
+dispute; it prevents local numbers from inheriting contested superiority or
+timing claims.
 
 - [ ] **Step 5: Commit runner/config/tests**
 
 ```bash
 git add scripts/run_codec_reproduction.py tests/test_codec_reproduction.py \
-  configs/benchmarks/codec-local-v1.json
+  configs/benchmarks/codec-local-v1.json pyproject.toml \
+  requirements/runtime.in requirements/runtime.lock
 git commit -m "feat: add local TurboQuant codec reproduction"
 ```
 
