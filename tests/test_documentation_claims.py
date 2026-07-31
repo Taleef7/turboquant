@@ -7,8 +7,9 @@ artifacts.
 
 from __future__ import annotations
 
-from pathlib import Path
 import re
+from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,8 @@ PUBLIC_DOCUMENTS = (
     ROOT / "docs" / "PORTABILITY.md",
     ROOT / "docs" / "BENCHMARK_PROTOCOL.md",
     ROOT / "docs" / "RESULTS.md",
+    ROOT / "UPDATED_PLAN.md",
+    ROOT / "scripts" / "README.md",
 )
 QUALIFIED_ARTIFACT_ID = re.compile(
     r"qualified(?:-[a-z0-9]+)*/\d{8}T\d{6}Z-[a-z0-9._-]+", re.IGNORECASE
@@ -39,12 +42,48 @@ THIRTY_TWO_K_SUCCESS = re.compile(
 )
 
 
-def read_public_docs() -> str:
-    """Return one normalized corpus of release-facing Markdown documents."""
-    return "\n".join(
+def public_claim_corpus() -> str:
+    """Return normalized text for all public plans and script documentation."""
+    return normalize_claim_text("\n".join(
         path.read_text(encoding="utf-8") if path.exists() else ""
         for path in PUBLIC_DOCUMENTS
-    )
+    ))
+
+
+def read_public_docs() -> str:
+    """Return one normalized corpus of public claim-bearing documentation."""
+    return public_claim_corpus()
+
+
+def load_ci_steps() -> tuple[SimpleNamespace, ...]:
+    """Read the simple `run` steps in the checked-in CPU workflow without PyYAML."""
+    lines = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    steps: list[SimpleNamespace] = []
+    index = 0
+    while index < len(lines):
+        match = re.match(r"^        run:\s*(.*)$", lines[index])
+        if match is None:
+            index += 1
+            continue
+        run = match.group(1)
+        if run == "|":
+            body: list[str] = []
+            index += 1
+            while index < len(lines) and lines[index].startswith("          "):
+                body.append(lines[index].removeprefix("          "))
+                index += 1
+            run = "\n".join(body)
+        else:
+            index += 1
+        steps.append(SimpleNamespace(run=run))
+    return tuple(steps)
+
+
+def is_pytest_invocation(run: str) -> bool:
+    """Recognize the CPU test command, not installation of pytest itself."""
+    return "python -m pytest" in run
 
 
 def normalize_claim_text(value: str) -> str:
@@ -82,7 +121,7 @@ def is_32k_success_claim(value: str) -> bool:
 
 
 def test_docs_do_not_contain_unqualified_legacy_memory_claims() -> None:
-    corpus = normalize_claim_text(read_public_docs())
+    corpus = public_claim_corpus()
 
     for stale_claim in (
         "5.2x compression",
@@ -93,6 +132,35 @@ def test_docs_do_not_contain_unqualified_legacy_memory_claims() -> None:
         "validated-qwen 32k niah",
     ):
         assert stale_claim not in corpus
+
+
+def test_all_public_plans_and_script_docs_use_current_claims() -> None:
+    corpus = public_claim_corpus()
+
+    assert "5.2x" not in corpus
+    assert "full through 16k" not in corpus
+    assert ">=80% of baseline" not in corpus
+
+
+def test_pytest_invocation_detection_excludes_dependency_installation() -> None:
+    assert not is_pytest_invocation("python -m pip install pytest ruff")
+    assert is_pytest_invocation('python -m pytest tests -m "not gpu" -q')
+
+
+def test_ci_installs_locked_runtime_before_pytest() -> None:
+    steps = load_ci_steps()
+    install_index = next(
+        index
+        for index, step in enumerate(steps)
+        if "requirements/runtime.lock" in getattr(step, "run", "")
+    )
+    test_index = next(
+        index
+        for index, step in enumerate(steps)
+        if is_pytest_invocation(getattr(step, "run", ""))
+    )
+
+    assert install_index < test_index
 
 
 def test_qualified_artifact_reference_rejects_generic_label() -> None:

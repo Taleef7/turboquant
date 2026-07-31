@@ -1,39 +1,47 @@
-# Scripts Index
+# Reproducibility scripts
 
-This directory contains only active scripts used by the current reproducibility workflow.
+These are the active entry points for the local Forge evidence workflow. Run
+them from the repository root with the pinned runtime in
+`requirements/runtime.lock`. The benchmark and release runners write artifacts;
+the validator reads an existing artifact before treating a measurement as
+evidence.
 
-## Canonical entry points
+## `run_direct_benchmark.py`
 
-- `reproduce_release.py`
-  - One-command reproducibility runner.
-  - Modes:
-    - `quick`: smoke-level validation
-    - `full`: Qwen release-check path (currently through 16K)
+Runs an interleaved baseline, packed-reference, and Triton-direct systems
+benchmark for the pinned Qwen2.5 profile. It records every trial, dispatch
+counter, physical-cache breakdown, and OOM probe in the output JSON.
 
-- `benchmark_throughput.py`
-  - Baseline vs TurboQuant throughput/memory benchmark.
-  - Supports `--output-json` for machine-readable artifacts.
+```bash
+python scripts/run_direct_benchmark.py \
+  --output artifacts/direct-systems.json \
+  --prompt-tokens 8192 --decode-tokens 64 --warmups 1 --trials 2
+```
 
-- `test_long_context.py`
-  - Paired NIAH harness (`baseline` vs `TurboQuant` on identical prompts).
+The runner requires CUDA and does not itself establish a quality or Pareto
+claim.
 
-## Demonstration scripts
+## `reproduce_release.py`
 
-- `run_baseline.py`
-- `run_turboquant_v2.py`
+Coordinates validator-first Qwen evidence legs. `quick` is a smoke workflow;
+`qualified` applies the configured admission gates. A nonzero exit status is a
+reported outcome, not a result to suppress.
 
-## Validation / unit tests
+```bash
+python scripts/reproduce_release.py --mode quick --output-dir artifacts/repro
+```
 
-- `test_math.py`
-- `test_kernels.py`
-- `test_long_context_harness.py`
-- `test_cache_config.py`
-- `test_qjl_config.py`
-- `test_repro_utils.py`
-- `test_reproduce_release.py`
+## `validate_artifact.py`
 
-## Multi-model benchmark
+Validates a JSON artifact against the checked-in schema and, by default, the
+current source binding. It returns a nonzero status for malformed, incomplete,
+or mismatched evidence.
 
-- `test_multimodel.py`
+```bash
+python scripts/validate_artifact.py artifacts/direct-systems.json
+```
 
-Current claims are Qwen-focused; multi-model retrieval closure is deferred.
+For the current measured evidence and its scope, see
+[`docs/RESULTS.md`](../docs/RESULTS.md). The local-foundation design describes
+the next evidence requirements in
+[`docs/superpowers/specs/2026-07-31-turboquant-forge-v1-design.md`](../docs/superpowers/specs/2026-07-31-turboquant-forge-v1-design.md).
