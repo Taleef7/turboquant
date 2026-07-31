@@ -410,18 +410,53 @@ class TurboQuantProductReference:
     def physical_nbytes(self, encoded: TurboQuantProductEncoded) -> int: ...
 ```
 
+`dimension` is an exact built-in integer at least `2`; `total_bits` is an exact
+built-in integer in `2..9`, because the composed MSE codec consumes
+`total_bits - 1` and supports widths `1..8`. Both seeds use PyTorch's inclusive
+generator range `[-2**63, 2**64 - 1]`. Reject booleans, integer subclasses, and
+objects that spoof `__class__`.
+
+Encoding accepts finite CPU float32/float64 `[d]` or non-empty `[n, d]`
+vectors. A single payload stores packed signs as `[ceil(d/8)]` and a scalar
+float32 residual norm; a batch stores `[n, ceil(d/8)]` signs and `[n]` norms.
+Every consumer validates the concrete encoded/config types, derived nested MSE
+config, CPU dtype/device, rank, byte width, zero padding, finite nonnegative
+norms, and single/batch consistency. The physical payload per vector is:
+
+```text
+ceil(d * (total_bits - 1) / 8) + ceil(d / 8) + 8 bytes
+```
+
+The two four-byte terms are the MSE and residual float32 norms. Shared
+codebooks, rotation, projection matrix, and config objects are excluded.
+
+`estimate_inner_product()` accepts finite CPU float32/float64 query shapes
+`[d]` or non-empty `[q, d]`. Its retrieval-oriented outputs are scalar for one
+query/one encoded vector, `[n]` for one query/encoded batch, `[q]` for a query
+batch/one encoded vector, and `[q, n]` for two batches. Results and decoded
+vectors are CPU float64.
+
 - [ ] **Step 1: Write failing QJL/product tests**
 
-Use literal small fixtures for sign packing and byte counts. Across
-dimensions `64/128` and 128 declared projection seeds, test that:
+Use literal small fixtures for sign packing and byte counts, including a
+non-byte-aligned dimension. Test that:
 
 - zero residuals encode deterministically with zero residual norm;
 - residual signs are physically one bit per dimension;
 - direct inner-product estimation equals query dot decoded product vectors;
-- the signed-bias 95% confidence interval contains zero for seeded
-  unit-sphere vector/query fixtures; and
-- product error is lower than the same total-bit MSE codec on the declared
-  high-inner-product fixture.
+- an independent Algorithm 2 oracle matches the row-vector implementation;
+- exact config, seed, payload, and four query/output shape contracts fail
+  closed; and
+- across dimensions `64/128` and projection seeds `0..127`, the per-seed
+  signed-error mean satisfies the predeclared deterministic smoke gate
+  `abs(mean) <= 4 * SEM + 1e-12`, centered on the finite-float32-residual-norm
+  expectation.
+
+Compute and expose the ordinary 95% confidence interval for reporting, but do
+not require that interval to contain zero: even an unbiased estimator fails
+that gate about five percent of the time. Treat “product beats the same-total-
+bit MSE codec” as a Task 6 empirical low-bit comparison, not a unit-test
+invariant.
 
 - [ ] **Step 2: Run RED**
 
@@ -433,11 +468,17 @@ Expected: FAIL because the product codec does not exist.
 
 - [ ] **Step 3: Implement Algorithm 2 exactly**
 
-Generate `S` from a CPU float64 Gaussian generator. Normalize residuals only for
-the sign projection; store residual norm separately. Pack signs as bits. Decode
-with `sqrt(pi / 2) / dimension * residual_norm * S.T @ signs`, then add the MSE
-decode. Use the same operation in `estimate_inner_product()` so the test oracle
-has one mathematical definition.
+Generate a square CPU float64 Gaussian projection `S[d, d]` from a fresh
+generator seeded by `projection_seed`, without changing global RNG state.
+Compute the original-space residual against the physical MSE decode. With row
+vectors, encode signs as `sign(residual @ S.T)`, defining zero projections as
+`+1`; do not normalize the residual before projection because Algorithm 2 uses
+the residual directly. Pack one sign bit per dimension and store the residual
+norm as float32 under the same finite-overflow and ordinary-underflow policy as
+the MSE norm. Decode with
+`sqrt(pi / 2) / dimension * residual_norm * signs @ S`, then add the MSE
+decode. Use the same reconstruction in `estimate_inner_product()` so the test
+oracle has one mathematical definition.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -462,9 +503,13 @@ git commit -m "feat: add TurboQuant product reference codec"
 
 - [ ] **Step 1: Write failing matrix/completeness tests**
 
-The fixed config contains dimensions `64/128/256`, bits `1/2/3/4`, codecs
-`mse/product`, distributions `sphere/gaussian/heavy_tail/outlier`, transform
-seeds `0..15`, and 10,000 vectors per synthetic cell. GloVe uses a pinned
+The fixed config contains dimensions `64/128/256`; MSE widths `1/2/3/4`;
+product total widths `2/3/4`; distributions
+`sphere/gaussian/heavy_tail/outlier`; transform/projection seed pairs `0..15`;
+and 10,000 vectors per synthetic cell. Product and MSE results at equal total
+width are reported side by side, including whether the product estimator
+improves the declared low-bit high-inner-product fixture, but the comparison
+is never promoted as a theorem or universal pass gate. GloVe uses a pinned
 dataset revision, sample IDs, and `1@k` for `k=1/10/100`.
 
 Tests assert exact expected row IDs/counts, deterministic resumption, invalid
