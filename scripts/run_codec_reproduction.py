@@ -1,0 +1,1727 @@
+"""Build the resumable local TurboQuant codec and GloVe reproduction artifact."""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
+import sys
+import time
+from typing import Any, Iterable, Mapping, Sequence
+import urllib.request
+
+import numpy as np
+from scipy.stats import t as student_t
+import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from core.paper_mse import (  # noqa: E402
+    TurboQuantMSEConfig,
+    TurboQuantMSEReference,
+)
+from core.paper_product import (  # noqa: E402
+    TurboQuantProductConfig,
+    TurboQuantProductReference,
+)
+from scripts.benchmark_schema import V2_ROW_STATES, load_strict_json  # noqa: E402
+from scripts.repro_utils import (  # noqa: E402
+    capture_cuda_metadata,
+    capture_env_metadata,
+    capture_source_metadata,
+    package_version,
+    sha256_file,
+)
+
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+RESUME_PROTOCOL = "codec_reproduction_row_v1"
+DEFAULT_RETRIEVAL_CHUNK_SIZE = 2_048
+_CODEC_SOURCE_PATHS = (
+    "scripts/run_codec_reproduction.py",
+    "core/paper_mse.py",
+    "core/paper_product.py",
+    "core/paper_codebook.py",
+    "core/paper_rotation.py",
+    "core/packing.py",
+)
+_CODEC_CACHE: dict[tuple[object, ...], object] = {}
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _sha256_json(value: object) -> str:
+    return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _behavior_sha256() -> str:
+    digest = hashlib.sha256()
+    for relative in _CODEC_SOURCE_PATHS:
+        path = ROOT / relative
+        digest.update(relative.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def codec_identity(config_path: str | Path) -> dict[str, str]:
+    """Return schema-v2 identity without pretending a codec has model weights."""
+    path = Path(config_path)
+    artifact_id = json.loads(path.read_text(encoding="utf-8"))["artifact_id"]
+    return {
+        "model_id": "not_applicable:codec-only",
+        "model_revision": "not_applicable:codec-only",
+        "weights_sha256": EMPTY_SHA256,
+        "profile_id": artifact_id,
+        "profile_sha256": sha256_file(path),
+        "kv_dtype": "float32",
+    }
+
+
+def _fixture_lookup(config: Mapping[str, Any]) -> dict[tuple[str, int], Mapping[str, Any]]:
+    fixtures = config["synthetic"]["fixtures"]
+    return {
+        (fixture["distribution"], fixture["dimension"]): fixture
+        for fixture in fixtures
+    }
+
+
+def build_row_specs(config: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Materialize canonical row identities and every input seed they bind."""
+    pairs = config["seed_pairs"]
+    synthetic = config["synthetic"]
+    fixtures = _fixture_lookup(config)
+    specs: list[dict[str, Any]] = []
+    for distribution in (
+        item["name"] for item in synthetic["distributions"]
+    ):
+        for dimension in synthetic["dimensions"]:
+            fixture = fixtures[(distribution, dimension)]
+            for codec_name in ("mse", "product"):
+                widths = synthetic["codecs"][codec_name]["nominal_total_bits"]
+                for bits in widths:
+                    for pair in pairs:
+                        pair_id = pair["pair_id"]
+                        specs.append(
+                            {
+                                "row_id": (
+                                    f"syn-{distribution}-d{dimension}-"
+                                    f"{codec_name}-b{bits}-s{pair_id:02d}"
+                                ),
+                                "dataset": "synthetic",
+                                "distribution": distribution,
+                                "dimension": dimension,
+                                "codec": codec_name,
+                                "nominal_total_bits": bits,
+                                "pair_id": pair_id,
+                                "rotation_seed": pair["rotation_seed"],
+                                "projection_seed": (
+                                    pair["projection_seed"]
+                                    if codec_name == "product"
+                                    else None
+                                ),
+                                "fixture_id": fixture["fixture_id"],
+                                "data_seed": fixture["data_seed"],
+                                "independent_query_seed": fixture[
+                                    "independent_query_seed"
+                                ],
+                                "high_inner_product_noise_seed": fixture[
+                                    "high_inner_product_noise_seed"
+                                ],
+                                "vector_count": synthetic["vector_count"],
+                                "chunk_size": synthetic["chunk_size"],
+                            }
+                        )
+    glove = config["glove200"]
+    dimension = glove["datasets"]["train"]["shape"][1]
+    for codec_name in glove["codecs"]:
+        for bits in glove["nominal_total_bits"]:
+            for pair in pairs:
+                pair_id = pair["pair_id"]
+                specs.append(
+                    {
+                        "row_id": (
+                            f"glove200-{codec_name}-b{bits}-s{pair_id:02d}"
+                        ),
+                        "dataset": "glove200",
+                        "dimension": dimension,
+                        "codec": codec_name,
+                        "nominal_total_bits": bits,
+                        "pair_id": pair_id,
+                        "rotation_seed": pair["rotation_seed"],
+                        "projection_seed": (
+                            pair["projection_seed"]
+                            if codec_name == "product"
+                            else None
+                        ),
+                    }
+                )
+    return sorted(specs, key=lambda item: item["row_id"])
+
+
+def _validate_config(config: Mapping[str, Any], *, canonical: bool) -> None:
+    if config.get("config_version") != 1:
+        raise ValueError("config_version must be 1")
+    pairs = config.get("seed_pairs")
+    if not isinstance(pairs, list) or not pairs:
+        raise ValueError("seed_pairs must be a non-empty list")
+    for index, pair in enumerate(pairs):
+        if pair != {
+            "pair_id": index,
+            "rotation_seed": 10_000 + index,
+            "projection_seed": 1_000_000 + index,
+        }:
+            raise ValueError(f"seed pair {index} does not match the declared schedule")
+    fixtures = config["synthetic"]["fixtures"]
+    namespaces = (
+        ("data_seed", 3_000_000),
+        ("independent_query_seed", 4_000_000),
+        ("high_inner_product_noise_seed", 5_000_000),
+    )
+    for field, start in namespaces:
+        if [fixture[field] for fixture in fixtures] != list(
+            range(start, start + len(fixtures))
+        ):
+            raise ValueError(f"{field} does not match its disjoint seed namespace")
+    row_ids = [spec["row_id"] for spec in build_row_specs(config)]
+    if len(row_ids) != len(set(row_ids)):
+        raise ValueError("row specifications contain duplicate row IDs")
+    if canonical and (len(row_ids) != 1_408 or len(fixtures) != 12):
+        raise ValueError("canonical config must materialize 1,408 rows and 12 fixtures")
+    base_ids, query_ids = glove_selection_ids(config["glove200"])
+    if hashlib.sha256(base_ids.tobytes()).hexdigest() != (
+        config["glove200"]["base_selection"]["sha256"]
+    ):
+        raise ValueError("GloVe base selection ID SHA-256 mismatch")
+    if hashlib.sha256(query_ids.tobytes()).hexdigest() != (
+        config["glove200"]["query_selection"]["sha256"]
+    ):
+        raise ValueError("GloVe query selection ID SHA-256 mismatch")
+
+
+def load_config(path: str | Path) -> dict[str, Any]:
+    payload = load_strict_json(Path(path))
+    if not isinstance(payload, dict):
+        raise ValueError("codec reproduction config must contain an object")
+    canonical = Path(path).resolve() == (
+        ROOT / "configs" / "benchmarks" / "codec-local-v1.json"
+    ).resolve()
+    _validate_config(payload, canonical=canonical)
+    return payload
+
+
+def _normalize_rows(rows: np.ndarray) -> np.ndarray:
+    values = np.asarray(rows, dtype=np.float64)
+    norms = np.linalg.norm(values, axis=1, keepdims=True)
+    if np.any(~np.isfinite(norms)) or np.any(norms == 0):
+        raise ValueError("vectors must have finite nonzero norms")
+    return np.asarray(values / norms, dtype=np.float32)
+
+
+def _synthetic_vectors(
+    distribution: str,
+    dimension: int,
+    count: int,
+    generator: np.random.Generator,
+) -> np.ndarray:
+    if distribution == "sphere":
+        return _normalize_rows(generator.standard_normal((count, dimension)))
+    if distribution == "gaussian":
+        values = generator.standard_normal((count, dimension)) / math.sqrt(
+            dimension
+        )
+    elif distribution == "heavy_tail":
+        values = generator.standard_t(3, size=(count, dimension)) / math.sqrt(
+            3 * dimension
+        )
+    elif distribution == "outlier":
+        values = generator.standard_normal((count, dimension)) / math.sqrt(
+            dimension
+        )
+        coordinates = generator.integers(0, dimension, size=count)
+        signs = generator.integers(0, 2, size=count) * 2 - 1
+        values[np.arange(count), coordinates] += 8.0 * signs
+        values /= math.sqrt(65.0)
+    else:
+        raise ValueError(f"unknown synthetic distribution: {distribution}")
+    return np.asarray(values, dtype=np.float32)
+
+
+def _query_fixture(
+    vectors: np.ndarray,
+    independent_generator: np.random.Generator,
+    high_ip_generator: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    count, dimension = vectors.shape
+    independent = _normalize_rows(
+        independent_generator.standard_normal((count, dimension))
+    )
+    unit = _normalize_rows(vectors)
+    noise = high_ip_generator.standard_normal((count, dimension))
+    noise -= np.sum(noise * unit, axis=1, keepdims=True) * unit
+    noise_norms = np.linalg.norm(noise, axis=1, keepdims=True)
+    bad = np.flatnonzero(noise_norms[:, 0] <= np.finfo(np.float64).eps)
+    for index in bad:
+        coordinate = int(np.argmin(np.abs(unit[index])))
+        noise[index] = 0
+        noise[index, coordinate] = 1
+        noise[index] -= float(noise[index] @ unit[index]) * unit[index]
+    orthogonal = _normalize_rows(noise)
+    high_ip = np.asarray(0.8 * unit + 0.6 * orthogonal, dtype=np.float32)
+    return independent, high_ip
+
+
+@dataclass
+class _SyntheticStream:
+    distribution: str
+    dimension: int
+    data: np.random.Generator
+    independent: np.random.Generator
+    high_ip: np.random.Generator
+
+    def take(self, count: int) -> dict[str, np.ndarray]:
+        vectors = _synthetic_vectors(
+            self.distribution, self.dimension, count, self.data
+        )
+        independent, high_ip = _query_fixture(
+            vectors, self.independent, self.high_ip
+        )
+        return {
+            "vectors": vectors,
+            "independent_queries": independent,
+            "high_inner_product_queries": high_ip,
+        }
+
+
+def _synthetic_stream(
+    *,
+    distribution: str,
+    dimension: int,
+    data_seed: int,
+    independent_query_seed: int,
+    high_inner_product_noise_seed: int,
+) -> _SyntheticStream:
+    return _SyntheticStream(
+        distribution=distribution,
+        dimension=dimension,
+        data=np.random.Generator(np.random.PCG64(data_seed)),
+        independent=np.random.Generator(
+            np.random.PCG64(independent_query_seed)
+        ),
+        high_ip=np.random.Generator(
+            np.random.PCG64(high_inner_product_noise_seed)
+        ),
+    )
+
+
+def generate_synthetic_fixture(
+    *,
+    distribution: str,
+    dimension: int,
+    count: int,
+    data_seed: int,
+    independent_query_seed: int,
+    high_inner_product_noise_seed: int,
+) -> dict[str, np.ndarray]:
+    """Generate a deterministic in-memory fixture for tests and small probes."""
+    return _synthetic_stream(
+        distribution=distribution,
+        dimension=dimension,
+        data_seed=data_seed,
+        independent_query_seed=independent_query_seed,
+        high_inner_product_noise_seed=high_inner_product_noise_seed,
+    ).take(count)
+
+
+@dataclass
+class _Moments:
+    count: int = 0
+    total: float = 0.0
+    total_square: float = 0.0
+
+    def add(self, values: np.ndarray | torch.Tensor) -> None:
+        if isinstance(values, torch.Tensor):
+            array = values.detach().cpu().numpy()
+        else:
+            array = np.asarray(values)
+        array = np.asarray(array, dtype=np.float64).reshape(-1)
+        if array.size == 0 or not np.all(np.isfinite(array)):
+            raise ValueError("statistics require finite non-empty observations")
+        self.count += int(array.size)
+        self.total += float(array.sum(dtype=np.float64))
+        self.total_square += float(np.square(array).sum(dtype=np.float64))
+
+    def mean(self) -> float:
+        if self.count == 0:
+            raise ValueError("mean requires observations")
+        return self.total / self.count
+
+    def signed_summary(self) -> dict[str, object]:
+        if self.count < 2:
+            raise ValueError("Student-t summary requires at least two observations")
+        bias = self.total / self.count
+        variance = (
+            self.total_square - self.count * bias * bias
+        ) / (self.count - 1)
+        standard_deviation = math.sqrt(max(0.0, variance))
+        sem = standard_deviation / math.sqrt(self.count)
+        critical = float(student_t.ppf(0.975, df=self.count - 1))
+        return {
+            "count": self.count,
+            "rmse": math.sqrt(self.total_square / self.count),
+            "signed_bias": bias,
+            "sample_standard_deviation": standard_deviation,
+            "sem": sem,
+            "student_t_95_ci": [
+                bias - critical * sem,
+                bias + critical * sem,
+            ],
+        }
+
+
+def summarize_signed_errors(values: np.ndarray) -> dict[str, object]:
+    moments = _Moments()
+    moments.add(values)
+    return moments.signed_summary()
+
+
+def physical_bytes_formula(
+    codec_name: str, dimension: int, nominal_total_bits: int, count: int
+) -> int:
+    mse_bits = nominal_total_bits if codec_name == "mse" else nominal_total_bits - 1
+    mse_bytes = math.ceil(dimension * mse_bits / 8) + 4
+    if codec_name == "mse":
+        return count * mse_bytes
+    if codec_name != "product":
+        raise ValueError(f"unknown codec: {codec_name}")
+    return count * (mse_bytes + math.ceil(dimension / 8) + 4)
+
+
+def product_float32_residual_expectation(
+    vectors: torch.Tensor,
+    mse_decoded: torch.Tensor,
+    stored_residual_norm: torch.Tensor,
+    queries: torch.Tensor,
+) -> torch.Tensor:
+    residual = vectors.to(torch.float64) - mse_decoded
+    residual_norm = torch.linalg.vector_norm(residual, dim=-1)
+    ratio = torch.zeros_like(residual_norm)
+    nonzero = residual_norm > 0
+    ratio[nonzero] = (
+        stored_residual_norm.to(torch.float64)[nonzero]
+        / residual_norm[nonzero]
+    )
+    expected = mse_decoded + residual * ratio.unsqueeze(-1)
+    return (queries.to(torch.float64) * expected).sum(dim=-1)
+
+
+def artifact_status(states: Iterable[str], *, dirty_source: bool) -> str:
+    outcomes = set(states)
+    if "invalid" in outcomes:
+        return "invalid"
+    if outcomes.intersection({"failed", "oom"}):
+        return "failed"
+    if dirty_source or outcomes.intersection({"unsupported", "unavailable"}):
+        return "partial"
+    return "qualified"
+
+
+def can_resume_row(
+    row: Mapping[str, Any], expected_fingerprint: Mapping[str, Any]
+) -> bool:
+    return (
+        row.get("status") in {"passed", "failed", "unsupported"}
+        and row.get("extensions", {}).get("resume_fingerprint")
+        == expected_fingerprint
+    )
+
+
+def _atomic_write(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def atomic_write_json(path: str | Path, payload: object) -> None:
+    _atomic_write(
+        Path(path),
+        json.dumps(
+            payload,
+            allow_nan=False,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n",
+    )
+
+
+def atomic_write_jsonl(
+    path: str | Path, rows: Iterable[Mapping[str, Any]]
+) -> None:
+    ordered = sorted(rows, key=lambda row: row["row_id"])
+    payload = b"".join(_canonical_bytes(row) + b"\n" for row in ordered)
+    _atomic_write(Path(path), payload)
+
+
+def _placeholder(
+    row_id: str, identity: Mapping[str, Any], reason: str
+) -> dict[str, Any]:
+    return {
+        "row_id": row_id,
+        "status": "invalid",
+        "reason": reason,
+        "identity": dict(identity),
+        "metrics": {},
+        "sidecars": [],
+        "extensions": {},
+    }
+
+
+def collect_rows(
+    row_dir: str | Path,
+    specs: Sequence[Mapping[str, Any]],
+    identity: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Load every expected row, replacing missing or malformed files explicitly."""
+    root = Path(row_dir)
+    rows: list[dict[str, Any]] = []
+    for spec in sorted(specs, key=lambda item: item["row_id"]):
+        row_id = spec["row_id"]
+        path = root / f"{row_id}.json"
+        if not path.is_file():
+            rows.append(_placeholder(row_id, identity, "missing expected row file"))
+            continue
+        try:
+            row = load_strict_json(path)
+            if not isinstance(row, dict):
+                raise ValueError("row payload is not an object")
+            if row.get("row_id") != row_id:
+                raise ValueError("row ID does not match filename")
+            if row.get("identity") != identity:
+                raise ValueError("row identity does not match artifact identity")
+            rows.append(row)
+        except (OSError, UnicodeError, ValueError) as exc:
+            rows.append(_placeholder(row_id, identity, f"malformed row file: {exc}"))
+    return rows
+
+
+def paired_seed_block_bootstrap(
+    product_seed_means: Sequence[float],
+    mse_seed_means: Sequence[float],
+    *,
+    seed: int,
+    iterations: int,
+) -> dict[str, object]:
+    """Percentile CI over paired seed-block mean differences."""
+    product = np.asarray(product_seed_means, dtype=np.float64)
+    mse = np.asarray(mse_seed_means, dtype=np.float64)
+    if product.ndim != 1 or product.shape != mse.shape or product.size < 2:
+        raise ValueError("paired bootstrap requires equally shaped seed vectors")
+    if not np.all(np.isfinite(product)) or not np.all(np.isfinite(mse)):
+        raise ValueError("paired bootstrap requires finite seed means")
+    differences = product - mse
+    generator = np.random.Generator(np.random.PCG64(seed))
+    sampled = generator.integers(
+        0, differences.size, size=(iterations, differences.size)
+    )
+    bootstrap_means = differences[sampled].mean(axis=1)
+    lower, upper = np.quantile(
+        bootstrap_means, (0.025, 0.975), method="linear"
+    )
+    return {
+        "method": "paired_seed_block_percentile_bootstrap",
+        "seed_block_count": int(differences.size),
+        "iterations": iterations,
+        "seed": seed,
+        "product_minus_mse_mean": float(differences.mean()),
+        "bootstrap_95_ci": [float(lower), float(upper)],
+    }
+
+
+def aggregate_product_comparisons(
+    rows: Sequence[Mapping[str, Any]], *, seed: int, iterations: int
+) -> list[dict[str, Any]]:
+    metric_paths = (
+        ("mean_squared_l2_error", ("mean_squared_l2_error",)),
+        ("queries.independent.rmse", ("queries", "independent", "rmse")),
+        (
+            "queries.high_inner_product.rmse",
+            ("queries", "high_inner_product", "rmse"),
+        ),
+    )
+    groups: dict[tuple[object, ...], dict[str, dict[int, float]]] = defaultdict(
+        lambda: {"mse": {}, "product": {}}
+    )
+    for row in rows:
+        if row.get("status") != "passed":
+            continue
+        spec = row.get("extensions", {}).get("row_spec", {})
+        if spec.get("dataset") != "synthetic":
+            continue
+        for metric_name, components in metric_paths:
+            metric: object = row.get("metrics", {})
+            for component in components:
+                if not isinstance(metric, Mapping):
+                    metric = None
+                    break
+                metric = metric.get(component)
+            if isinstance(metric, (int, float)) and math.isfinite(metric):
+                key = (
+                    spec.get("distribution"),
+                    spec.get("dimension"),
+                    spec.get("nominal_total_bits"),
+                    metric_name,
+                )
+                groups[key][spec["codec"]][spec["pair_id"]] = float(metric)
+    result: list[dict[str, Any]] = []
+    for key, codecs in sorted(groups.items()):
+        pair_ids = sorted(set(codecs["mse"]) & set(codecs["product"]))
+        if len(pair_ids) < 2:
+            continue
+        comparison = paired_seed_block_bootstrap(
+            [codecs["product"][pair_id] for pair_id in pair_ids],
+            [codecs["mse"][pair_id] for pair_id in pair_ids],
+            seed=seed,
+            iterations=iterations,
+        )
+        result.append(
+            {
+                "distribution": key[0],
+                "dimension": key[1],
+                "nominal_total_bits": key[2],
+                "metric": key[3],
+                **comparison,
+            }
+        )
+    return result
+
+
+def glove_selection_ids(
+    glove_config: Mapping[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    base_spec = glove_config["base_selection"]
+    if base_spec["algorithm"] == "literal_sorted_ids":
+        base = np.asarray(base_spec["ids"], dtype="<u4")
+    else:
+        train_count = glove_config["datasets"]["train"]["shape"][0]
+        generator = np.random.Generator(np.random.PCG64(base_spec["seed"]))
+        base = np.sort(
+            generator.choice(
+                train_count,
+                base_spec["count"],
+                replace=False,
+            )
+        ).astype("<u4")
+    query_spec = glove_config["query_selection"]
+    query = np.arange(
+        query_spec["start"], query_spec["stop"], dtype="<u4"
+    )
+    return base, query
+
+
+def _json_attribute(value: object) -> object:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value
+
+
+def validate_glove_file(
+    path: str | Path, expected: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Verify the pinned file before opening its datasets read-only."""
+    source = Path(path)
+    actual_size = source.stat().st_size
+    if actual_size != expected["size_bytes"]:
+        raise ValueError(
+            f"GloVe size mismatch: expected {expected['size_bytes']}, "
+            f"got {actual_size}"
+        )
+    actual_sha = sha256_file(source)
+    if actual_sha != expected["sha256"]:
+        raise ValueError(
+            f"GloVe SHA-256 mismatch: expected {expected['sha256']}, "
+            f"got {actual_sha}"
+        )
+    try:
+        import h5py
+    except ImportError as exc:
+        raise ModuleNotFoundError("h5py is required for GloVe retrieval") from exc
+    metadata: dict[str, Any] = {
+        "size_bytes": actual_size,
+        "sha256": actual_sha,
+        "datasets": {},
+        "attributes": {},
+    }
+    with h5py.File(source, "r") as handle:
+        metadata["attributes"] = {
+            key: _json_attribute(value) for key, value in handle.attrs.items()
+        }
+        for name, declaration in expected["datasets"].items():
+            if name not in handle:
+                raise ValueError(f"GloVe dataset is missing: {name}")
+            dataset = handle[name]
+            actual_shape = list(dataset.shape)
+            if actual_shape != declaration["shape"]:
+                raise ValueError(
+                    f"GloVe {name} shape mismatch: expected "
+                    f"{declaration['shape']}, got {actual_shape}"
+                )
+            metadata["datasets"][name] = {
+                "shape": actual_shape,
+                "dtype": str(dataset.dtype),
+                "chunks": list(dataset.chunks) if dataset.chunks else None,
+                "compression": dataset.compression,
+            }
+    return metadata
+
+
+def _read_h5_rows(
+    dataset: Any, ids: np.ndarray, *, read_chunk_size: int
+) -> np.ndarray:
+    if ids.ndim != 1 or np.any(ids[:-1] >= ids[1:]):
+        raise ValueError("HDF5 row IDs must be strictly increasing")
+    output = np.empty((len(ids), dataset.shape[1]), dtype=dataset.dtype)
+    for output_start in range(0, len(ids), read_chunk_size):
+        output_stop = min(output_start + read_chunk_size, len(ids))
+        selected = ids[output_start:output_stop].astype(np.int64, copy=False)
+        source_start = int(selected[0])
+        source_stop = int(selected[-1]) + 1
+        if source_stop - source_start <= 4 * len(selected):
+            span = np.empty(
+                (source_stop - source_start, dataset.shape[1]),
+                dtype=dataset.dtype,
+            )
+            dataset.read_direct(
+                span,
+                np.s_[source_start:source_stop, :],
+                np.s_[:, :],
+            )
+            output[output_start:output_stop] = span[selected - source_start]
+        else:
+            # Bounded, sorted fancy selections avoid h5py's huge point lists.
+            output[output_start:output_stop] = dataset[selected]
+    return output
+
+
+def load_normalized_glove_arrays(
+    path: str | Path,
+    base_ids: np.ndarray,
+    query_ids: np.ndarray,
+    *,
+    read_chunk_size: int = 512,
+) -> tuple[np.ndarray, np.ndarray]:
+    try:
+        import h5py
+    except ImportError as exc:
+        raise ModuleNotFoundError("h5py is required for GloVe retrieval") from exc
+    with h5py.File(Path(path), "r") as handle:
+        base = _read_h5_rows(
+            handle["train"], base_ids, read_chunk_size=read_chunk_size
+        )
+        query = _read_h5_rows(
+            handle["test"], query_ids, read_chunk_size=read_chunk_size
+        )
+    return _normalize_rows(base), _normalize_rows(query)
+
+
+def _retrieval_device(requested: str) -> torch.device:
+    if requested not in {"cpu", "cuda"}:
+        raise ValueError("retrieval device must be cpu or cuda")
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA retrieval scoring was requested but is unavailable")
+    return torch.device(requested)
+
+
+def _stream_top_k(
+    base: np.ndarray,
+    queries: np.ndarray,
+    *,
+    k: int,
+    chunk_size: int,
+    device: str,
+    transform: Any | None = None,
+) -> tuple[np.ndarray, float]:
+    torch_device = _retrieval_device(device)
+    query_tensor = torch.from_numpy(
+        np.asarray(queries, dtype=np.float32)
+    ).to(torch_device)
+    best_values: torch.Tensor | None = None
+    best_ids: torch.Tensor | None = None
+    scoring_seconds = 0.0
+    for start in range(0, len(base), chunk_size):
+        stop = min(start + chunk_size, len(base))
+        block = np.asarray(base[start:stop], dtype=np.float32)
+        if transform is not None:
+            block = transform(block)
+        if torch_device.type == "cuda":
+            torch.cuda.synchronize()
+        scoring_start = time.perf_counter()
+        block_tensor = torch.from_numpy(np.ascontiguousarray(block)).to(
+            torch_device
+        )
+        scores = query_tensor @ block_tensor.T
+        local_k = min(k, stop - start)
+        values, indices = torch.topk(scores, k=local_k, dim=1)
+        indices = indices + start
+        if best_values is None:
+            best_values, best_ids = values, indices
+        else:
+            candidate_values = torch.cat((best_values, values), dim=1)
+            candidate_ids = torch.cat((best_ids, indices), dim=1)
+            keep = min(k, candidate_values.shape[1])
+            best_values, positions = torch.topk(
+                candidate_values, k=keep, dim=1
+            )
+            best_ids = torch.gather(candidate_ids, 1, positions)
+        if torch_device.type == "cuda":
+            torch.cuda.synchronize()
+        scoring_seconds += time.perf_counter() - scoring_start
+    if best_ids is None:
+        raise ValueError("retrieval base must be non-empty")
+    return best_ids.cpu().numpy(), scoring_seconds
+
+
+def exact_top_one(
+    base: np.ndarray,
+    queries: np.ndarray,
+    *,
+    chunk_size: int,
+    device: str,
+) -> np.ndarray:
+    ranked, _ = _stream_top_k(
+        base,
+        queries,
+        k=1,
+        chunk_size=chunk_size,
+        device=device,
+    )
+    return ranked[:, 0].astype("<u4")
+
+
+def one_at_k(
+    true_top_one: np.ndarray,
+    approximate_ranked_ids: np.ndarray,
+    top_k: Sequence[int],
+) -> dict[str, float]:
+    truth = np.asarray(true_top_one).reshape(-1)
+    ranked = np.asarray(approximate_ranked_ids)
+    if ranked.ndim != 2 or ranked.shape[0] != truth.shape[0]:
+        raise ValueError("ranked IDs must have one row per exact top-one ID")
+    result: dict[str, float] = {}
+    for k in top_k:
+        if (
+            not isinstance(k, int)
+            or isinstance(k, bool)
+            or not 1 <= k <= ranked.shape[1]
+        ):
+            raise ValueError("each k must fit within the approximate ranking")
+        hits = np.any(ranked[:, :k] == truth[:, None], axis=1)
+        result[f"1@{k}"] = float(hits.mean())
+    return result
+
+
+def _codec(
+    codec_name: str,
+    dimension: int,
+    bits: int,
+    rotation_seed: int,
+    projection_seed: int | None,
+) -> TurboQuantMSEReference | TurboQuantProductReference:
+    key = (codec_name, dimension, bits, rotation_seed, projection_seed)
+    cached = _CODEC_CACHE.get(key)
+    if cached is not None:
+        return cached  # type: ignore[return-value]
+    if codec_name == "mse":
+        value: TurboQuantMSEReference | TurboQuantProductReference = (
+            TurboQuantMSEReference(
+                TurboQuantMSEConfig(dimension, bits, rotation_seed)
+            )
+        )
+    elif codec_name == "product":
+        if projection_seed is None:
+            raise ValueError("product codec requires a projection seed")
+        value = TurboQuantProductReference(
+            TurboQuantProductConfig(
+                dimension, bits, rotation_seed, projection_seed
+            )
+        )
+    else:
+        raise ValueError(f"unknown codec: {codec_name}")
+    _CODEC_CACHE[key] = value
+    return value
+
+
+@dataclass
+class _CodecMeasurements:
+    squared_error: _Moments
+    relative_error: _Moments
+    query_errors: dict[str, _Moments]
+    expectation_errors: dict[str, _Moments]
+    actual_bytes: int = 0
+    encode_seconds: float = 0.0
+    decode_seconds: float = 0.0
+
+
+def _new_measurements(
+    codec_name: str, *, include_query_metrics: bool = True
+) -> _CodecMeasurements:
+    return _CodecMeasurements(
+        squared_error=_Moments(),
+        relative_error=_Moments(),
+        query_errors=(
+            {
+                "independent": _Moments(),
+                "high_inner_product": _Moments(),
+            }
+            if include_query_metrics
+            else {}
+        ),
+        expectation_errors=(
+            {
+                "independent": _Moments(),
+                "high_inner_product": _Moments(),
+            }
+            if codec_name == "product" and include_query_metrics
+            else {}
+        ),
+    )
+
+
+def _measure_codec_block(
+    codec: TurboQuantMSEReference | TurboQuantProductReference,
+    codec_name: str,
+    vectors: np.ndarray,
+    queries: Mapping[str, np.ndarray] | None,
+    measurements: _CodecMeasurements,
+) -> np.ndarray:
+    tensor = torch.from_numpy(np.ascontiguousarray(vectors))
+    encode_start = time.perf_counter()
+    encoded = codec.encode(tensor)
+    measurements.encode_seconds += time.perf_counter() - encode_start
+    decode_start = time.perf_counter()
+    decoded = codec.decode(encoded)
+    measurements.decode_seconds += time.perf_counter() - decode_start
+    measurements.actual_bytes += codec.physical_nbytes(encoded)
+
+    source = tensor.to(torch.float64)
+    difference = source - decoded
+    squared = difference.square().sum(dim=-1)
+    denominator = source.square().sum(dim=-1)
+    measurements.squared_error.add(squared)
+    measurements.relative_error.add(squared / denominator)
+    if queries is not None:
+        for name, values in queries.items():
+            query = torch.from_numpy(np.ascontiguousarray(values)).to(torch.float64)
+            truth = (query * source).sum(dim=-1)
+            estimate = (query * decoded).sum(dim=-1)
+            measurements.query_errors[name].add(estimate - truth)
+    if codec_name == "product" and queries is not None:
+        assert isinstance(codec, TurboQuantProductReference)
+        assert measurements.expectation_errors
+        mse_decoded = codec._mse.decode(encoded.mse)
+        for name, values in queries.items():
+            query = torch.from_numpy(np.ascontiguousarray(values))
+            expected = product_float32_residual_expectation(
+                source,
+                mse_decoded,
+                encoded.residual_norm.reshape(-1),
+                query,
+            )
+            approximate = (query.to(torch.float64) * decoded).sum(dim=-1)
+            measurements.expectation_errors[name].add(
+                approximate - expected
+            )
+    return decoded.to(torch.float32).numpy()
+
+
+def _metrics_from_measurements(
+    measurements: _CodecMeasurements,
+    *,
+    codec_name: str,
+    dimension: int,
+    bits: int,
+    count: int,
+) -> dict[str, Any]:
+    formula_bytes = physical_bytes_formula(codec_name, dimension, bits, count)
+    if measurements.actual_bytes != formula_bytes:
+        raise ValueError(
+            "physical byte mismatch: "
+            f"actual={measurements.actual_bytes}, formula={formula_bytes}"
+        )
+    metrics: dict[str, Any] = {
+        "sample_count": count,
+        "dimension": dimension,
+        "mean_squared_l2_error": measurements.squared_error.mean(),
+        "relative_squared_error": measurements.relative_error.mean(),
+        "encode_latency_ms": measurements.encode_seconds * 1_000,
+        "decode_latency_ms": measurements.decode_seconds * 1_000,
+        "encode_latency_us_per_vector": (
+            measurements.encode_seconds * 1_000_000 / count
+        ),
+        "decode_latency_us_per_vector": (
+            measurements.decode_seconds * 1_000_000 / count
+        ),
+        "actual_physical_bytes": measurements.actual_bytes,
+        "formula_physical_bytes": formula_bytes,
+        "effective_physical_bits_per_coordinate": (
+            measurements.actual_bytes * 8 / (count * dimension)
+        ),
+        "nominal_total_bits_per_coordinate": bits,
+    }
+    if measurements.query_errors:
+        metrics["queries"] = {
+            name: values.signed_summary()
+            for name, values in measurements.query_errors.items()
+        }
+    if measurements.expectation_errors:
+        metrics["finite_float32_residual_expectation"] = (
+            {
+                name: values.signed_summary()
+                for name, values in measurements.expectation_errors.items()
+            }
+        )
+    return metrics
+
+
+def _run_synthetic_row(
+    spec: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    fingerprint: Mapping[str, Any],
+    *,
+    timing_class: str,
+) -> dict[str, Any]:
+    codec = _codec(
+        spec["codec"],
+        spec["dimension"],
+        spec["nominal_total_bits"],
+        spec["rotation_seed"],
+        spec["projection_seed"],
+    )
+    stream = _synthetic_stream(
+        distribution=spec["distribution"],
+        dimension=spec["dimension"],
+        data_seed=spec["data_seed"],
+        independent_query_seed=spec["independent_query_seed"],
+        high_inner_product_noise_seed=spec[
+            "high_inner_product_noise_seed"
+        ],
+    )
+    measurements = _new_measurements(spec["codec"])
+    processed = 0
+    while processed < spec["vector_count"]:
+        block_count = min(
+            spec["chunk_size"], spec["vector_count"] - processed
+        )
+        fixture = stream.take(block_count)
+        _measure_codec_block(
+            codec,
+            spec["codec"],
+            fixture["vectors"],
+            {
+                "independent": fixture["independent_queries"],
+                "high_inner_product": fixture[
+                    "high_inner_product_queries"
+                ],
+            },
+            measurements,
+        )
+        processed += block_count
+    metrics = _metrics_from_measurements(
+        measurements,
+        codec_name=spec["codec"],
+        dimension=spec["dimension"],
+        bits=spec["nominal_total_bits"],
+        count=spec["vector_count"],
+    )
+    return {
+        "row_id": spec["row_id"],
+        "status": "passed",
+        "reason": None,
+        "identity": dict(identity),
+        "metrics": metrics,
+        "sidecars": [],
+        "extensions": {
+            "row_spec": dict(spec),
+            "resume_fingerprint": dict(fingerprint),
+            "timing_class": timing_class,
+        },
+    }
+
+
+def score_glove_codec(
+    base: np.ndarray,
+    queries: np.ndarray,
+    exact_top_one_ids: np.ndarray,
+    *,
+    codec_name: str,
+    nominal_total_bits: int,
+    rotation_seed: int,
+    projection_seed: int,
+    chunk_size: int,
+    top_k: Sequence[int],
+    device: str,
+) -> dict[str, Any]:
+    codec = _codec(
+        codec_name,
+        base.shape[1],
+        nominal_total_bits,
+        rotation_seed,
+        projection_seed if codec_name == "product" else None,
+    )
+    measurements = _new_measurements(codec_name, include_query_metrics=False)
+
+    def transform(block: np.ndarray) -> np.ndarray:
+        return _measure_codec_block(
+            codec,
+            codec_name,
+            block,
+            None,
+            measurements,
+        )
+
+    ranked, scoring_seconds = _stream_top_k(
+        base,
+        queries,
+        k=max(top_k),
+        chunk_size=chunk_size,
+        device=device,
+        transform=transform,
+    )
+    metrics = _metrics_from_measurements(
+        measurements,
+        codec_name=codec_name,
+        dimension=base.shape[1],
+        bits=nominal_total_bits,
+        count=base.shape[0],
+    )
+    metrics.update(
+        {
+            "retrieval": one_at_k(exact_top_one_ids, ranked, top_k),
+            "retrieval_scoring_latency_ms": scoring_seconds * 1_000,
+            "retrieval_scoring_device": device,
+            "retrieval_scoring_chunk_size": chunk_size,
+            "retrieval_algorithm": (
+                "exact_chunked_brute_force_dot_product"
+            ),
+            "scoring_device": device,
+            "full_score_matrix_materialized": False,
+            "maximum_score_block": {
+                "rows": int(queries.shape[0]),
+                "columns": min(chunk_size, int(base.shape[0])),
+            },
+            "gpu_indexing_latency_ms": None,
+        }
+    )
+    return {"ranked_ids": ranked, "metrics": metrics}
+
+
+def _sidecar(path: Path) -> dict[str, Any]:
+    try:
+        relative = path.resolve().relative_to(ROOT.resolve()).as_posix()
+    except ValueError:
+        return {}
+    return {
+        "path": relative,
+        "sha256": sha256_file(path),
+        "available": True,
+    }
+
+
+def _run_glove_row(
+    spec: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    fingerprint: Mapping[str, Any],
+    *,
+    base: np.ndarray,
+    queries: np.ndarray,
+    exact_ids: np.ndarray,
+    top_k: Sequence[int],
+    chunk_size: int,
+    device: str,
+    sidecars: Sequence[Mapping[str, Any]],
+    timing_class: str,
+) -> dict[str, Any]:
+    scored = score_glove_codec(
+        base,
+        queries,
+        exact_ids,
+        codec_name=spec["codec"],
+        nominal_total_bits=spec["nominal_total_bits"],
+        rotation_seed=spec["rotation_seed"],
+        projection_seed=spec["projection_seed"] or 0,
+        chunk_size=chunk_size,
+        top_k=top_k,
+        device=device,
+    )
+    return {
+        "row_id": spec["row_id"],
+        "status": "passed",
+        "reason": None,
+        "identity": dict(identity),
+        "metrics": scored["metrics"],
+        "sidecars": list(sidecars),
+        "extensions": {
+            "row_spec": dict(spec),
+            "resume_fingerprint": dict(fingerprint),
+            "timing_class": timing_class,
+            "retrieval_scoring": {
+                "device": device,
+                "base_chunk_size": chunk_size,
+                "codec_encode_decode_device": "cpu",
+                "gpu_indexing_performed": False,
+                "retrieval_algorithm": (
+                    "exact_chunked_brute_force_dot_product"
+                ),
+                "scoring_device": device,
+                "full_score_matrix_materialized": False,
+                "maximum_score_block": {
+                    "rows": int(queries.shape[0]),
+                    "columns": min(chunk_size, int(base.shape[0])),
+                },
+            },
+        },
+    }
+
+
+def _unavailable_or_invalid_row(
+    spec: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    fingerprint: Mapping[str, Any],
+    *,
+    status: str,
+    reason: str,
+    timing_class: str,
+) -> dict[str, Any]:
+    return {
+        "row_id": spec["row_id"],
+        "status": status,
+        "reason": reason,
+        "identity": dict(identity),
+        "metrics": {},
+        "sidecars": [],
+        "extensions": {
+            "row_spec": dict(spec),
+            "resume_fingerprint": dict(fingerprint),
+            "timing_class": timing_class,
+        },
+    }
+
+
+def _download_atomic(url: str, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    try:
+        with urllib.request.urlopen(url) as response, temporary.open("wb") as target:
+            shutil.copyfileobj(response, target, length=1024 * 1024)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _execution_class(config: Mapping[str, Any]) -> dict[str, Any]:
+    cuda = capture_cuda_metadata()
+    cpu_model = platform.processor() or platform.machine()
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.is_file():
+        for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.lower().startswith("model name") and ":" in line:
+                cpu_model = line.split(":", 1)[1].strip()
+                break
+    return {
+        "name": config["execution_class"],
+        "gpu_name": cuda["gpu_name"] or "not_available",
+        "total_vram_bytes": cuda["gpu_total_vram_bytes"] or 1,
+        "driver_version": cuda["driver_version"] or "not_available",
+        "cuda_runtime": cuda["cuda_runtime"] or "not_available",
+        "extensions": {
+            "cuda_available": bool(cuda["cuda_available"]),
+            "environment": capture_env_metadata(),
+            "h5py_version": package_version("h5py"),
+            "runtime_lock_sha256": sha256_file(
+                ROOT / "requirements" / "runtime.lock"
+            ),
+            "cpu_model": cpu_model,
+            "operating_system": platform.platform(),
+            "torch_intraop_threads": torch.get_num_threads(),
+            "torch_interop_threads": torch.get_num_interop_threads(),
+            "timing_policy": {
+                "codec_setup_excluded": True,
+                "fixture_generation_excluded": True,
+                "base_device_transfer_in_retrieval_scoring": True,
+                "query_device_transfer_in_retrieval_scoring": False,
+            },
+        },
+    }
+
+
+def _source_metadata() -> dict[str, Any]:
+    source = capture_source_metadata(ROOT)
+    if source["git_commit"] != "unknown":
+        return source
+    root_text = str(ROOT)
+    command = "git"
+    if ROOT.as_posix().startswith("/mnt/"):
+        parts = ROOT.as_posix().split("/")
+        drive = parts[2].upper()
+        root_text = drive + ":\\" + "\\".join(parts[3:])
+        command = "git.exe"
+    base = [command, "-c", "safe.directory=*", "-C", root_text]
+    try:
+        commit = subprocess.check_output(
+            [*base, "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        status = subprocess.check_output(
+            [*base, "status", "--porcelain", "--untracked-files=normal"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return source
+    return {"git_commit": commit, "dirty": bool(status.strip())}
+
+
+def _paper(config: Mapping[str, Any]) -> dict[str, Any]:
+    reference = ROOT / config["paper_reference"]
+    payload = load_strict_json(reference)
+    return {
+        key: payload[key]
+        for key in ("paper_id", "source_url", "retrieved_at", "sha256")
+    }
+
+
+def build_manifest(
+    *,
+    config: Mapping[str, Any],
+    config_path: str | Path,
+    rows: Sequence[Mapping[str, Any]],
+    expected_row_ids: Sequence[str],
+    source: Mapping[str, Any],
+    execution_class: Mapping[str, Any],
+    paper: Mapping[str, Any],
+    retrieval_device: str = "cpu",
+    retrieval_chunk_size: int = DEFAULT_RETRIEVAL_CHUNK_SIZE,
+) -> dict[str, Any]:
+    counts = Counter(row["status"] for row in rows)
+    statistics = config["statistics"]
+    comparisons = aggregate_product_comparisons(
+        rows,
+        seed=statistics["seed"],
+        iterations=statistics["iterations"],
+    )
+    glove = config["glove200"]
+    query_count = (
+        glove["query_selection"]["stop"] - glove["query_selection"]["start"]
+    )
+    base_count = glove["base_selection"]["count"]
+    return {
+        "artifact_type": "codec_reproduction",
+        "schema_version": 2,
+        "artifact_id": config["artifact_id"],
+        "status": artifact_status(
+            (row["status"] for row in rows),
+            dirty_source=bool(source["dirty"]),
+        ),
+        "paper": dict(paper),
+        "source": dict(source),
+        "execution_class": dict(execution_class),
+        "identity": codec_identity(config_path),
+        "expected_row_ids": sorted(expected_row_ids),
+        "statistics": {
+            "method": statistics["method"],
+            "confidence_level": statistics["confidence_level"],
+            "seed": statistics["seed"],
+            "iterations": statistics["iterations"],
+            "extensions": {
+                "bootstrap_interval": "paired_seed_block_percentile_linear",
+                "student_t_degrees_of_freedom": "actual_n_minus_1",
+            },
+        },
+        "rows": sorted(rows, key=lambda row: row["row_id"]),
+        "pass_state_counts": {
+            state: counts[state] for state in V2_ROW_STATES
+        },
+        "claims": [],
+        "extensions": {
+            "config_sha256": sha256_file(config_path),
+            "claim_labels": list(config["claim_labels"]),
+            "timing_class": config["timing_class"],
+            "product_minus_mse_comparisons": comparisons,
+            "retrieval_policy": {
+                "device": retrieval_device,
+                "base_chunk_size": retrieval_chunk_size,
+                "codec_encode_decode_device": "cpu",
+                "gpu_indexing_performed": False,
+                "retrieval_algorithm": (
+                    "exact_chunked_brute_force_dot_product"
+                ),
+                "scoring_device": retrieval_device,
+                "full_score_matrix_materialized": False,
+                "maximum_score_block": {
+                    "rows": query_count,
+                    "columns": min(retrieval_chunk_size, base_count),
+                },
+            },
+        },
+    }
+
+
+def _input_hashes(
+    spec: Mapping[str, Any],
+    config: Mapping[str, Any],
+    *,
+    glove_actual_sha256: str | None,
+) -> dict[str, str]:
+    if spec["dataset"] == "synthetic":
+        fixture = {
+            key: spec[key]
+            for key in (
+                "distribution",
+                "dimension",
+                "fixture_id",
+                "data_seed",
+                "independent_query_seed",
+                "high_inner_product_noise_seed",
+                "vector_count",
+                "chunk_size",
+            )
+        }
+        return {"synthetic_fixture_sha256": _sha256_json(fixture)}
+    glove = config["glove200"]
+    return {
+        "dataset_sha256": glove_actual_sha256 or glove["sha256"],
+        "base_ids_sha256": glove["base_selection"]["sha256"],
+        "query_ids_sha256": glove["query_selection"]["sha256"],
+    }
+
+
+def _fingerprint(
+    spec: Mapping[str, Any],
+    config_path: Path,
+    input_hashes: Mapping[str, str],
+    *,
+    retrieval_device: str,
+    retrieval_chunk_size: int,
+) -> dict[str, Any]:
+    return {
+        "protocol": RESUME_PROTOCOL,
+        "identity": codec_identity(config_path),
+        "config_sha256": sha256_file(config_path),
+        "row_spec_sha256": _sha256_json(spec),
+        "input_sha256": dict(input_hashes),
+        "code_sha256": _behavior_sha256(),
+        "retrieval_policy": {
+            "device": retrieval_device,
+            "base_chunk_size": retrieval_chunk_size,
+        },
+    }
+
+
+def _load_resumable(
+    path: Path,
+    fingerprint: Mapping[str, Any],
+    identity: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        row = load_strict_json(path)
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if (
+        isinstance(row, dict)
+        and row.get("identity") == identity
+        and can_resume_row(row, fingerprint)
+    ):
+        return row
+    return None
+
+
+def _prepare_glove(
+    config: Mapping[str, Any],
+    dataset_cache: Path,
+    output_dir: Path,
+    *,
+    allow_download: bool,
+    retrieval_device: str,
+    retrieval_chunk_size: int,
+) -> dict[str, Any]:
+    glove = config["glove200"]
+    path = dataset_cache / glove["filename"]
+    if not path.is_file():
+        if not allow_download:
+            return {"state": "unavailable", "reason": "verified GloVe file unavailable"}
+        try:
+            _download_atomic(glove["url"], path)
+        except (OSError, urllib.error.URLError) as exc:
+            return {"state": "unavailable", "reason": f"GloVe download unavailable: {exc}"}
+    try:
+        metadata = validate_glove_file(path, glove)
+    except ModuleNotFoundError as exc:
+        return {"state": "unavailable", "reason": str(exc)}
+    except (OSError, ValueError) as exc:
+        return {"state": "invalid", "reason": str(exc)}
+    base_ids, query_ids = glove_selection_ids(glove)
+    try:
+        base, queries = load_normalized_glove_arrays(path, base_ids, query_ids)
+    except (OSError, ValueError, ModuleNotFoundError) as exc:
+        return {"state": "invalid", "reason": f"GloVe computation error: {exc}"}
+    exact = exact_top_one(
+        base,
+        queries,
+        chunk_size=retrieval_chunk_size,
+        device=retrieval_device,
+    )
+    sidecar_values = {
+        "glove200-base-ids.u32": base_ids,
+        "glove200-query-ids.u32": query_ids,
+        "glove200-subset-exact-top1.u32": exact,
+    }
+    declared: list[dict[str, Any]] = []
+    for name, values in sidecar_values.items():
+        sidecar_path = output_dir / name
+        _atomic_write(sidecar_path, values.astype("<u4", copy=False).tobytes())
+        declaration = _sidecar(sidecar_path)
+        if declaration:
+            declared.append(declaration)
+    return {
+        "state": "ready",
+        "metadata": metadata,
+        "base": base,
+        "queries": queries,
+        "exact": exact,
+        "sidecars": declared,
+        "sha256": metadata["sha256"],
+    }
+
+
+def _write_aggregate_outputs(
+    *,
+    output_dir: Path,
+    config: Mapping[str, Any],
+    config_path: Path,
+    specs: Sequence[Mapping[str, Any]],
+    identity: Mapping[str, Any],
+    source: Mapping[str, Any],
+    execution_class: Mapping[str, Any],
+    paper: Mapping[str, Any],
+    retrieval_device: str,
+    retrieval_chunk_size: int,
+) -> dict[str, Any]:
+    rows = collect_rows(output_dir / "rows", specs, identity)
+    atomic_write_jsonl(output_dir / "rows.jsonl", rows)
+    manifest = build_manifest(
+        config=config,
+        config_path=config_path,
+        rows=rows,
+        expected_row_ids=[spec["row_id"] for spec in specs],
+        source=source,
+        execution_class=execution_class,
+        paper=paper,
+        retrieval_device=retrieval_device,
+        retrieval_chunk_size=retrieval_chunk_size,
+    )
+    atomic_write_json(output_dir / "manifest.json", manifest)
+    return manifest
+
+
+def execute_reproduction(
+    *,
+    config_path: str | Path,
+    output_dir: str | Path,
+    dataset_cache: str | Path,
+    allow_download: bool = True,
+    retrieval_device: str = "cpu",
+    retrieval_chunk_size: int = DEFAULT_RETRIEVAL_CHUNK_SIZE,
+) -> dict[str, Any]:
+    """Execute or resume all declared rows and atomically rebuild the artifact."""
+    path = Path(config_path).resolve()
+    output = Path(output_dir).resolve()
+    cache = Path(dataset_cache).expanduser().resolve()
+    if retrieval_chunk_size <= 0:
+        raise ValueError("retrieval_chunk_size must be positive")
+    _retrieval_device(retrieval_device)
+    config = load_config(path)
+    specs = build_row_specs(config)
+    identity = codec_identity(path)
+    source = _source_metadata()
+    execution = _execution_class(config)
+    paper = _paper(config)
+    rows_dir = output / "rows"
+    rows_dir.mkdir(parents=True, exist_ok=True)
+
+    glove_specs = [spec for spec in specs if spec["dataset"] == "glove200"]
+    glove_context: dict[str, Any] | None = None
+    try:
+        for spec in specs:
+            if spec["dataset"] == "glove200" and glove_context is None:
+                glove_context = _prepare_glove(
+                    config,
+                    cache,
+                    output,
+                    allow_download=allow_download,
+                    retrieval_device=retrieval_device,
+                    retrieval_chunk_size=retrieval_chunk_size,
+                )
+            actual_glove_sha = (
+                glove_context.get("sha256")
+                if glove_context and glove_context["state"] == "ready"
+                else None
+            )
+            fingerprint = _fingerprint(
+                spec,
+                path,
+                _input_hashes(
+                    spec,
+                    config,
+                    glove_actual_sha256=actual_glove_sha,
+                ),
+                retrieval_device=retrieval_device,
+                retrieval_chunk_size=retrieval_chunk_size,
+            )
+            row_path = rows_dir / f"{spec['row_id']}.json"
+            if _load_resumable(row_path, fingerprint, identity) is not None:
+                continue
+            try:
+                if spec["dataset"] == "synthetic":
+                    row = _run_synthetic_row(
+                        spec,
+                        identity,
+                        fingerprint,
+                        timing_class=config["timing_class"],
+                    )
+                elif glove_context and glove_context["state"] == "ready":
+                    row = _run_glove_row(
+                        spec,
+                        identity,
+                        fingerprint,
+                        base=glove_context["base"],
+                        queries=glove_context["queries"],
+                        exact_ids=glove_context["exact"],
+                        top_k=config["glove200"]["top_k"],
+                        chunk_size=retrieval_chunk_size,
+                        device=retrieval_device,
+                        sidecars=glove_context["sidecars"],
+                        timing_class=config["timing_class"],
+                    )
+                else:
+                    assert glove_context is not None
+                    row = _unavailable_or_invalid_row(
+                        spec,
+                        identity,
+                        fingerprint,
+                        status=glove_context["state"],
+                        reason=glove_context["reason"],
+                        timing_class=config["timing_class"],
+                    )
+            except (MemoryError, torch.OutOfMemoryError) as exc:
+                row = _unavailable_or_invalid_row(
+                    spec,
+                    identity,
+                    fingerprint,
+                    status="oom",
+                    reason=f"out of memory: {exc}",
+                    timing_class=config["timing_class"],
+                )
+            except (ArithmeticError, RuntimeError, TypeError, ValueError) as exc:
+                row = _unavailable_or_invalid_row(
+                    spec,
+                    identity,
+                    fingerprint,
+                    status="invalid",
+                    reason=f"computation error: {exc}",
+                    timing_class=config["timing_class"],
+                )
+            atomic_write_json(row_path, row)
+    finally:
+        manifest = _write_aggregate_outputs(
+            output_dir=output,
+            config=config,
+            config_path=path,
+            specs=specs,
+            identity=identity,
+            source=source,
+            execution_class=execution,
+            paper=paper,
+            retrieval_device=retrieval_device,
+            retrieval_chunk_size=retrieval_chunk_size,
+        )
+    if len(glove_specs) == 0:
+        raise ValueError("config must declare at least one GloVe row")
+    return manifest
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--dataset-cache", type=Path, required=True)
+    parser.add_argument(
+        "--retrieval-device",
+        choices=("cpu", "cuda"),
+        default="cpu",
+    )
+    parser.add_argument(
+        "--retrieval-base-chunk-size",
+        type=int,
+        default=DEFAULT_RETRIEVAL_CHUNK_SIZE,
+    )
+    parser.add_argument(
+        "--no-download",
+        action="store_true",
+        help="record missing GloVe input as unavailable without downloading",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    manifest = execute_reproduction(
+        config_path=args.config,
+        output_dir=args.output_dir,
+        dataset_cache=args.dataset_cache,
+        allow_download=not args.no_download,
+        retrieval_device=args.retrieval_device,
+        retrieval_chunk_size=args.retrieval_base_chunk_size,
+    )
+    print(
+        json.dumps(
+            {
+                "artifact_id": manifest["artifact_id"],
+                "status": manifest["status"],
+                "pass_state_counts": manifest["pass_state_counts"],
+                "manifest": str(args.output_dir / "manifest.json"),
+            },
+            sort_keys=True,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -12,6 +12,7 @@ license = { file = "LICENSE" }
 
 [project.optional-dependencies]
 gpu = ["triton>=3.3"]
+retrieval = ["h5py>=3.16,<4"]
 
 [tool.pytest.ini_options]
 addopts = "--strict-markers"

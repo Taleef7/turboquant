@@ -1,0 +1,135 @@
+{
+  "config_version": 1,
+  "artifact_id": "codec-local-v1",
+  "artifact_type": "codec_reproduction",
+  "paper_reference": "docs/references/turboquant-2504.19874v1.json",
+  "execution_class": "local_rtx5070ti_12gb",
+  "timing_class": "local_reference_cpu_timing",
+  "seed_pairs": [
+    {"pair_id": 0, "rotation_seed": 10000, "projection_seed": 1000000},
+    {"pair_id": 1, "rotation_seed": 10001, "projection_seed": 1000001},
+    {"pair_id": 2, "rotation_seed": 10002, "projection_seed": 1000002},
+    {"pair_id": 3, "rotation_seed": 10003, "projection_seed": 1000003},
+    {"pair_id": 4, "rotation_seed": 10004, "projection_seed": 1000004},
+    {"pair_id": 5, "rotation_seed": 10005, "projection_seed": 1000005},
+    {"pair_id": 6, "rotation_seed": 10006, "projection_seed": 1000006},
+    {"pair_id": 7, "rotation_seed": 10007, "projection_seed": 1000007},
+    {"pair_id": 8, "rotation_seed": 10008, "projection_seed": 1000008},
+    {"pair_id": 9, "rotation_seed": 10009, "projection_seed": 1000009},
+    {"pair_id": 10, "rotation_seed": 10010, "projection_seed": 1000010},
+    {"pair_id": 11, "rotation_seed": 10011, "projection_seed": 1000011},
+    {"pair_id": 12, "rotation_seed": 10012, "projection_seed": 1000012},
+    {"pair_id": 13, "rotation_seed": 10013, "projection_seed": 1000013},
+    {"pair_id": 14, "rotation_seed": 10014, "projection_seed": 1000014},
+    {"pair_id": 15, "rotation_seed": 10015, "projection_seed": 1000015}
+  ],
+  "synthetic": {
+    "dimensions": [64, 128, 256],
+    "vector_count": 10000,
+    "chunk_size": 2048,
+    "codecs": {
+      "mse": {"nominal_total_bits": [1, 2, 3, 4]},
+      "product": {"nominal_total_bits": [2, 3, 4]}
+    },
+    "distributions": [
+      {
+        "name": "sphere",
+        "definition": "normalized_iid_gaussian_rows",
+        "parameters": {}
+      },
+      {
+        "name": "gaussian",
+        "definition": "iid_normal",
+        "parameters": {"mean": 0.0, "coordinate_standard_deviation": "1/sqrt(d)"}
+      },
+      {
+        "name": "heavy_tail",
+        "definition": "iid_student_t",
+        "parameters": {"degrees_of_freedom": 3, "scale": "1/sqrt(3*d)"}
+      },
+      {
+        "name": "outlier",
+        "definition": "(z + 8*s*e_j)/sqrt(65)",
+        "parameters": {
+          "z": "iid_normal(0,1/d)",
+          "coordinate": "uniform_integer_[0,d)",
+          "sign": "independent_rademacher",
+          "amplitude": 8.0,
+          "normalizer": "sqrt(65)"
+        }
+      }
+    ],
+    "fixtures": [
+      {"fixture_id": 0, "distribution": "sphere", "dimension": 64, "data_seed": 3000000, "independent_query_seed": 4000000, "high_inner_product_noise_seed": 5000000},
+      {"fixture_id": 1, "distribution": "sphere", "dimension": 128, "data_seed": 3000001, "independent_query_seed": 4000001, "high_inner_product_noise_seed": 5000001},
+      {"fixture_id": 2, "distribution": "sphere", "dimension": 256, "data_seed": 3000002, "independent_query_seed": 4000002, "high_inner_product_noise_seed": 5000002},
+      {"fixture_id": 3, "distribution": "gaussian", "dimension": 64, "data_seed": 3000003, "independent_query_seed": 4000003, "high_inner_product_noise_seed": 5000003},
+      {"fixture_id": 4, "distribution": "gaussian", "dimension": 128, "data_seed": 3000004, "independent_query_seed": 4000004, "high_inner_product_noise_seed": 5000004},
+      {"fixture_id": 5, "distribution": "gaussian", "dimension": 256, "data_seed": 3000005, "independent_query_seed": 4000005, "high_inner_product_noise_seed": 5000005},
+      {"fixture_id": 6, "distribution": "heavy_tail", "dimension": 64, "data_seed": 3000006, "independent_query_seed": 4000006, "high_inner_product_noise_seed": 5000006},
+      {"fixture_id": 7, "distribution": "heavy_tail", "dimension": 128, "data_seed": 3000007, "independent_query_seed": 4000007, "high_inner_product_noise_seed": 5000007},
+      {"fixture_id": 8, "distribution": "heavy_tail", "dimension": 256, "data_seed": 3000008, "independent_query_seed": 4000008, "high_inner_product_noise_seed": 5000008},
+      {"fixture_id": 9, "distribution": "outlier", "dimension": 64, "data_seed": 3000009, "independent_query_seed": 4000009, "high_inner_product_noise_seed": 5000009},
+      {"fixture_id": 10, "distribution": "outlier", "dimension": 128, "data_seed": 3000010, "independent_query_seed": 4000010, "high_inner_product_noise_seed": 5000010},
+      {"fixture_id": 11, "distribution": "outlier", "dimension": 256, "data_seed": 3000011, "independent_query_seed": 4000011, "high_inner_product_noise_seed": 5000011}
+    ],
+    "queries": {
+      "independent": {
+        "definition": "normalized_iid_gaussian_rows"
+      },
+      "high_inner_product": {
+        "definition": "q=0.8*u+0.6*v",
+        "u": "normalized_input_vector",
+        "v": "independent_gaussian_orthogonalized_against_u_and_normalized",
+        "u_coefficient": 0.8,
+        "v_coefficient": 0.6
+      }
+    }
+  },
+  "glove200": {
+    "url": "https://ann-benchmarks.com/glove-200-angular.hdf5",
+    "filename": "glove-200-angular.hdf5",
+    "sha256": "4839085e5a8bb293434a1a66e1aa0193afc3f07c6797a85f1dbd91656172da20",
+    "size_bytes": 962819488,
+    "datasets": {
+      "train": {"shape": [1183514, 200]},
+      "test": {"shape": [10000, 200]},
+      "neighbors": {"shape": [10000, 100]}
+    },
+    "base_selection": {
+      "algorithm": "numpy.Generator(PCG64).choice_without_replacement_then_sort",
+      "seed": 20260731,
+      "count": 100000,
+      "dtype": "little-endian uint32",
+      "sha256": "4465179f0175fbc0a43621e61c5472bff7c70361a7512b34245ff3e47b135c40"
+    },
+    "query_selection": {
+      "start": 0,
+      "stop": 10000,
+      "dtype": "little-endian uint32",
+      "sha256": "9140e019602b8628f6f4a6aac3658bf206e332a92943eb113fb2b465fecc55d6"
+    },
+    "codecs": ["mse", "product"],
+    "nominal_total_bits": [2, 4],
+    "top_k": [1, 10, 100],
+    "classification": "v1_partial_reproduction"
+  },
+  "statistics": {
+    "method": "deterministic_paired_seed_block_bootstrap",
+    "confidence_level": 0.95,
+    "seed": 1729,
+    "iterations": 10000,
+    "student_t_confidence_level": 0.95
+  },
+  "claim_labels": [
+    "forge_local_synthetic",
+    "not_paper_scale",
+    "v1_partial_reproduction",
+    "unknown_original_sample_ids",
+    "unknown_paper_codec_variant",
+    "accepted_revision_protocol_changed",
+    "external_reproducibility_dispute_open",
+    "local_reference_cpu_timing",
+    "nominal_width_not_physical_bit_parity"
+  ]
+}
