@@ -620,7 +620,36 @@ runtime input/lock, and keep the 918 MiB source outside Git. If the dependency
 or verified dataset is unavailable, emit all 64 GloVe rows as `unavailable`;
 never invent a successful sidecar.
 
-- [ ] **Step 4: Execute the local synthetic matrix**
+- [ ] **Step 4: Exercise the runner before commit**
+
+Run the focused contract suite, including the reduced end-to-end configuration,
+before committing the implementation. Do not present a full matrix emitted from
+this dirty implementation worktree as canonical evidence: schema v2 correctly
+classifies dirty-source evidence as `partial`.
+
+```bash
+python -m pytest tests/test_codec_reproduction.py -q
+```
+
+Expected: the reduced end-to-end case performs real chunked codec work, writes
+and validates a complete miniature artifact, and proves deterministic resume.
+
+- [ ] **Step 5: Commit runner/config/tests**
+
+```bash
+git add scripts/run_codec_reproduction.py tests/test_codec_reproduction.py \
+  configs/benchmarks/codec-local-v1.json pyproject.toml \
+  requirements/runtime.in requirements/runtime.lock
+git commit -m "feat: add local TurboQuant codec reproduction"
+```
+
+- [ ] **Step 6: Execute the canonical matrix from the reviewed commit**
+
+After independent code review passes, run the canonical matrix from a clean
+detached worktree at the accepted Task 6 commit. If review changes that commit,
+discard the superseded result and rerun from the amended clean commit. This
+keeps the artifact's source identity truthful even when the controller
+worktree contains unrelated pre-existing changes.
 
 ```bash
 python scripts/run_codec_reproduction.py \
@@ -644,15 +673,6 @@ Public claims for this artifact carry:
 Task 6 does not add RaBitQ/PQ baselines or adjudicate the 2026 reproducibility
 dispute; it prevents local numbers from inheriting contested superiority or
 timing claims.
-
-- [ ] **Step 5: Commit runner/config/tests**
-
-```bash
-git add scripts/run_codec_reproduction.py tests/test_codec_reproduction.py \
-  configs/benchmarks/codec-local-v1.json pyproject.toml \
-  requirements/runtime.in requirements/runtime.lock
-git commit -m "feat: add local TurboQuant codec reproduction"
-```
 
 ### Task 7: Publish the first transparent reproduction report
 
