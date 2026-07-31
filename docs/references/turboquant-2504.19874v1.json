@@ -1,0 +1,15 @@
+{
+  "paper_id": "arxiv:2504.19874v1",
+  "source_url": "https://arxiv.org/pdf/2504.19874v1",
+  "retrieved_at": "2026-07-31T06:23:40Z",
+  "sha256": "431eb13926e10491f5fbd0bebd0813c51bd6c1e884426a1500c5db640b2997ab",
+  "title": "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate",
+  "authors": [
+    "Amir Zandieh",
+    "Majid Daliri",
+    "Majid Hadian",
+    "Vahab Mirrokni"
+  ],
+  "license": "CC BY 4.0",
+  "source_scope": "Paper identity and mathematical formulas only; no external implementation source was inspected."
+}
