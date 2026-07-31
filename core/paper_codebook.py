@@ -238,6 +238,161 @@ def _lloyd_update(
     )
 
 
+def _arcsine_interval_mean(lower: float, upper: float) -> float:
+    """Return the exact conditional mean for the d=2 arcsine density."""
+
+    angle_width = math.asin(upper) - math.asin(lower)
+    lower_height = math.sqrt((1 - lower) * (1 + lower))
+    upper_height = math.sqrt((1 - upper) * (1 + upper))
+    height_difference = (
+        (upper - lower)
+        * (upper + lower)
+        / (lower_height + upper_height)
+    )
+    return height_difference / angle_width
+
+
+def _arcsine_lloyd_update(positive: np.ndarray) -> np.ndarray:
+    boundaries = np.concatenate(
+        (
+            [0.0],
+            (positive[:-1] + positive[1:]) / 2,
+            [1.0],
+        )
+    )
+    return np.asarray(
+        [
+            _arcsine_interval_mean(lower, upper)
+            for lower, upper in itertools.pairwise(boundaries.tolist())
+        ],
+        dtype=np.float64,
+    )
+
+
+def _validate_positive_centroids(positive: np.ndarray) -> None:
+    if (
+        positive.ndim != 1
+        or not np.all(np.isfinite(positive))
+        or positive[0] <= 0
+        or positive[-1] >= 1
+        or not np.all(np.diff(positive) > 0)
+    ):
+        raise _InvalidSolverCandidate
+
+
+def _arcsine_lloyd_jacobian(positive: np.ndarray) -> np.ndarray:
+    """Return the analytic tridiagonal Jacobian of update(c) - c."""
+
+    _validate_positive_centroids(positive)
+    count = positive.shape[0]
+    boundaries = np.concatenate(
+        (
+            [0.0],
+            (positive[:-1] + positive[1:]) / 2,
+            [1.0],
+        )
+    )
+    jacobian = np.zeros((count, count), dtype=np.float64)
+
+    for index, (lower, upper) in enumerate(
+        itertools.pairwise(boundaries.tolist())
+    ):
+        angle_width = math.asin(upper) - math.asin(lower)
+        mean = _arcsine_interval_mean(lower, upper)
+        jacobian[index, index] = -1
+
+        if index > 0:
+            lower_height = math.sqrt((1 - lower) * (1 + lower))
+            derivative = (mean - lower) / (lower_height * angle_width)
+            jacobian[index, index - 1] += derivative / 2
+            jacobian[index, index] += derivative / 2
+
+        if index + 1 < count:
+            upper_height = math.sqrt((1 - upper) * (1 + upper))
+            derivative = (upper - mean) / (upper_height * angle_width)
+            jacobian[index, index] += derivative / 2
+            jacobian[index, index + 1] += derivative / 2
+
+    return jacobian
+
+
+def _solve_high_resolution_arcsine_codebook(
+    bits: int,
+    iterations: int,
+    tolerance: float,
+) -> _LloydMaxSolution:
+    """Solve the d=2 fixed point directly within the residual-call budget."""
+
+    levels = 1 << bits
+    positive_levels = levels // 2
+    initial_boundaries = np.sin(
+        np.pi * np.arange(positive_levels + 1, dtype=np.float64) / levels
+    )
+    initial_positive = np.asarray(
+        [
+            _arcsine_interval_mean(lower, upper)
+            for lower, upper in itertools.pairwise(
+                initial_boundaries.tolist()
+            )
+        ],
+        dtype=np.float64,
+    )
+    evaluations = 0
+    residual_cache: dict[tuple[float, ...], np.ndarray] = {}
+
+    def fixed_point_residual(positive: np.ndarray) -> np.ndarray:
+        nonlocal evaluations
+        key = tuple(float(value) for value in positive)
+        cached = residual_cache.get(key)
+        if cached is not None:
+            return cached.copy()
+        if evaluations >= iterations:
+            raise _EvaluationBudgetExhausted
+        _validate_positive_centroids(positive)
+        residual = _arcsine_lloyd_update(positive) - positive
+        evaluations += 1
+        residual_cache[key] = residual
+        return residual.copy()
+
+    try:
+        initial_residual = fixed_point_residual(initial_positive)
+        if float(np.max(np.abs(initial_residual))) <= tolerance:
+            positive = initial_positive
+            final_residual = initial_residual
+        else:
+            solver_result = root(
+                fixed_point_residual,
+                initial_positive,
+                jac=_arcsine_lloyd_jacobian,
+                method="hybr",
+                options={"maxfev": iterations, "xtol": tolerance},
+            )
+            positive = np.asarray(solver_result.x, dtype=np.float64)
+            final_residual = fixed_point_residual(positive)
+    except (_EvaluationBudgetExhausted, _InvalidSolverCandidate) as error:
+        raise RuntimeError(
+            "Lloyd-Max did not converge "
+            f"for dimension=2, bits={bits} after "
+            f"{iterations} evaluations"
+        ) from error
+
+    max_change = float(np.max(np.abs(final_residual)))
+    if not math.isfinite(max_change) or max_change > tolerance:
+        raise RuntimeError(
+            "Lloyd-Max did not converge "
+            f"for dimension=2, bits={bits} after "
+            f"{evaluations} evaluations"
+        )
+
+    _validate_positive_centroids(positive)
+    negative = tuple(-float(value) for value in reversed(positive))
+    return _LloydMaxSolution(
+        centroids=negative + tuple(float(value) for value in positive),
+        evaluations=evaluations,
+        max_change=max_change,
+    )
+
+
 def _positive_centroids_to_logits(positive: np.ndarray) -> np.ndarray:
     spacings = np.diff(np.concatenate(([0.0], positive, [1.0])))
     if not np.all(np.isfinite(spacings)) or not np.all(spacings > 0):
@@ -268,6 +423,13 @@ def _cached_lloyd_max_sphere_codebook(
     iterations: int,
     tolerance: float,
 ) -> _LloydMaxSolution:
+    if dimension == 2 and bits >= 6:
+        return _solve_high_resolution_arcsine_codebook(
+            bits,
+            iterations,
+            tolerance,
+        )
+
     levels = 1 << bits
     exponent = (dimension - 3) / 2
     log_coefficient = _log_density_coefficient(dimension)

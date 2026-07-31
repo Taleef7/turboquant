@@ -238,6 +238,36 @@ def test_d2_codebooks_are_warning_free_converged_and_deterministic() -> None:
     ]
 
 
+@pytest.mark.parametrize("bits", [6, 7, 8])
+def test_d2_high_resolution_codebooks_use_exact_arcsine_fixed_point(
+    bits: int,
+) -> None:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", IntegrationWarning)
+
+        codebook = lloyd_max_sphere_codebook(2, bits)
+
+    assert codebook.shape == (1 << bits,)
+    assert torch.all(codebook[1:] > codebook[:-1])
+    assert torch.equal(codebook, -codebook.flip(0))
+    assert torch.equal(codebook, lloyd_max_sphere_codebook(2, bits))
+    assert _lloyd_max_residual(codebook, 2) <= 1e-12
+    assert not [
+        warning
+        for warning in caught
+        if issubclass(warning.category, IntegrationWarning)
+    ]
+
+
+def test_d2_high_resolution_solver_honors_residual_evaluation_budget() -> None:
+    with pytest.raises(RuntimeError, match="after 1 evaluations"):
+        lloyd_max_sphere_codebook(
+            2,
+            8,
+            iterations=1,
+        )
+
+
 def test_integration_warning_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     real_quad = paper_codebook.quad
 
