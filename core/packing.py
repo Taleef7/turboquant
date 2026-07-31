@@ -7,11 +7,11 @@ import math
 import torch
 
 
-_INDEX_BITS = frozenset({2, 3, 4, 5, 6, 7, 8})
+_INDEX_BITS = frozenset({1, 2, 3, 4, 5, 6, 7, 8})
 
 
 def _require_builtin_int(value: object, name: str, *, minimum: int = 1) -> int:
-    if type(value) is not int:
+    if type(value) is not int:  # noqa: E721
         raise TypeError(f"{name} must be a built-in int.")
     if value < minimum:
         raise ValueError(f"{name} must be at least {minimum}.")
