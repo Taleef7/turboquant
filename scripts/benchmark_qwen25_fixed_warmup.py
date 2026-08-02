@@ -188,6 +188,35 @@ def validate_warmup_artifact(
         errors.append("diagnostic artifact claims must be empty")
     if artifact.get("config") != config:
         errors.append("artifact config does not match the predeclared config")
+    artifact_source = artifact.get("source_identity")
+    source_valid = isinstance(artifact_source, Mapping)
+    if not source_valid:
+        errors.append("artifact source_identity is missing")
+    else:
+        commit = artifact_source.get("git_commit")
+        if (
+            not isinstance(commit, str)
+            or len(commit) != 40
+            or any(character not in "0123456789abcdef" for character in commit)
+        ):
+            errors.append("artifact source_identity git_commit is invalid")
+        if artifact_source.get("model_id") != config["model_id"]:
+            errors.append("artifact source_identity model_id is invalid")
+        if artifact_source.get("model_revision") != config["model_revision"]:
+            errors.append("artifact source_identity model_revision is invalid")
+        if not isinstance(artifact_source.get("dirty"), bool):
+            errors.append("artifact source_identity dirty flag is invalid")
+        fixture = artifact_source.get("model_fixture")
+        if fixture is not None:
+            if not isinstance(fixture, Mapping):
+                errors.append("artifact model_fixture identity is invalid")
+            else:
+                if fixture.get("snapshot_id") != config["model_revision"]:
+                    errors.append("artifact model_fixture snapshot_id is invalid")
+                if fixture.get("manifest_sha256") != config["fixture_manifest_sha256"]:
+                    errors.append("artifact model_fixture manifest is invalid")
+                if not isinstance(fixture.get("resolved_path"), str):
+                    errors.append("artifact model_fixture resolved_path is missing")
     expected = expected_row_ids(config)
     rows = artifact.get("rows")
     observed = (
@@ -218,6 +247,8 @@ def validate_warmup_artifact(
             errors.append(f"row {index} has invalid status")
         if not isinstance(row.get("source_identity"), Mapping):
             errors.append(f"row {index} source_identity is missing")
+        elif source_valid and row["source_identity"] != artifact_source:
+            errors.append(f"row {index} source_identity disagrees with artifact")
         if status == "unavailable" and not isinstance(row.get("reason"), str):
             errors.append(f"row {index} unavailable reason is missing")
         if status in {"error", "oom"} and not isinstance(row.get("exception"), str):

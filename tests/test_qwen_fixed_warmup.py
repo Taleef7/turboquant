@@ -162,6 +162,12 @@ def test_validator_rejects_gate_and_dispatch_mutations() -> None:
     assert not result.valid
     assert any("decode_p95_ms disagrees" in error for error in result.errors)
 
+    artifact = _completed_fixture(config)
+    artifact["source_identity"]["git_commit"] = "unknown"
+    result = validate_warmup_artifact(artifact, config)
+    assert not result.valid
+    assert any("git_commit" in error for error in result.errors)
+
 
 def test_validator_returns_errors_for_malformed_completed_rows() -> None:
     config = load_warmup_config(CONFIG)
