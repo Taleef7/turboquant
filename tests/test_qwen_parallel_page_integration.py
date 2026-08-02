@@ -177,6 +177,8 @@ def test_parallel_decode_dispatch_reuses_workspace_and_arena_pointers(
     with session._active("prefill"):
         session.cache.update(keys, values, 0)
         session.cache.update(keys, values, 1)
+    session._prepare_parallel_decode_state()
+    assert set(session._parallel_prepared_codecs) == {0, 1}
     query = torch.randn((1, 28, 1, 128), device=device, dtype=torch.float16)
     expected = {
         layer_idx: _reference(query, _reference_store(session, keys, values, layer_idx))
@@ -189,15 +191,6 @@ def test_parallel_decode_dispatch_reuses_workspace_and_arena_pointers(
         layer_idx: stores[layer_idx].arena.data_pointers() for layer_idx in (0, 1)
     }
 
-    with session._active("decode"):
-        actual0, _ = qwen25_packed_attention(
-            session.layers[0],
-            query,
-            keys[..., :1, :],
-            values[..., :1, :],
-            None,
-            scaling=1 / 128**0.5,
-        )
     workspace = session._parallel_workspace
     assert workspace is not None
     workspace_pointers = tuple(
@@ -207,12 +200,27 @@ def test_parallel_decode_dispatch_reuses_workspace_and_arena_pointers(
     def reject_hot_path_allocation(*args: object, **kwargs: object) -> torch.Tensor:
         raise AssertionError("parallel decode allocated after first-use setup")
 
+    from core.codec import KeyCodec
+
+    def reject_late_codec_prepare(*args: object, **kwargs: object) -> object:
+        raise AssertionError("parallel decode prepared a codec after prefill")
+
     with monkeypatch.context() as guarded:
+        guarded.setattr(KeyCodec, "prepare_device", reject_late_codec_prepare)
         guarded.setattr(torch, "empty", reject_hot_path_allocation)
+        with session._active("decode"):
+            actual0, _ = qwen25_packed_attention(
+                session.layers[0],
+                query,
+                keys[..., :1, :],
+                values[..., :1, :],
+                None,
+                scaling=1 / 128**0.5,
+            )
         actual0_repeat = session.packed_decode(
             session.layers[0], query, scale=1 / 128**0.5
         )
-    actual1 = session.packed_decode(session.layers[1], query, scale=1 / 128**0.5)
+        actual1 = session.packed_decode(session.layers[1], query, scale=1 / 128**0.5)
 
     for actual, reference in (
         (actual0, expected[0]),
@@ -248,6 +256,7 @@ def test_parallel_decode_handles_nonidentity_layer_rotation_and_tail_only_histor
     values = torch.randn_like(keys)
     with session._active("prefill"):
         session.cache.update(keys, values, 1)
+    session._prepare_parallel_decode_state()
     store = session.cache.store_for(1)
     assert store.arena is not None and store.arena.used_pages == 0
     rotation = store.key_codec.prepare_device(device).rotation
@@ -262,3 +271,52 @@ def test_parallel_decode_handles_nonidentity_layer_rotation_and_tail_only_histor
     assert actual.shape == expected.shape == (1, 1, 28, 128)
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
     assert session.metrics.parallel_decode_calls == 1
+
+
+@pytest.mark.gpu
+def test_short_tail_prewarm_covers_every_decoded_layer_without_late_allocations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 17-token prompt must not lazily prepare layer constants at decode."""
+    _require_gpu_triton()
+    torch.manual_seed(26_008)
+    session = _parallel_session(maximum_sequence_length=383)
+    device = torch.device("cuda")
+    keys = torch.randn((1, 4, 17, 128), device=device, dtype=torch.float16)
+    values = torch.randn_like(keys)
+    with session._active("prefill"):
+        session.cache.update(keys, values, 0)
+        session.cache.update(keys, values, 1)
+    session._prepare_parallel_decode_state()
+    assert set(session._parallel_prepared_codecs) == {0, 1}
+    query = torch.randn((1, 28, 1, 128), device=device, dtype=torch.float16)
+    expected = {
+        layer_idx: _reference(query, _reference_store(session, keys, values, layer_idx))
+        .transpose(1, 2)
+        .contiguous()
+        for layer_idx in (0, 1)
+    }
+    workspace = session._parallel_workspace
+    assert workspace is not None
+    workspace_pointers = tuple(
+        tensor.data_ptr() for tensor in workspace.__dict__.values()
+    )
+    from core.codec import KeyCodec
+
+    def reject_late_prepare(*args: object, **kwargs: object) -> object:
+        raise AssertionError("short-tail decode prepared a codec after prefill")
+
+    def reject_allocation(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("short-tail decode allocated after prefill setup")
+
+    with monkeypatch.context() as guarded:
+        guarded.setattr(KeyCodec, "prepare_device", reject_late_prepare)
+        guarded.setattr(torch, "empty", reject_allocation)
+        actual0 = session.packed_decode(session.layers[0], query, scale=1 / 128**0.5)
+        actual1 = session.packed_decode(session.layers[1], query, scale=1 / 128**0.5)
+    torch.testing.assert_close(actual0, expected[0], rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual1, expected[1], rtol=1e-2, atol=1e-2)
+    assert (
+        tuple(tensor.data_ptr() for tensor in workspace.__dict__.values())
+        == workspace_pointers
+    )

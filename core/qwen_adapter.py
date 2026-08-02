@@ -184,6 +184,7 @@ class PackedAttentionSession:
         self._parallel_workspace: Any | None = None
         self._parallel_workspace_device: torch.device | None = None
         self._parallel_outputs: dict[int, torch.Tensor] = {}
+        self._parallel_prepared_codecs: dict[int, Any] = {}
         self.compare_packed_reference = False
         self.use_packed_reference_backend = False
 
@@ -277,6 +278,8 @@ class PackedAttentionSession:
                 use_cache=True,
                 logits_to_keep=1,
             )
+        if self.use_parallel_page_attention:
+            self._prepare_parallel_decode_state()
         self._last_logits = result.logits
         return result
 
@@ -392,6 +395,30 @@ class PackedAttentionSession:
         self._prepared_layers[layer_idx] = cached
         return cached
 
+    def _prepare_parallel_decode_state(self) -> None:
+        """Prewarm all CUDA constants and reusable outputs after prefill."""
+        if not self.use_parallel_page_attention:
+            return
+        device = self.cache._device
+        if device is None:
+            raise UnsupportedCapabilityError(
+                "parallel page attention requires a populated cache after prefill."
+            )
+        if device.type != "cuda":
+            # Keep the CPU path fail-closed at decode rather than silently
+            # switching to the legacy serial backend.
+            return
+        if self.cache._dtype not in (torch.float16, torch.bfloat16):
+            raise UnsupportedCapabilityError(
+                "parallel page attention requires a stable fp16 or bf16 cache dtype."
+            )
+        for layer_idx, store in enumerate(self.cache._stores):
+            if store is not None:
+                self._parallel_prepared_codecs[
+                    layer_idx
+                ] = store.key_codec.prepare_device(device)
+        self._parallel_workspace_for(device)
+
     def _parallel_workspace_for(self, device: torch.device) -> Any:
         from core.parallel_page_workspace import reserve_parallel_page_workspace
 
@@ -470,7 +497,11 @@ class PackedAttentionSession:
                 "parallel page attention requires the canonical Qwen2.5 packed layout."
             )
         workspace = self._parallel_workspace_for(query.device)
-        prepared_codec = store.key_codec.prepare_device(query.device)  # type: ignore[attr-defined]
+        prepared_codec = self._parallel_prepared_codecs.get(layer_idx)
+        if prepared_codec is None:
+            raise UnsupportedCapabilityError(
+                "parallel decode state must be prewarmed after prompt prefill."
+            )
         launch_qwen25_query_rotation(query, prepared_codec.rotation, workspace)
         launch_qwen25_page_states(
             query,
