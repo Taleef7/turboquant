@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import torch
 import pytest
+import torch
 
 from core.codec import KeyCodec, KeyLayout, ValueCodec, ValueLayout
 from core.packed_page_arena import PackedPageArena, PackedPageArenaLayout
@@ -54,7 +54,10 @@ def test_8k_prefill_copies_only_final_arena_destinations(
         )
     }
     copies: list[int] = []
+    prompt_sized_allocations: list[torch.Tensor] = []
     original_copy = torch.Tensor.copy_
+    original_empty = torch.empty
+    original_empty_like = torch.empty_like
 
     def track_copy(
         self: torch.Tensor, source: torch.Tensor, *args: object, **kwargs: object
@@ -63,7 +66,23 @@ def test_8k_prefill_copies_only_final_arena_destinations(
             copies.append(self.numel() * self.element_size())
         return original_copy(self, source, *args, **kwargs)
 
+    def track_empty(*args: object, **kwargs: object) -> torch.Tensor:
+        result = original_empty(*args, **kwargs)
+        if result.numel() >= 8192 * 4 * 128:
+            prompt_sized_allocations.append(result)
+        return result
+
+    def track_empty_like(
+        source: torch.Tensor, *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        result = original_empty_like(source, *args, **kwargs)
+        if result.numel() >= 8192 * 4 * 128:
+            prompt_sized_allocations.append(result)
+        return result
+
     monkeypatch.setattr(torch.Tensor, "copy_", track_copy)
+    monkeypatch.setattr(torch, "empty", track_empty)
+    monkeypatch.setattr(torch, "empty_like", track_empty_like)
     tokens = 8192
     keys = torch.randn((1, 4, tokens, 128), dtype=torch.float16)
     store.append(keys, keys + 1)
@@ -78,6 +97,7 @@ def test_8k_prefill_copies_only_final_arena_destinations(
     assert arena.tail_length == tail_tokens
     assert len(copies) == pages * 5 + 2
     assert sum(copies) == pages * page_bytes + tail_bytes
+    assert prompt_sized_allocations == []
     assert store.physical_nbytes().workspace == 2 * 4 * 383 * 128 * 2
 
 
