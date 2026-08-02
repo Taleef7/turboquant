@@ -518,6 +518,8 @@ def _validate_tail(
         raise ValueError("tail_length must fit the supplied tail capacity.")
     if type(tail_head_stride) is not int or type(tail_token_stride) is not int:  # noqa: E721
         raise TypeError("tail strides must be built-in ints.")
+    if tail_head_stride <= 0 or tail_token_stride <= 0:
+        raise ValueError("tail strides must be positive.")
     if tail_head_stride != tail_keys.stride(
         1
     ) or tail_head_stride != tail_values.stride(1):
