@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "artifact_type": "qwen25_fixed_warmup",
+  "name": "qwen25-fixed-warmup-v1",
+  "model_id": "Qwen/Qwen2.5-7B-Instruct",
+  "model_revision": "a09a35458c702b33eeacc393d103063234e8bc28",
+  "fixture_manifest_sha256": "439db8405dc165561eb248284eea98b5bcd88fb18ba153825b456950b58043c5",
+  "contexts": [1024, 2048],
+  "warmup_tokens": 1,
+  "measured_decode_tokens": 3,
+  "repeats": 3,
+  "backends": [
+    "baseline",
+    "packed_reference",
+    "serial_direct",
+    "parallel_direct"
+  ],
+  "quality_gates": {
+    "max_abs_logit": 0.01,
+    "mean_abs_logit": 0.001,
+    "kl_divergence": 0.0001,
+    "top1_agreement": 1.0,
+    "greedy_agreement": 1.0
+  }
+}

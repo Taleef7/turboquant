@@ -49,6 +49,21 @@ Use `--allow-download` only when network access is intentional.  This replay
 does not publish an end-to-end speed or VRAM claim; it is the fixed-token
 qualification input for a later systems gate.
 
+## `benchmark_qwen25_fixed_warmup.py`
+
+Runs the same fixed token stream through the four Qwen2.5 lanes with one
+unmeasured warmup decode followed by three measured decode tokens across three
+fresh repeats.  The artifact reports per-token samples, p50/p95, first-run vs
+steady-state timings, dispatch counters, cache logical/physical/unique bytes,
+runtime allocator peaks, and source identity.  It is diagnostic-only and uses
+the same pinned model fixture and strict quality gate as the replay:
+
+```bash
+python scripts/benchmark_qwen25_fixed_warmup.py \
+  --model-path /home/taleef/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
+  --output artifacts/qwen25-fixed-warmup.json
+```
+
 ## `benchmark_parallel_page_attention.py`
 
 Runs the serial packed-page diagnostic used to freeze the page-attention
