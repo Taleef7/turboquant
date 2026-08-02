@@ -15,6 +15,7 @@ from scripts.benchmark_qwen25_fixed_warmup import (
     run_warmup,
     validate_warmup_artifact,
 )
+from scripts.repro_utils import sha256_file
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -209,6 +210,43 @@ def test_unavailable_artifact_is_explicit_and_valid() -> None:
     assert artifact["status"] == "unavailable"
     assert artifact["claims"] == []
     assert len(artifact["rows"]) == 8
+
+
+def test_source_identity_binds_shared_and_warmup_runners() -> None:
+    config = load_warmup_config(CONFIG)
+    artifact = build_unavailable_artifact(
+        config, config_path=CONFIG, reason="missing fixture"
+    )
+    source = artifact["source_identity"]
+    assert source["runner_sha256"] == sha256_file(
+        ROOT / "scripts" / "replay_qwen25_fixed_tokens.py"
+    )
+    assert source["warmup_runner_sha256"] == sha256_file(
+        ROOT / "scripts" / "benchmark_qwen25_fixed_warmup.py"
+    )
+    result = validate_warmup_artifact(artifact, config)
+    assert result.valid, result.errors
+
+
+def test_validator_accepts_legacy_artifact_without_warmup_runner_hash() -> None:
+    config = load_warmup_config(CONFIG)
+    artifact = build_unavailable_artifact(
+        config, config_path=CONFIG, reason="legacy fixture"
+    )
+    artifact["source_identity"].pop("warmup_runner_sha256")
+    result = validate_warmup_artifact(artifact, config)
+    assert result.valid, result.errors
+
+
+def test_validator_rejects_wrong_warmup_runner_hash() -> None:
+    config = load_warmup_config(CONFIG)
+    artifact = build_unavailable_artifact(
+        config, config_path=CONFIG, reason="tampered runner"
+    )
+    artifact["source_identity"]["warmup_runner_sha256"] = "0" * 64
+    result = validate_warmup_artifact(artifact, config)
+    assert not result.valid
+    assert any("warmup_runner_sha256" in error for error in result.errors)
 
 
 def test_stats_reports_p50_p95_and_mean() -> None:

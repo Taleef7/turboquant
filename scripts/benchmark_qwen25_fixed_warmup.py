@@ -35,7 +35,7 @@ from scripts.replay_qwen25_fixed_tokens import (  # noqa: E402
     _memory_runtime,
     _quality,
     _snapshot_logits,
-    _source_identity,
+    _source_identity as _shared_source_identity,
     _timed,
 )
 from scripts.repro_utils import (  # noqa: E402
@@ -44,6 +44,7 @@ from scripts.repro_utils import (  # noqa: E402
     benchmark_binding,
     capture_env_metadata,
     git_commit_sha,
+    sha256_file,
     seed_everything,
     write_json,
 )
@@ -54,6 +55,14 @@ WARMUP_CONTEXT_ALLOWLIST = {
     "qwen25-fixed-warmup-v1": [1024, 2048],
     "qwen25-fixed-warmup-local-v2": [4096, 8192],
 }
+
+
+def _source_identity(config_path: Path) -> dict[str, Any]:
+    """Bind warmup artifacts to both shared replay and warmup runner code."""
+    return {
+        **_shared_source_identity(config_path),
+        "warmup_runner_sha256": sha256_file(Path(__file__)),
+    }
 
 
 def load_warmup_config(path: str | Path = CONFIG_PATH) -> dict[str, Any]:
@@ -227,6 +236,24 @@ def validate_warmup_artifact(
             errors.append("artifact source_identity model_revision is invalid")
         if not isinstance(artifact_source.get("dirty"), bool):
             errors.append("artifact source_identity dirty flag is invalid")
+        warmup_runner_sha256 = artifact_source.get("warmup_runner_sha256")
+        if warmup_runner_sha256 is not None:
+            if (
+                not isinstance(warmup_runner_sha256, str)
+                or len(warmup_runner_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in warmup_runner_sha256
+                )
+            ):
+                errors.append(
+                    "artifact source_identity warmup_runner_sha256 is invalid"
+                )
+            elif warmup_runner_sha256 != sha256_file(Path(__file__)):
+                errors.append(
+                    "artifact source_identity warmup_runner_sha256 does not match "
+                    "the warmup runner"
+                )
         fixture = artifact_source.get("model_fixture")
         if fixture is not None:
             if not isinstance(fixture, Mapping):
