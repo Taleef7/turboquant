@@ -14,7 +14,7 @@ import pytest
 
 from scripts.benchmark_schema import validate_artifact, validate_v2_artifact
 import scripts.repro_utils as repro_utils
-from scripts.repro_utils import capture_source_metadata
+from scripts.repro_utils import capture_source_metadata, git_commit_sha
 from tests.test_benchmark_schema import complete_matrix
 
 
@@ -582,3 +582,12 @@ def test_source_metadata_resolves_wsl_worktree_pointer_and_detached_head(
     )
     detached = capture_source_metadata(worktree)
     assert detached == {"git_commit": expected_commit, "dirty": True}
+
+
+def test_git_commit_sha_defaults_to_current_worktree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(ROOT)
+    expected = git_commit_sha(ROOT)
+    assert expected != "unknown"
+    assert git_commit_sha() == expected

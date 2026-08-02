@@ -103,7 +103,8 @@ def _git_output(root: Path | None, args: list[str]) -> str:
 
 def git_commit_sha(root: str | Path | None = None) -> str:
     try:
-        return _git_output(None if root is None else Path(root), ["rev-parse", "HEAD"])
+        root_path = Path.cwd() if root is None else Path(root)
+        return _git_output(root_path, ["rev-parse", "HEAD"])
     except Exception:
         return "unknown"
 
