@@ -2,13 +2,65 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
-[![CUDA](https://img.shields.io/badge/CUDA-12.8%2B-76B900.svg)](https://pytorch.org/get-started/locally/)
+[![CUDA tested](https://img.shields.io/badge/CUDA-tested%2012.8-76B900.svg)](https://pytorch.org/get-started/locally/)
+[![CI](https://github.com/Taleef7/turboquant/actions/workflows/ci.yml/badge.svg)](https://github.com/Taleef7/turboquant/actions/workflows/ci.yml)
 
 TurboQuant Forge is a clean-room, evidence-first KV-cache research backend for
 Hugging Face Qwen2.5. It physically bit-packs fixed KV blocks and evaluates
 them with blockwise PyTorch reference attention and direct Triton decode
-kernels. The project treats every performance, memory, and quality statement as
-an artifact-backed claim rather than an extrapolation.
+kernels. Every performance, memory, and quality statement is tied to a raw,
+hash-bound artifact rather than an extrapolation.
+
+> **Research status:** active engineering prototype. The narrow Qwen2.5 path is
+> implemented and tested; compressed full-logit quality and end-to-end serving
+> wins are not yet qualified.
+
+## At a glance
+
+| Surface | Current state |
+| --- | --- |
+| KV storage | Physically packed fixed 256-token blocks with exact byte accounting |
+| Attention | PyTorch packed reference plus direct Triton score/value kernels |
+| Model adapter | Qwen2.5-7B-Instruct only; text, batch 1, one GPU, greedy decode |
+| Canonical quality | Exact 4K/8K NIAH matrix qualified in the named artifact |
+| 32K | Capacity admission failed before a 32K child launched |
+| End-to-end win | Not established; the canonical 8K systems run is negative |
+| Portability | Qwen3, Qwen3.5, and Gemma 4 are manifest-only and fail closed |
+
+The project is designed to make a negative result useful: failed gates,
+capacity stops, allocator peaks, dispatch counters, environment details, and
+raw logs are retained instead of being silently converted into a success claim.
+
+## Latest measured snapshot
+
+These are diagnostic measurements, not new release claims. See the linked raw
+artifact pages for the exact matrix, validator, and limitations.
+
+| Experiment | Observed result |
+| --- | --- |
+| Qwen2.5 warmup, 4K/8K | Cache-store savings of 36.9%/44.8%; all six packed rows fail strict full-logit gates while preserving top-1/greedy choices in the small matrix |
+| Fused page attention, 3–63 pages | 25.2–79.5% faster than serial synthetic scheduling, deterministic, max error `1.05e-05` |
+| Value-bit ablation, v6 vs v8 | v8 is roughly 12% larger and 49–59.5% slower; both candidates fail strict full-logit gates |
+
+These numbers are deliberately scoped to the local RTX 5070 Ti fixture. They
+are not claims about Gilbreth hardware, other models, or production serving.
+
+## Design overview
+
+The direct path keeps prefill conventional and changes only the one-token
+decode path:
+
+1. Hugging Face Qwen2.5 produces standard K/V during prefill.
+2. `PackedKVBlockStore` stores fixed blocks using physically packed low-bit
+   indices plus a bounded fp16/bf16 tail.
+3. A packed PyTorch reference defines correctness independently of Triton.
+4. Triton kernels rotate queries, score packed pages, mix values, and merge
+   page states without reconstructing the full KV history.
+5. Validators bind model, profile, runner, configuration, source commit, and
+   environment hashes before a result can be treated as evidence.
+
+This separation makes it possible to optimize the GPU schedule without hiding
+quality drift or confusing KV-store bytes with total allocator VRAM.
 
 ## Current status
 
@@ -131,10 +183,20 @@ The second command currently exits nonzero unless every context, provenance, and
 quality gate passes. Use [the protocol](docs/BENCHMARK_PROTOCOL.md) to interpret
 `qualified`, `failed`, `invalid`, and `inconclusive` states.
 
+## Continue on Purdue Gilbreth
+
+The repository is ready for a controlled cluster handoff, not an assumption
+that local CUDA wheels or VRAM will transfer unchanged. Start with
+[GILBRETH_HANDOFF.md](docs/GILBRETH_HANDOFF.md): it records the exact branch and
+artifact state, the Slurm account/partition/QOS checks, environment capture,
+durable raw-artifact transfer, and the ordered 16K/32K experiment matrix. A
+cluster agent should begin with a tiny preflight and 4K/8K parity before
+attempting longer contexts.
+
 ## Documentation map
 
-- [Results](docs/RESULTS.md): current artifact-backed 8K result, 32K capacity
-  stop, systems comparison, and retired invalid v4 history.
+- [Results](docs/RESULTS.md): canonical release-ladder 8K result, 32K capacity
+  stop, systems comparison, and the latest diagnostic checkpoint.
 - [Local long-context results](docs/LOCAL_LONG_CONTEXT_RESULTS.md): clean
   Qwen2.5 4K/8K warmup artifact with quality, storage, timing, and limits.
 - [Local fused page results](docs/LOCAL_FUSED_PAGE_RESULTS.md): clean synthetic
