@@ -70,6 +70,7 @@ def _completed_fixture(config: dict) -> dict:
             "packed_reference_decode_calls": 0,
             "parallel_decode_calls": 0,
             "parallel_page_launches": 0,
+            "parallel_reduce_tail_launches": 0,
             "parallel_reduction_launches": 0,
             "parallel_tail_launches": 0,
             "fallback": False,
@@ -86,8 +87,7 @@ def _completed_fixture(config: dict) -> dict:
                     "packed_decode_calls": layer_calls,
                     "parallel_decode_calls": layer_calls,
                     "parallel_page_launches": layer_calls,
-                    "parallel_reduction_launches": layer_calls,
-                    "parallel_tail_launches": layer_calls,
+                    "parallel_reduce_tail_launches": layer_calls,
                 }
             )
         row.update(
@@ -270,10 +270,10 @@ def test_validator_rejects_quality_gate_mutation() -> None:
 def test_validator_rejects_parallel_dispatch_mutation() -> None:
     config = load_replay_config(CONFIG)
     artifact = _completed_fixture(config)
-    artifact["rows"][3]["dispatch"]["parallel_tail_launches"] = 0
+    artifact["rows"][3]["dispatch"]["parallel_reduce_tail_launches"] = 0
     result = validate_replay_artifact(artifact, config)
     assert not result.valid
-    assert any("parallel parallel_tail_launches" in error for error in result.errors)
+    assert any("parallel parallel_reduce_tail_launches" in error for error in result.errors)
 
 
 def test_validator_rejects_memory_undercount_mutation() -> None:

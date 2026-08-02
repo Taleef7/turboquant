@@ -31,6 +31,7 @@ def _metrics(page_count: int) -> dict[str, object]:
             "page": page_count,
             "reduction": 0,
             "tail": 1,
+            "reduce_tail": 0,
             "fallback": 0,
             "allocation": 4 + 3 * page_count,
         },
@@ -167,16 +168,22 @@ def test_parallel_contract_requires_reduction_and_tail_launches() -> None:
         row = copy.deepcopy(row)
         row["row_id"] = row["row_id"].replace("serial-", "parallel-")
         row["metrics"]["launch_counts"].update(  # type: ignore[index]
-            {"page": 1, "reduction": 1, "tail": 1, "allocation": 0}
+            {
+                "page": 1,
+                "reduction": 0,
+                "tail": 0,
+                "reduce_tail": 1,
+                "allocation": 0,
+            }
         )
         rows.append(row)
     artifact["rows"] = rows
     result = validate_parallel_page_artifact(artifact)
     assert result.valid, result.errors
-    rows[0]["metrics"]["launch_counts"]["reduction"] = 0  # type: ignore[index]
+    rows[0]["metrics"]["launch_counts"]["reduce_tail"] = 0  # type: ignore[index]
     result = validate_parallel_page_artifact(artifact)
     assert not result.valid
-    assert any("reduction" in error for error in result.errors)
+    assert any("reduce_tail" in error for error in result.errors)
 
 
 def test_mixed_contract_rejects_inconsistent_serial_parallel_tail_accounting() -> None:
@@ -186,7 +193,13 @@ def test_mixed_contract_rejects_inconsistent_serial_parallel_tail_accounting() -
         row = copy.deepcopy(row)
         row["row_id"] = row["row_id"].replace("serial-", "parallel-")
         row["metrics"]["launch_counts"].update(  # type: ignore[index]
-            {"page": 1, "reduction": 1, "tail": 1, "allocation": 0}
+            {
+                "page": 1,
+                "reduction": 0,
+                "tail": 0,
+                "reduce_tail": 1,
+                "allocation": 0,
+            }
         )
         row["metrics"]["memory"]["tail_logical_bytes"] = 256  # type: ignore[index]
         row["metrics"]["memory"]["tail_capacity_bytes"] = 256  # type: ignore[index]

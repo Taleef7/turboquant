@@ -13,7 +13,10 @@ from core.packed_page_arena import PackedPageArena, PackedPageArenaLayout
 from core.packing import pack_indices, unpack_indices
 from kernels.qwen25_parallel_page_attention import (
     ParallelPageWorkspace,
+    launch_qwen25_page_reduce_tail_merge,
+    launch_qwen25_page_reduction,
     launch_qwen25_page_states,
+    launch_qwen25_tail_merge,
     page_state_grid,
 )
 
@@ -125,6 +128,64 @@ def _oracle(
                 "n,nd->d", weights, values[head // 7]
             )
     return page_max, page_denominator, page_numerator
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("page_count", [3, 7, 15, 31, 63])
+@pytest.mark.parametrize("tail_length", [0, 1, 128, 255, 256, 382, 383])
+def test_fused_reduce_tail_merge_matches_existing_stages(
+    page_count: int, tail_length: int
+) -> None:
+    """The fused stage preserves the chronological reduction and raw-tail result."""
+    arena, _codec, prepared, query, workspace = _make_fixture(page_count)
+    generator = torch.Generator(device="cpu").manual_seed(39_000 + tail_length)
+    if tail_length:
+        tail_keys = torch.randn(
+            (1, 4, tail_length, 128), generator=generator, dtype=torch.float16
+        ).to(query.device)
+        tail_values = torch.randn(
+            (1, 4, tail_length, 128), generator=generator, dtype=torch.float16
+        ).to(query.device)
+        arena.append_tail(tail_keys, tail_values)
+    tail_keys, tail_values = arena.tail_views()
+    scale = 1 / math.sqrt(128)
+    expected = torch.empty((28, 128), device=query.device, dtype=torch.float16)
+    actual = torch.empty_like(expected)
+
+    launch_qwen25_page_states(
+        query, arena, prepared, workspace, used_pages=page_count, scale=scale
+    )
+    launch_qwen25_page_reduction(workspace, used_pages=page_count)
+    launch_qwen25_tail_merge(
+        query,
+        tail_keys,
+        tail_values,
+        workspace,
+        tail_length=tail_length,
+        tail_head_stride=tail_keys.stride(1),
+        tail_token_stride=tail_keys.stride(2),
+        scale=scale,
+        output=expected,
+        tail_query=query,
+    )
+    launch_qwen25_page_states(
+        query, arena, prepared, workspace, used_pages=page_count, scale=scale
+    )
+    launch_qwen25_page_reduce_tail_merge(
+        query,
+        tail_keys,
+        tail_values,
+        workspace,
+        used_pages=page_count,
+        tail_length=tail_length,
+        tail_head_stride=tail_keys.stride(1),
+        tail_token_stride=tail_keys.stride(2),
+        scale=scale,
+        output=actual,
+        tail_query=query,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.gpu

@@ -419,6 +419,85 @@ if _TRITON_AVAILABLE:
         output_offsets = head * output_head_stride + dims * output_dim_stride
         tl.store(output_ptr + output_offsets, normalized)
 
+    @triton.jit
+    def _qwen25_page_reduce_tail_merge_kernel(
+        page_max_ptr,
+        page_denominator_ptr,
+        page_numerator_ptr,
+        query_ptr,
+        tail_keys_ptr,
+        tail_values_ptr,
+        output_ptr,
+        tail_length,
+        tail_head_stride,
+        tail_token_stride,
+        output_head_stride,
+        output_dim_stride,
+        USED_PAGES: tl.constexpr,
+        SCALE: tl.constexpr,
+        TAIL_CAPACITY: tl.constexpr,
+    ):
+        """Chronologically reduce packed pages, then merge the raw tail."""
+        head = tl.program_id(0)
+        kv_head = head // 7
+        dims = tl.arange(0, 128)
+        merged_max = tl.full((), -float("inf"), dtype=tl.float32)
+        merged_denominator = tl.zeros((), dtype=tl.float32)
+        merged_numerator = tl.zeros((128,), dtype=tl.float32)
+
+        for page in tl.static_range(0, USED_PAGES):
+            state = page * 28 + head
+            page_maximum = tl.load(page_max_ptr + state)
+            page_denominator = tl.load(page_denominator_ptr + state)
+            page_numerator = tl.load(page_numerator_ptr + state * 128 + dims)
+            next_max = tl.maximum(merged_max, page_maximum)
+            previous_scale = tl.where(
+                merged_denominator > 0.0,
+                tl.exp(merged_max - next_max),
+                0.0,
+            )
+            page_scale = tl.exp(page_maximum - next_max)
+            merged_denominator = (
+                merged_denominator * previous_scale + page_denominator * page_scale
+            )
+            merged_numerator = (
+                merged_numerator * previous_scale + page_numerator * page_scale
+            )
+            merged_max = next_max
+
+        query = tl.load(query_ptr + head * 128 + dims).to(tl.float32)
+        for token in tl.range(0, TAIL_CAPACITY):
+            token_id = tl.full((), token, dtype=tl.int32)
+            active = token_id < tail_length
+            key_offsets = kv_head * tail_head_stride + token * tail_token_stride + dims
+            key = tl.load(tail_keys_ptr + key_offsets, mask=active, other=0.0)
+            score = tl.sum(query * key.to(tl.float32), axis=0) * SCALE
+            score = tl.where(active, score, -float("inf"))
+            next_max = tl.maximum(merged_max, score)
+            previous_scale = tl.where(
+                merged_denominator > 0.0,
+                tl.exp(merged_max - next_max),
+                0.0,
+            )
+            token_scale = tl.where(active, tl.exp(score - next_max), 0.0)
+            value_offsets = kv_head * tail_head_stride + token * tail_token_stride + dims
+            value = tl.load(
+                tail_values_ptr + value_offsets,
+                mask=active,
+                other=0.0,
+            ).to(tl.float32)
+            merged_denominator = merged_denominator * previous_scale + token_scale
+            merged_numerator = merged_numerator * previous_scale + value * token_scale
+            merged_max = next_max
+
+        normalized = tl.where(
+            merged_denominator > 0.0,
+            merged_numerator / merged_denominator,
+            0.0,
+        )
+        output_offsets = head * output_head_stride + dims * output_dim_stride
+        tl.store(output_ptr + output_offsets, normalized)
+
 
 def launch_qwen25_page_states(
     query: torch.Tensor,
@@ -678,8 +757,96 @@ def launch_qwen25_tail_merge(
     )
 
 
+def launch_qwen25_page_reduce_tail_merge(
+    query: torch.Tensor,
+    tail_keys: torch.Tensor,
+    tail_values: torch.Tensor,
+    workspace: ParallelPageWorkspace,
+    *,
+    used_pages: int,
+    tail_length: int,
+    tail_head_stride: int,
+    tail_token_stride: int,
+    scale: float,
+    output: torch.Tensor,
+    tail_query: torch.Tensor | None = None,
+) -> None:
+    """Fuse chronological page reduction and raw-tail merging into one launch.
+
+    ``launch_qwen25_page_reduction`` and ``launch_qwen25_tail_merge`` remain
+    public for diagnostics.  This fast-path helper performs the identical
+    per-head floating-point operation order without materializing reduced state
+    between the two stages.
+    """
+    _require_triton_cuda()
+    if not isinstance(workspace, ParallelPageWorkspace):
+        raise TypeError("workspace must be a ParallelPageWorkspace.")
+    if type(used_pages) is not int:  # noqa: E721
+        raise TypeError("used_pages must be a built-in int.")
+    device = workspace.rotated_query.device
+    if used_pages < 0 or used_pages > workspace.page_max.shape[0]:
+        raise ValueError("used_pages must be within the workspace page capacity.")
+    _validate_workspace(workspace, device=device, used_pages=used_pages)
+    _validate_query(query, device)
+    tail_query_2d = workspace.rotated_query
+    if tail_query is not None:
+        tail_query_2d, _ = _validate_query(tail_query, device)
+    tail_capacity = _validate_tail(
+        tail_keys,
+        tail_values,
+        device=device,
+        tail_length=tail_length,
+        tail_head_stride=tail_head_stride,
+        tail_token_stride=tail_token_stride,
+    )
+    if (
+        not isinstance(scale, (float, int))
+        or isinstance(scale, bool)
+        or not math.isfinite(scale)
+    ):
+        raise ValueError("scale must be finite.")
+    if not isinstance(output, torch.Tensor) or output.device != device:
+        raise ValueError("output must be a tensor on the workspace device.")
+    if output.ndim == 2 and tuple(output.shape) == (_QUERY_HEADS, _HEAD_DIM):
+        output_2d = output
+    elif output.ndim == 4 and tuple(output.shape) in {
+        (1, _QUERY_HEADS, 1, _HEAD_DIM),
+        (1, 1, _QUERY_HEADS, _HEAD_DIM),
+    }:
+        output_2d = output.view(_QUERY_HEADS, _HEAD_DIM)
+    else:
+        raise ValueError(
+            "output must have shape [28, 128], [1, 28, 1, 128], or [1, 1, 28, 128]."
+        )
+    if output.dtype not in _SUPPORTED_FLOAT_DTYPES:
+        raise TypeError("output must use fp16, bf16, or fp32.")
+    if output_2d.stride(-1) != 1:
+        raise ValueError("output feature dimension must have unit stride.")
+    if output_2d.stride(0) <= 0:
+        raise ValueError("output head stride must be positive.")
+    _qwen25_page_reduce_tail_merge_kernel[(_QUERY_HEADS,)](
+        workspace.page_max,
+        workspace.page_denominator,
+        workspace.page_numerator,
+        tail_query_2d,
+        tail_keys,
+        tail_values,
+        output_2d,
+        tail_length,
+        tail_head_stride,
+        tail_token_stride,
+        output_2d.stride(0),
+        output_2d.stride(1),
+        USED_PAGES=used_pages,
+        SCALE=float(scale),
+        TAIL_CAPACITY=tail_capacity,
+        num_warps=4,
+    )
+
+
 __all__ = [
     "ParallelPageWorkspace",
+    "launch_qwen25_page_reduce_tail_merge",
     "launch_qwen25_page_reduction",
     "launch_qwen25_page_states",
     "launch_qwen25_query_rotation",

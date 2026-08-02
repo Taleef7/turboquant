@@ -240,8 +240,9 @@ def test_parallel_decode_dispatch_reuses_workspace_and_arena_pointers(
     assert session.metrics.packed_decode_calls == 3
     assert session.metrics.parallel_decode_calls == 3
     assert session.metrics.parallel_page_launches == 3
-    assert session.metrics.parallel_reduction_launches == 3
-    assert session.metrics.parallel_tail_launches == 3
+    assert session.metrics.parallel_reduce_tail_launches == 3
+    assert session.metrics.parallel_reduction_launches == 0
+    assert session.metrics.parallel_tail_launches == 0
 
 
 @pytest.mark.gpu

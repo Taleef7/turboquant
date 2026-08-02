@@ -55,10 +55,7 @@ def _completed_fixture(config: dict) -> dict:
             "parallel_page_launches": layer_calls
             if backend == "parallel_direct"
             else 0,
-            "parallel_reduction_launches": layer_calls
-            if backend == "parallel_direct"
-            else 0,
-            "parallel_tail_launches": layer_calls
+            "parallel_reduce_tail_launches": layer_calls
             if backend == "parallel_direct"
             else 0,
             "fallback": False,
@@ -272,10 +269,10 @@ def test_validator_rejects_gate_and_dispatch_mutations() -> None:
     assert any("quality_gate_pass" in error for error in result.errors)
 
     artifact = _completed_fixture(config)
-    artifact["rows"][3]["dispatch"]["parallel_tail_launches"] = 0
+    artifact["rows"][3]["dispatch"]["parallel_reduce_tail_launches"] = 0
     result = validate_warmup_artifact(artifact, config)
     assert not result.valid
-    assert any("parallel parallel_tail_launches" in error for error in result.errors)
+    assert any("parallel parallel_reduce_tail_launches" in error for error in result.errors)
 
     artifact = _completed_fixture(config)
     artifact["rows"][0]["timing"]["decode_p95_ms"] = 0.0

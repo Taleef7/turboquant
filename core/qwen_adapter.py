@@ -42,6 +42,7 @@ class PackedAttentionMetrics:
     packed_reference_decode_calls: int = 0
     parallel_decode_calls: int = 0
     parallel_page_launches: int = 0
+    parallel_reduce_tail_launches: int = 0
     parallel_reduction_launches: int = 0
     parallel_tail_launches: int = 0
     max_logit_drift: float | None = None
@@ -468,10 +469,9 @@ class PackedAttentionSession:
         scale: float,
     ) -> torch.Tensor:
         from kernels.qwen25_parallel_page_attention import (
-            launch_qwen25_page_reduction,
+            launch_qwen25_page_reduce_tail_merge,
             launch_qwen25_page_states,
             launch_qwen25_query_rotation,
-            launch_qwen25_tail_merge,
         )
 
         if query.shape != (1, 28, 1, 128) or not query.is_contiguous():
@@ -511,7 +511,6 @@ class PackedAttentionSession:
             used_pages=arena.used_pages,
             scale=scale,
         )
-        launch_qwen25_page_reduction(workspace, used_pages=arena.used_pages)
         output = self._parallel_outputs.get(layer_idx)
         if (
             output is None
@@ -521,11 +520,12 @@ class PackedAttentionSession:
             raise UnsupportedCapabilityError(
                 "parallel page output buffers were not reserved for this cache device/dtype."
             )
-        launch_qwen25_tail_merge(
+        launch_qwen25_page_reduce_tail_merge(
             query,
             arena.tail_keys,
             arena.tail_values,
             workspace,
+            used_pages=arena.used_pages,
             tail_length=arena.tail_length,
             tail_head_stride=arena.tail_keys.stride(1),
             tail_token_stride=arena.tail_keys.stride(2),
@@ -535,8 +535,7 @@ class PackedAttentionSession:
         )
         self.metrics.parallel_decode_calls += 1
         self.metrics.parallel_page_launches += 1
-        self.metrics.parallel_reduction_launches += 1
-        self.metrics.parallel_tail_launches += 1
+        self.metrics.parallel_reduce_tail_launches += 1
         return output
 
     def packed_decode(

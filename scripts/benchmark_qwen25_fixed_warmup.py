@@ -372,11 +372,31 @@ def validate_warmup_artifact(
                 "packed_decode_calls",
                 "parallel_decode_calls",
                 "parallel_page_launches",
-                "parallel_reduction_launches",
-                "parallel_tail_launches",
             ):
                 if dispatch.get(key, 0) != expected_layer_calls:
                     errors.append(f"row {index} parallel {key} count is invalid")
+            fused = dispatch.get("parallel_reduce_tail_launches")
+            if fused is None:
+                for key in (
+                    "parallel_reduction_launches",
+                    "parallel_tail_launches",
+                ):
+                    if dispatch.get(key, 0) != expected_layer_calls:
+                        errors.append(f"row {index} parallel {key} count is invalid")
+            else:
+                if fused != expected_layer_calls:
+                    errors.append(
+                        f"row {index} parallel parallel_reduce_tail_launches count is invalid"
+                    )
+                for key in (
+                    "parallel_reduction_launches",
+                    "parallel_tail_launches",
+                ):
+                    if dispatch.get(key, 0) != 0:
+                        errors.append(
+                            f"row {index} parallel {key} must be zero when the fused "
+                            "reduce-tail launch is used"
+                        )
         memory = row["memory"]
         memory_keys = (
             "logical_payload_bytes",
@@ -498,6 +518,7 @@ def _run_lane(
         "packed_reference_decode_calls": 0,
         "parallel_decode_calls": 0,
         "parallel_page_launches": 0,
+        "parallel_reduce_tail_launches": 0,
         "parallel_reduction_launches": 0,
         "parallel_tail_launches": 0,
         "fallback": False,

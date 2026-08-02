@@ -390,6 +390,7 @@ def _run_page_state_row(page_count: int, *, seed: int) -> dict[str, object]:
     from kernels.qwen25_parallel_page_attention import (
         ParallelPageWorkspace,
         launch_qwen25_page_states,
+        launch_qwen25_query_rotation,
     )
 
     if not torch.cuda.is_available():
@@ -402,7 +403,7 @@ def _run_page_state_row(page_count: int, *, seed: int) -> dict[str, object]:
     )
     query = query_cpu.to(device)
     workspace = ParallelPageWorkspace(
-        rotated_query=query.float().clone(),
+        rotated_query=torch.empty((QUERY_HEADS, HEAD_DIM), device=device),
         page_max=torch.empty((page_count, QUERY_HEADS), device=device),
         page_denominator=torch.empty((page_count, QUERY_HEADS), device=device),
         page_numerator=torch.empty((page_count, QUERY_HEADS, HEAD_DIM), device=device),
@@ -414,9 +415,13 @@ def _run_page_state_row(page_count: int, *, seed: int) -> dict[str, object]:
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     baseline_allocated = int(torch.cuda.memory_allocated())
-    launch_qwen25_page_states(
-        query, arena, prepared, workspace, used_pages=page_count, scale=scale
-    )
+    def launch_once() -> None:
+        launch_qwen25_query_rotation(query, prepared.rotation, workspace)
+        launch_qwen25_page_states(
+            query, arena, prepared, workspace, used_pages=page_count, scale=scale
+        )
+
+    launch_once()
     torch.cuda.synchronize()
     launch_counts = {
         "rotation": 1,
@@ -427,25 +432,19 @@ def _run_page_state_row(page_count: int, *, seed: int) -> dict[str, object]:
         "allocation": _allocation_probe_page_state(query, arena, prepared, workspace),
     }
     for _ in range(WARMUP_RUNS):
-        launch_qwen25_page_states(
-            query, arena, prepared, workspace, used_pages=page_count, scale=scale
-        )
+        launch_once()
     torch.cuda.synchronize()
     samples: list[float] = []
     for _ in range(MEASURED_TRIALS):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        launch_qwen25_page_states(
-            query, arena, prepared, workspace, used_pages=page_count, scale=scale
-        )
+        launch_once()
         end.record()
         torch.cuda.synchronize()
         samples.append(float(start.elapsed_time(end)))
     repeated = workspace.page_numerator.clone()
-    launch_qwen25_page_states(
-        query, arena, prepared, workspace, used_pages=page_count, scale=scale
-    )
+    launch_once()
     torch.cuda.synchronize()
     expected = _page_state_oracle(blocks_cpu, query_cpu, scale=scale)
     actual = (
@@ -524,12 +523,12 @@ def _allocation_probe_parallel(
     tail_values: "torch.Tensor",
     output: "torch.Tensor",
 ) -> int:
-    """Count Python tensor constructors around one warmed four-launch path."""
+    """Count Python tensor constructors around one warmed three-launch path."""
     import torch
     from kernels.qwen25_parallel_page_attention import (
-        launch_qwen25_page_reduction,
+        launch_qwen25_page_reduce_tail_merge,
         launch_qwen25_page_states,
-        launch_qwen25_tail_merge,
+        launch_qwen25_query_rotation,
     )
 
     count = 0
@@ -543,10 +542,9 @@ def _allocation_probe_parallel(
                 return _original(*args, **kwargs)
 
             stack.enter_context(_patch_attribute(torch, name, wrapped))
-        # The synthetic fixture uses an identity rotation.  Include the
-        # storage-owned cast/copy in the hot path without allocating a tensor;
-        # model-specific non-identity rotation is an integration concern.
-        workspace.rotated_query.copy_(query)  # type: ignore[attr-defined]
+        launch_qwen25_query_rotation(
+            query, prepared.rotation, workspace  # type: ignore[arg-type,attr-defined]
+        )
         launch_qwen25_page_states(
             query,
             arena,  # type: ignore[arg-type]
@@ -555,20 +553,18 @@ def _allocation_probe_parallel(
             used_pages=arena.used_pages,  # type: ignore[attr-defined]
             scale=1 / math.sqrt(HEAD_DIM),
         )
-        launch_qwen25_page_reduction(
-            workspace,  # type: ignore[arg-type]
-            used_pages=arena.used_pages,  # type: ignore[attr-defined]
-        )
-        launch_qwen25_tail_merge(
+        launch_qwen25_page_reduce_tail_merge(
             query,
             tail_keys,
             tail_values,
             workspace,  # type: ignore[arg-type]
+            used_pages=arena.used_pages,  # type: ignore[attr-defined]
             tail_length=arena.tail_length,  # type: ignore[attr-defined]
             tail_head_stride=tail_keys.stride(1),
             tail_token_stride=tail_keys.stride(2),
             scale=1 / math.sqrt(HEAD_DIM),
             output=output,
+            tail_query=query,
         )
     torch.cuda.synchronize()
     return count
@@ -582,15 +578,15 @@ def _parallel_arena_tail_views(
 
 
 def _run_parallel_row(page_count: int, *, seed: int) -> dict[str, object]:
-    """Measure the complete four-launch page-state/reduction/tail diagnostic."""
+    """Measure the complete fused three-launch parallel decode diagnostic."""
     import torch
     from core.parallel_page_workspace import (
         reserve_parallel_page_workspace,
     )
     from kernels.qwen25_parallel_page_attention import (
-        launch_qwen25_page_reduction,
+        launch_qwen25_page_reduce_tail_merge,
         launch_qwen25_page_states,
-        launch_qwen25_tail_merge,
+        launch_qwen25_query_rotation,
     )
 
     if not torch.cuda.is_available():
@@ -622,7 +618,6 @@ def _run_parallel_row(page_count: int, *, seed: int) -> dict[str, object]:
     del tail_keys, tail_values
     query = query_cpu.to(device)
     workspace = reserve_parallel_page_workspace(page_capacity=page_count, device=device)
-    workspace.rotated_query.copy_(query)
     output = torch.empty((QUERY_HEADS, HEAD_DIM), device=device, dtype=torch.float32)
     scale = 1 / math.sqrt(HEAD_DIM)
     torch.cuda.synchronize()
@@ -630,10 +625,7 @@ def _run_parallel_row(page_count: int, *, seed: int) -> dict[str, object]:
     baseline_allocated = int(torch.cuda.memory_allocated())
 
     def launch_once() -> None:
-        # Keep the rotation-stage accounting honest: this diagnostic fixture
-        # uses identity rotation, so the stage is a dtype-casting copy into
-        # the session-owned buffer.  Task 6 owns the model rotation kernel.
-        workspace.rotated_query.copy_(query)
+        launch_qwen25_query_rotation(query, prepared.rotation, workspace)
         launch_qwen25_page_states(
             query,
             arena,
@@ -642,17 +634,18 @@ def _run_parallel_row(page_count: int, *, seed: int) -> dict[str, object]:
             used_pages=page_count,
             scale=scale,
         )
-        launch_qwen25_page_reduction(workspace, used_pages=page_count)
-        launch_qwen25_tail_merge(
+        launch_qwen25_page_reduce_tail_merge(
             query,
             arena_tail_keys,
             arena_tail_values,
             workspace,
+            used_pages=page_count,
             tail_length=TAIL_TOKENS,
             tail_head_stride=arena_tail_keys.stride(1),
             tail_token_stride=arena_tail_keys.stride(2),
             scale=scale,
             output=output,
+            tail_query=query,
         )
 
     launch_once()
@@ -661,8 +654,9 @@ def _run_parallel_row(page_count: int, *, seed: int) -> dict[str, object]:
     launch_counts = {
         "rotation": 1,
         "page": 1,
-        "reduction": 1,
-        "tail": 1,
+        "reduction": 0,
+        "tail": 0,
+        "reduce_tail": 1,
         "fallback": 0,
         "allocation": _allocation_probe_parallel(
             query,
@@ -791,9 +785,12 @@ def _allocation_probe_page_state(
     prepared: object,
     workspace: object,
 ) -> int:
-    """Count Python tensor constructors around one warmed page-state launch."""
+    """Count Python tensor constructors around warmed rotation and page-state launches."""
     import torch
-    from kernels.qwen25_parallel_page_attention import launch_qwen25_page_states
+    from kernels.qwen25_parallel_page_attention import (
+        launch_qwen25_page_states,
+        launch_qwen25_query_rotation,
+    )
 
     count = 0
     with ExitStack() as stack:
@@ -806,6 +803,9 @@ def _allocation_probe_page_state(
                 return _original(*args, **kwargs)
 
             stack.enter_context(_patch_attribute(torch, name, wrapped))
+        launch_qwen25_query_rotation(
+            query, prepared.rotation, workspace  # type: ignore[arg-type,attr-defined]
+        )
         launch_qwen25_page_states(
             query,
             arena,  # type: ignore[arg-type]
@@ -1088,11 +1088,20 @@ def validate_parallel_page_artifact(artifact: Mapping[str, Any]) -> ValidationRe
                 "parallel": {
                     "rotation": 1,
                     "page": 1,
-                    "reduction": 1,
-                    "tail": 1,
+                    "reduction": 0,
+                    "tail": 0,
+                    "reduce_tail": 1,
                     "fallback": 0,
                 },
             }[implementation]
+            if implementation == "parallel" and "reduce_tail" not in counts:
+                expected_counts = {
+                    "rotation": 1,
+                    "page": 1,
+                    "reduction": 1,
+                    "tail": 1,
+                    "fallback": 0,
+                }
             for key, expected in expected_counts.items():
                 if counts.get(key) != expected:
                     errors.append(
