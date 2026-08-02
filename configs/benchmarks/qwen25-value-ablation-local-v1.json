@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "artifact_type": "qwen25_value_ablation",
+  "name": "qwen25-value-ablation-local-v1",
+  "model_id": "Qwen/Qwen2.5-7B-Instruct",
+  "model_revision": "a09a35458c702b33eeacc393d103063234e8bc28",
+  "fixture_manifest_sha256": "439db8405dc165561eb248284eea98b5bcd88fb18ba153825b456950b58043c5",
+  "contexts": [4096, 8192],
+  "stream_seed": 26009,
+  "warmup_tokens": 1,
+  "measured_decode_tokens": 3,
+  "repeats": 3,
+  "backends": [
+    "baseline",
+    "serial_direct"
+  ],
+  "profiles": [
+    {
+      "id": "v6",
+      "path": "configs/profiles/qwen25-7b-direct-v1.json",
+      "file_sha256": "4287e72d8ad2abb8a91d4e3e42ddeecd993657909ce9c5047f81c6fccea2db50",
+      "profile_sha256": "75ee885c1e19cc00f2c986afd349668d8377bde7882199041fb9ea8a9a7a86e7",
+      "value_bits": 6
+    },
+    {
+      "id": "v8",
+      "path": "configs/profiles/qwen25-7b-direct-v1-v8-value.json",
+      "file_sha256": "e3364c782e4c95015aa5b2c824bd877de344d6dc8b30e4c0cef84934547778fb",
+      "profile_sha256": "2c0384ee4254c2f58991237cb7e6b084efd4186a41da7482ec1c52168db4e1ca",
+      "value_bits": 8
+    }
+  ],
+  "quality_gates": {
+    "max_abs_logit": 0.01,
+    "mean_abs_logit": 0.001,
+    "kl_divergence": 0.0001,
+    "top1_agreement": 1.0,
+    "greedy_agreement": 1.0
+  }
+}

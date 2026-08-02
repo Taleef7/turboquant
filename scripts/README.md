@@ -85,6 +85,29 @@ python scripts/validate_qwen_fixed_warmup.py \
 The v2 run is diagnostic-only and is not a replacement for the canonical v1
 artifact or its 1,024/2,048-token qualification matrix.
 
+## `benchmark_qwen25_value_ablation.py`
+
+Runs an opt-in value-bit ablation on the same fixed 4,096/8,192-token stream:
+the pinned production profile (`value_bits=6`) and the separate profile with
+8-bit values. It measures one baseline lane plus serial direct decode for each
+profile; the parallel fused lane is deliberately excluded so this experiment
+isolates codec precision rather than page-attention behavior. The artifact
+records quality, exact cache byte fields, timing, profile paths and both file
+and profile hashes, plus model/config/runner provenance. It is always
+diagnostic-only with an empty claims list and does not modify the v1/v2
+warmup artifacts or production profile.
+
+```bash
+python scripts/benchmark_qwen25_value_ablation.py \
+  --config configs/benchmarks/qwen25-value-ablation-local-v1.json \
+  --model-path /home/taleef/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
+  --output artifacts/qwen25-value-ablation-local-v1.json
+```
+
+The validator is built into the runner's final check and rejects changed
+profile files, model identity, runner/config hashes, fallback, parallel
+dispatch, incomplete rows, or inconsistent quality/byte/timing fields.
+
 ## `benchmark_parallel_page_attention.py`
 
 Runs the serial packed-page diagnostic used to freeze the page-attention
