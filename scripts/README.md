@@ -21,6 +21,32 @@ python scripts/run_direct_benchmark.py \
 The runner requires CUDA and does not itself establish a quality or Pareto
 claim.
 
+## `replay_qwen25_fixed_tokens.py`
+
+Runs the predeclared, exact-token Qwen2.5 replay matrix at 1,024 and 2,048
+prompt tokens through `baseline`, `packed_reference`, `serial_direct`, and
+`parallel_direct`.  Every lane receives the same prompt and two explicit
+decode token IDs.  Rows record logits, KL divergence, top-1/greedy agreement,
+dispatch/fallback counters, physical/logical/cache/workspace bytes, runtime
+allocator peaks, timing, and source identity.  The artifact is always
+`diagnostic_only` with an empty claims list; a missing local fixture is written
+as eight explicit `unavailable` rows rather than silently changing the test.
+
+The default is local-only and does not download model weights.  The pinned
+WSL fixture can be selected explicitly with `--cache-dir`:
+
+```bash
+python scripts/replay_qwen25_fixed_tokens.py \
+  --model-path /home/taleef/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
+  --output artifacts/qwen25-fixed-replay.json
+python scripts/validate_qwen_fixed_replay.py \
+  artifacts/qwen25-fixed-replay.json
+```
+
+Use `--allow-download` only when network access is intentional.  This replay
+does not publish an end-to-end speed or VRAM claim; it is the fixed-token
+qualification input for a later systems gate.
+
 ## `benchmark_parallel_page_attention.py`
 
 Runs the serial packed-page diagnostic used to freeze the page-attention
