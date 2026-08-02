@@ -7,12 +7,18 @@ full-history fp16 tensor.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 
 from core.errors import UnsupportedCapabilityError
-from core.packed_store import PackedKVBlockStore, PackedStoreRuntimeLayout, create_packed_kv_block_store
+from core.packed_page_arena import PackedPageArena, PackedPageArenaLayout
+from core.packed_store import (
+    PackedKVBlockStore,
+    PackedStoreRuntimeLayout,
+    create_packed_kv_block_store,
+)
 
 if TYPE_CHECKING:
     from core.profiles import CompressionProfile
@@ -21,9 +27,25 @@ if TYPE_CHECKING:
 class PackedDynamicCache:
     """One packed block store per verified full-attention Qwen2.5 layer."""
 
-    def __init__(self, profile: "CompressionProfile", *, layer_count: int) -> None:
+    def __init__(
+        self,
+        profile: "CompressionProfile",
+        *,
+        layer_count: int,
+        maximum_sequence_length: int | None = None,
+    ) -> None:
+        if type(layer_count) is not int or layer_count < 1:  # noqa: E721
+            raise TypeError("layer_count must be a positive built-in int.")
+        if maximum_sequence_length is not None:
+            if not isinstance(maximum_sequence_length, int) or isinstance(
+                maximum_sequence_length, bool
+            ):
+                raise TypeError("maximum_sequence_length must be a built-in int.")
+            if maximum_sequence_length < 1:
+                raise ValueError("maximum_sequence_length must be positive.")
         self.profile = profile
         self._layer_count = layer_count
+        self.maximum_sequence_length = maximum_sequence_length
         self._stores: list[PackedKVBlockStore | None] = [None] * layer_count
         self._device: torch.device | None = None
         self._dtype: torch.dtype | None = None
@@ -39,15 +61,25 @@ class PackedDynamicCache:
     def _validate_update(
         self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int
     ) -> None:
-        if type(layer_idx) is not int or not 0 <= layer_idx < self._layer_count:
-            raise UnsupportedCapabilityError("unsupported Qwen2.5 attention layer index.")
+        if (
+            not isinstance(layer_idx, int)
+            or isinstance(layer_idx, bool)
+            or not 0 <= layer_idx < self._layer_count
+        ):
+            raise UnsupportedCapabilityError(
+                "unsupported Qwen2.5 attention layer index."
+            )
         expected = (
             1,
             self.profile.model_architecture["num_key_value_heads"],
             self.profile.model_architecture["head_dim"],
         )
-        if not isinstance(key_states, torch.Tensor) or not isinstance(value_states, torch.Tensor):
-            raise UnsupportedCapabilityError("Qwen2.5 packed decode requires tensor KV states.")
+        if not isinstance(key_states, torch.Tensor) or not isinstance(
+            value_states, torch.Tensor
+        ):
+            raise UnsupportedCapabilityError(
+                "Qwen2.5 packed decode requires tensor KV states."
+            )
         if (
             key_states.ndim != 4
             or value_states.shape != key_states.shape
@@ -57,22 +89,66 @@ class PackedDynamicCache:
             or key_states.shape[-2] < 1
         ):
             raise UnsupportedCapabilityError("unsupported Qwen2.5 KV tensor layout.")
-        if key_states.dtype not in (torch.float16, torch.bfloat16) or value_states.dtype != key_states.dtype:
-            raise UnsupportedCapabilityError("Qwen2.5 packed decode requires stable fp16 or bf16 KV dtype.")
+        if (
+            key_states.dtype not in (torch.float16, torch.bfloat16)
+            or value_states.dtype != key_states.dtype
+        ):
+            raise UnsupportedCapabilityError(
+                "Qwen2.5 packed decode requires stable fp16 or bf16 KV dtype."
+            )
         if key_states.device != value_states.device:
-            raise UnsupportedCapabilityError("Qwen2.5 packed decode requires key/value on one device.")
+            raise UnsupportedCapabilityError(
+                "Qwen2.5 packed decode requires key/value on one device."
+            )
         if self._device is not None and key_states.device != self._device:
-            raise UnsupportedCapabilityError("Qwen2.5 packed decode does not support cache device changes.")
+            raise UnsupportedCapabilityError(
+                "Qwen2.5 packed decode does not support cache device changes."
+            )
         if self._dtype is not None and key_states.dtype != self._dtype:
-            raise UnsupportedCapabilityError("Qwen2.5 packed decode does not support cache dtype changes.")
+            raise UnsupportedCapabilityError(
+                "Qwen2.5 packed decode does not support cache dtype changes."
+            )
 
-    def _new_store(self, key_states: torch.Tensor, layer_idx: int) -> PackedKVBlockStore:
+    def _new_store(
+        self, key_states: torch.Tensor, layer_idx: int
+    ) -> PackedKVBlockStore:
         runtime = PackedStoreRuntimeLayout(
             head_dim=key_states.shape[-1],
             num_kv_heads=key_states.shape[1],
             norm_dtype=key_states.dtype,
         )
-        store = create_packed_kv_block_store(self.profile, runtime)
+        arena: PackedPageArena | None = None
+        if self.maximum_sequence_length is not None:
+            block_size = self.profile.block_size
+            arena = PackedPageArena.reserve(
+                PackedPageArenaLayout(
+                    page_capacity=max(
+                        1,
+                        math.ceil(
+                            max(
+                                0,
+                                self.maximum_sequence_length
+                                - (block_size + self.profile.fp16_window - 1),
+                            )
+                            / block_size
+                        ),
+                    ),
+                    page_tokens=block_size,
+                    num_kv_heads=key_states.shape[1],
+                    head_dim=key_states.shape[-1],
+                    key_packed_width=math.ceil(
+                        key_states.shape[-1] * self.profile.key_bits / 8
+                    ),
+                    value_packed_width=math.ceil(
+                        key_states.shape[-1] * self.profile.value_bits / 8
+                    ),
+                    value_groups=key_states.shape[-1] // self.profile.value_group_size,
+                    tail_capacity=block_size + self.profile.fp16_window - 1,
+                ),
+                device=key_states.device,
+                kv_dtype=key_states.dtype,
+            )
+        store = create_packed_kv_block_store(self.profile, runtime, arena=arena)
         # A layer-specific rotation is required: matching rotations make layer
         # compression accidentally share an implementation detail.
         store.key_codec._rotation = store.key_codec._rotation.roll(layer_idx, dims=0)
@@ -99,6 +175,13 @@ class PackedDynamicCache:
                 self.rejected_updates += 1
                 raise
         store = self._stores[layer_idx]
+        current_length = 0 if store is None else store.sequence_length()
+        if (
+            self.maximum_sequence_length is not None
+            and current_length + key_states.shape[-2] > self.maximum_sequence_length
+        ):
+            self.rejected_updates += 1
+            raise OverflowError("maximum_sequence_length capacity would be exceeded.")
         if store is None:
             store = self._new_store(key_states, layer_idx)
         # All validation happens before this append so failed mode/device/dtype
@@ -109,19 +192,32 @@ class PackedDynamicCache:
         self._dtype = key_states.dtype
         # Returning the incoming local segment is the only cache-facing K/V
         # contract. Historical packed data is consumed by the custom backend.
-        self.max_returned_kv_tokens = max(self.max_returned_kv_tokens, key_states.shape[-2])
+        self.max_returned_kv_tokens = max(
+            self.max_returned_kv_tokens, key_states.shape[-2]
+        )
         return key_states, value_states
 
     def store_for(self, layer_idx: int) -> PackedKVBlockStore:
-        if type(layer_idx) is not int or not 0 <= layer_idx < self._layer_count:
-            raise UnsupportedCapabilityError("unsupported Qwen2.5 attention layer index.")
+        if (
+            not isinstance(layer_idx, int)
+            or isinstance(layer_idx, bool)
+            or not 0 <= layer_idx < self._layer_count
+        ):
+            raise UnsupportedCapabilityError(
+                "unsupported Qwen2.5 attention layer index."
+            )
         store = self._stores[layer_idx]
         if store is not None:
             return store
         dtype = self._dtype or torch.float16
         device = self._device or torch.device("cpu")
         seed = torch.empty(
-            (1, self.profile.model_architecture["num_key_value_heads"], 1, self.profile.model_architecture["head_dim"]),
+            (
+                1,
+                self.profile.model_architecture["num_key_value_heads"],
+                1,
+                self.profile.model_architecture["head_dim"],
+            ),
             dtype=dtype,
             device=device,
         )
@@ -135,7 +231,9 @@ class PackedDynamicCache:
         store = self._stores[layer_idx]
         return 0 if store is None else store.sequence_length()
 
-    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
+    def get_mask_sizes(
+        self, cache_position: torch.Tensor, layer_idx: int
+    ) -> tuple[int, int]:
         return self.get_seq_length(layer_idx) + cache_position.shape[0], 0
 
     def sequence_length(self) -> int:
