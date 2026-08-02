@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping, Sequence
 import json
+import math
 from pathlib import Path
 import statistics
 import sys
@@ -153,6 +154,7 @@ def validate_replay_artifact(
         errors.append("rows must exactly match the predeclared context/backend matrix")
         rows = rows if isinstance(rows, list) else []
     statuses = {"completed", "unavailable", "error", "oom"}
+    expected_decode_tokens = int(config["decode_tokens"])
     for index, row in enumerate(rows):
         if not isinstance(row, Mapping):
             errors.append(f"row {index} must be an object")
@@ -178,6 +180,124 @@ def validate_replay_artifact(
                     errors.append(f"row {index} completed {key} is missing")
             if not isinstance(row.get("quality_gate_pass"), bool):
                 errors.append(f"row {index} quality_gate_pass is missing")
+            if all(
+                isinstance(row.get(key), Mapping)
+                for key in ("quality", "dispatch", "memory", "timing")
+            ):
+                quality = row["quality"]
+                gates = config["quality_gates"]
+                numeric_quality = ("max_abs_logit", "mean_abs_logit", "kl_divergence")
+                if any(
+                    not isinstance(quality.get(key), (int, float))
+                    or not math.isfinite(float(quality[key]))
+                    or float(quality[key]) < 0
+                    for key in numeric_quality
+                ):
+                    errors.append(f"row {index} quality numeric metrics are invalid")
+                if not 0.0 <= float(quality.get("top1_agreement", -1.0)) <= 1.0:
+                    errors.append(f"row {index} top1_agreement is invalid")
+                if not isinstance(quality.get("greedy_agreement"), bool):
+                    errors.append(f"row {index} greedy_agreement is invalid")
+                computed_gate = (
+                    float(quality.get("max_abs_logit", math.inf))
+                    <= gates["max_abs_logit"]
+                    and float(quality.get("mean_abs_logit", math.inf))
+                    <= gates["mean_abs_logit"]
+                    and float(quality.get("kl_divergence", math.inf))
+                    <= gates["kl_divergence"]
+                    and float(quality.get("top1_agreement", -1.0))
+                    >= gates["top1_agreement"]
+                    and quality.get("greedy_agreement") is True
+                )
+                if row.get("quality_gate_pass") is not computed_gate:
+                    errors.append(
+                        f"row {index} quality_gate_pass disagrees with quality metrics"
+                    )
+                backend = row.get("backend")
+                expected_layer_calls = expected_decode_tokens * 28
+                if backend == "baseline" and (
+                    any(
+                        float(quality.get(key, math.inf)) != 0.0
+                        for key in numeric_quality
+                    )
+                    or quality.get("top1_agreement") != 1.0
+                    or quality.get("greedy_agreement") is not True
+                ):
+                    errors.append(
+                        f"row {index} baseline quality must be exact zero-drift"
+                    )
+                dispatch = row["dispatch"]
+                if dispatch.get("fallback") is not False:
+                    errors.append(f"row {index} fallback must be false")
+                if (
+                    backend == "baseline"
+                    and dispatch.get("standard_attention_calls", 0) <= 0
+                ):
+                    errors.append(f"row {index} baseline attention dispatch is missing")
+                if (
+                    backend == "packed_reference"
+                    and dispatch.get("packed_reference_decode_calls", 0)
+                    != expected_layer_calls
+                ):
+                    errors.append(
+                        f"row {index} packed-reference dispatch count is invalid"
+                    )
+                if (
+                    backend == "serial_direct"
+                    and dispatch.get("packed_decode_calls", 0) != expected_layer_calls
+                ):
+                    errors.append(f"row {index} serial dispatch count is invalid")
+                if backend == "parallel_direct":
+                    for key in ("packed_decode_calls", "parallel_decode_calls"):
+                        if dispatch.get(key, 0) != expected_layer_calls:
+                            errors.append(
+                                f"row {index} parallel {key} count is invalid"
+                            )
+                    for key in (
+                        "parallel_page_launches",
+                        "parallel_reduction_launches",
+                        "parallel_tail_launches",
+                    ):
+                        if dispatch.get(key, 0) != expected_layer_calls:
+                            errors.append(
+                                f"row {index} parallel {key} count is invalid"
+                            )
+                memory = row["memory"]
+                memory_keys = (
+                    "logical_payload_bytes",
+                    "physical_cache_bytes",
+                    "arena_capacity_bytes",
+                    "tail_capacity_bytes",
+                    "workspace_bytes",
+                    "unique_resident_bytes",
+                )
+                if any(
+                    not isinstance(memory.get(key), int) or memory[key] < 0
+                    for key in memory_keys
+                ):
+                    errors.append(f"row {index} memory byte accounting is invalid")
+                elif memory["unique_resident_bytes"] < memory["physical_cache_bytes"]:
+                    errors.append(
+                        f"row {index} unique resident bytes undercount physical cache"
+                    )
+                if backend == "parallel_direct" and (
+                    memory["workspace_bytes"] <= 0
+                    or memory["arena_capacity_bytes"] <= 0
+                ):
+                    errors.append(f"row {index} parallel memory reservation is missing")
+                timing = row["timing"]
+                if (
+                    not isinstance(timing.get("decode_token_ms"), list)
+                    or len(timing["decode_token_ms"]) != expected_decode_tokens
+                ):
+                    errors.append(f"row {index} timing decode-token count is invalid")
+                elif any(
+                    not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or value < 0
+                    for value in timing["decode_token_ms"]
+                ):
+                    errors.append(f"row {index} timing values are invalid")
     statuses_seen = {row.get("status") for row in rows if isinstance(row, Mapping)}
     expected_status = (
         "unavailable"
@@ -245,10 +365,15 @@ def _tensor_storage_bytes(value: Any, seen: set[int] | None = None) -> int:
         return sum(_tensor_storage_bytes(item, seen) for item in value.values())
     if isinstance(value, (list, tuple)):
         return sum(_tensor_storage_bytes(item, seen) for item in value)
-    if hasattr(value, "key_cache") or hasattr(value, "value_cache"):
-        return _tensor_storage_bytes(
-            getattr(value, "key_cache", ()), seen
-        ) + _tensor_storage_bytes(getattr(value, "value_cache", ()), seen)
+    if hasattr(value, "layers"):
+        return _tensor_storage_bytes(getattr(value, "layers"), seen)
+    if any(
+        hasattr(value, name) for name in ("key_cache", "value_cache", "keys", "values")
+    ):
+        return sum(
+            _tensor_storage_bytes(getattr(value, name, ()), seen)
+            for name in ("key_cache", "value_cache", "keys", "values")
+        )
     return 0
 
 
@@ -275,21 +400,26 @@ def _direct_memory(session: Any, *, parallel: bool) -> dict[str, int]:
     for layer_idx in range(session.capabilities.layer_count):
         store = session.cache.store_for(layer_idx)
         breakdown = store.physical_nbytes()
-        cache_bytes += breakdown.total_nbytes
         if store.arena is not None:
             arena = store.arena
             arena_breakdown = arena.byte_breakdown()
+            # The arena owns all reserved page/tail storage.  Append scratch
+            # is a separate per-store allocation; neither includes workspace.
+            arena_storage = arena._unique_storage_bytes()
+            cache_bytes += arena_storage + breakdown.workspace
             logical += arena_breakdown.logical_payload + arena_breakdown.tail_logical
             arena_capacity += arena_breakdown.arena_capacity
             tail_capacity += arena_breakdown.tail_capacity
-            unique += arena_breakdown.unique_resident
+            unique += arena_storage + breakdown.workspace
         else:
+            cache_bytes += breakdown.total_nbytes
             logical += (
                 breakdown.key_payload
                 + breakdown.value_payload
                 + breakdown.metadata
                 + breakdown.fp16_window
             )
+            unique += breakdown.total_nbytes
     workspace = 0
     if parallel and session._parallel_workspace is not None:
         workspace = parallel_page_workspace_nbytes(session._parallel_workspace)
@@ -393,29 +523,33 @@ def _run_backend(
                     use_parallel_page_attention=parallel,
                 )
                 session.use_packed_reference_backend = backend == "packed_reference"
-                prefill, prefill_ms = _timed(
-                    lambda session=session: session.prefill(prompt_ids), torch_module
-                )
-                captured.append(_snapshot_logits(prefill.logits))
-                for index in range(int(decode_ids.shape[1])):
-                    token = decode_ids[:, index : index + 1]
-                    output, elapsed = _timed(
-                        lambda token=token, session=session: session.decode_one(token),
+                with session:
+                    prefill, prefill_ms = _timed(
+                        lambda session=session: session.prefill(prompt_ids),
                         torch_module,
                     )
-                    captured.append(_snapshot_logits(output.logits))
-                    decode_times.append(elapsed)
-                memory = _direct_memory(session, parallel=parallel)
-                dispatch = {
-                    "standard_prefill_calls": session.metrics.standard_prefill_calls,
-                    "packed_decode_calls": session.metrics.packed_decode_calls,
-                    "packed_reference_decode_calls": session.metrics.packed_reference_decode_calls,
-                    "parallel_decode_calls": session.metrics.parallel_decode_calls,
-                    "parallel_page_launches": session.metrics.parallel_page_launches,
-                    "parallel_reduction_launches": session.metrics.parallel_reduction_launches,
-                    "parallel_tail_launches": session.metrics.parallel_tail_launches,
-                    "fallback": False,
-                }
+                    captured.append(_snapshot_logits(prefill.logits))
+                    for index in range(int(decode_ids.shape[1])):
+                        token = decode_ids[:, index : index + 1]
+                        output, elapsed = _timed(
+                            lambda token=token, session=session: session.decode_one(
+                                token
+                            ),
+                            torch_module,
+                        )
+                        captured.append(_snapshot_logits(output.logits))
+                        decode_times.append(elapsed)
+                    memory = _direct_memory(session, parallel=parallel)
+                    dispatch = {
+                        "standard_prefill_calls": session.metrics.standard_prefill_calls,
+                        "packed_decode_calls": session.metrics.packed_decode_calls,
+                        "packed_reference_decode_calls": session.metrics.packed_reference_decode_calls,
+                        "parallel_decode_calls": session.metrics.parallel_decode_calls,
+                        "parallel_page_launches": session.metrics.parallel_page_launches,
+                        "parallel_reduction_launches": session.metrics.parallel_reduction_launches,
+                        "parallel_tail_launches": session.metrics.parallel_tail_launches,
+                        "fallback": False,
+                    }
         row = {
             "status": "completed",
             "timing": {

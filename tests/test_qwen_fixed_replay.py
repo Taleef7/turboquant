@@ -22,6 +22,70 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "configs" / "benchmarks" / "qwen25-fixed-replay-v1.json"
 
 
+def _completed_fixture(config: dict) -> dict:
+    """Build a small, internally consistent completed artifact for validator tests."""
+    artifact = build_unavailable_artifact(config, config_path=CONFIG, reason="fixture")
+    artifact["status"] = "diagnostic"
+    layer_calls = int(config["decode_tokens"]) * 28
+    for row in artifact["rows"]:
+        backend = row["backend"]
+        dispatch = {
+            "standard_prefill_calls": 0,
+            "packed_decode_calls": 0,
+            "packed_reference_decode_calls": 0,
+            "parallel_decode_calls": 0,
+            "parallel_page_launches": 0,
+            "parallel_reduction_launches": 0,
+            "parallel_tail_launches": 0,
+            "fallback": False,
+        }
+        if backend == "baseline":
+            dispatch["standard_attention_calls"] = layer_calls + 28
+        elif backend == "packed_reference":
+            dispatch["packed_reference_decode_calls"] = layer_calls
+        elif backend == "serial_direct":
+            dispatch["packed_decode_calls"] = layer_calls
+        else:
+            dispatch.update(
+                {
+                    "packed_decode_calls": layer_calls,
+                    "parallel_decode_calls": layer_calls,
+                    "parallel_page_launches": layer_calls,
+                    "parallel_reduction_launches": layer_calls,
+                    "parallel_tail_launches": layer_calls,
+                }
+            )
+        row.update(
+            {
+                "status": "completed",
+                "quality": {
+                    "max_abs_logit": 0.0,
+                    "mean_abs_logit": 0.0,
+                    "kl_divergence": 0.0,
+                    "top1_agreement": 1.0,
+                    "greedy_agreement": True,
+                },
+                "quality_gate_pass": True,
+                "dispatch": dispatch,
+                "memory": {
+                    "logical_payload_bytes": 1,
+                    "physical_cache_bytes": 1,
+                    "arena_capacity_bytes": 1 if backend == "parallel_direct" else 0,
+                    "tail_capacity_bytes": 0,
+                    "workspace_bytes": 1 if backend == "parallel_direct" else 0,
+                    "unique_resident_bytes": 2 if backend == "parallel_direct" else 1,
+                },
+                "timing": {
+                    "prefill_ms": 1.0,
+                    "decode_token_ms": [1.0] * int(config["decode_tokens"]),
+                    "decode_p50_ms": 1.0,
+                    "decode_mean_ms": 1.0,
+                },
+            }
+        )
+    return artifact
+
+
 def test_config_declares_exact_replay_matrix() -> None:
     config = load_replay_config(CONFIG)
     assert config["contexts"] == [1024, 2048]
@@ -130,6 +194,45 @@ def test_direct_memory_uses_one_logical_formula_for_arena_store() -> None:
         arena.byte_breakdown().logical_payload + arena.byte_breakdown().tail_logical
     )
     assert memory["logical_payload_bytes"] == expected_logical
+    expected_physical = (
+        arena._unique_storage_bytes() + cache.store_for(0).physical_nbytes().workspace
+    )
+    assert memory["physical_cache_bytes"] == expected_physical
+    assert memory["unique_resident_bytes"] == expected_physical
+
+
+def test_validator_accepts_consistent_completed_fixture() -> None:
+    config = load_replay_config(CONFIG)
+    artifact = _completed_fixture(config)
+    result = validate_replay_artifact(artifact, config)
+    assert result.valid, result.errors
+
+
+def test_validator_rejects_quality_gate_mutation() -> None:
+    config = load_replay_config(CONFIG)
+    artifact = _completed_fixture(config)
+    artifact["rows"][1]["quality"]["max_abs_logit"] = 0.02
+    result = validate_replay_artifact(artifact, config)
+    assert not result.valid
+    assert any("quality_gate_pass" in error for error in result.errors)
+
+
+def test_validator_rejects_parallel_dispatch_mutation() -> None:
+    config = load_replay_config(CONFIG)
+    artifact = _completed_fixture(config)
+    artifact["rows"][3]["dispatch"]["parallel_tail_launches"] = 0
+    result = validate_replay_artifact(artifact, config)
+    assert not result.valid
+    assert any("parallel parallel_tail_launches" in error for error in result.errors)
+
+
+def test_validator_rejects_memory_undercount_mutation() -> None:
+    config = load_replay_config(CONFIG)
+    artifact = _completed_fixture(config)
+    artifact["rows"][3]["memory"]["unique_resident_bytes"] = 0
+    result = validate_replay_artifact(artifact, config)
+    assert not result.valid
+    assert any("undercount physical" in error for error in result.errors)
 
 
 @pytest.mark.parametrize(
