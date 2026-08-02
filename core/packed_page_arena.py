@@ -155,6 +155,8 @@ class PackedPageArena:
             raise TypeError("layout must be a PackedPageArenaLayout.")
         if not isinstance(device, torch.device):
             raise TypeError("device must be a torch.device.")
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         if kv_dtype not in _SUPPORTED_KV_DTYPES:
             raise TypeError("kv_dtype must be torch.float16 or torch.bfloat16.")
 
