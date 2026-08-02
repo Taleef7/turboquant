@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -99,6 +100,103 @@ def _source_identity(config_path: Path) -> dict[str, Any]:
     }
 
 
+def _fixture_identity(
+    model_path: str | Path, config: Mapping[str, Any]
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Verify and fingerprint a direct HF snapshot before loading any weights.
+
+    A path override is only accepted when it is the exact pinned Hugging Face
+    snapshot layout.  This prevents a differently trained local model from
+    being reported under the pinned Qwen identity.
+    """
+    snapshot = Path(model_path).expanduser().resolve()
+    model_id = str(config["model_id"])
+    revision = str(config["model_revision"])
+    expected_cache_name = f"models--{model_id.replace('/', '--')}"
+    if (
+        not snapshot.is_dir()
+        or snapshot.name != revision
+        or snapshot.parent.name != "snapshots"
+        or snapshot.parent.parent.name != expected_cache_name
+    ):
+        return None, (
+            "local model path must resolve to the pinned HF snapshot layout "
+            f"{expected_cache_name}/snapshots/{revision}"
+        )
+
+    required = {
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "model.safetensors.index.json",
+    }
+    missing = sorted(name for name in required if not (snapshot / name).is_file())
+    if missing:
+        return None, "pinned model snapshot is missing required files: " + ", ".join(
+            missing
+        )
+    try:
+        model_config = json.loads(
+            (snapshot / "config.json").read_text(encoding="utf-8")
+        )
+        index = json.loads(
+            (snapshot / "model.safetensors.index.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"pinned model snapshot metadata is unreadable: {exc}"
+
+    expected_architecture = {
+        "model_type": "qwen2",
+        "hidden_size": 3584,
+        "num_hidden_layers": 28,
+        "num_attention_heads": 28,
+        "num_key_value_heads": 4,
+    }
+    architecture_mismatches = [
+        f"{key}={model_config.get(key)!r} (expected {value!r})"
+        for key, value in expected_architecture.items()
+        if model_config.get(key) != value
+    ]
+    if architecture_mismatches:
+        return None, "model config architecture mismatch: " + "; ".join(
+            architecture_mismatches
+        )
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, Mapping) or not weight_map:
+        return None, "model.safetensors.index.json has no weight_map"
+    shard_names = sorted({str(name) for name in weight_map.values()})
+    missing_shards = [name for name in shard_names if not (snapshot / name).is_file()]
+    if missing_shards:
+        return None, "pinned model snapshot is missing weight shards: " + ", ".join(
+            missing_shards
+        )
+
+    files: list[dict[str, Any]] = []
+    for relative in sorted(required | set(shard_names)):
+        path = snapshot / relative
+        try:
+            files.append(
+                {
+                    "path": relative,
+                    "size_bytes": path.stat().st_size,
+                    "sha256": sha256_file(path),
+                }
+            )
+        except OSError as exc:
+            return None, f"pinned model snapshot file is unreadable ({relative}): {exc}"
+    manifest_bytes = json.dumps(files, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return {
+        "model_id": model_id,
+        "snapshot_id": revision,
+        "resolved_path": str(snapshot),
+        "architecture": expected_architecture,
+        "files": files,
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+    }, None
+
+
 def build_unavailable_artifact(
     config: Mapping[str, Any], *, config_path: str | Path, reason: str
 ) -> dict[str, Any]:
@@ -130,6 +228,14 @@ def build_unavailable_artifact(
     }
 
 
+def _finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
 def validate_replay_artifact(
     artifact: Mapping[str, Any], config: Mapping[str, Any] | None = None
 ) -> ValidationResult:
@@ -150,7 +256,12 @@ def validate_replay_artifact(
         errors.append("artifact config does not match the predeclared replay config")
     expected = expected_row_ids(config)
     rows = artifact.get("rows")
-    if not isinstance(rows, list) or [row.get("row_id") for row in rows] != expected:
+    observed_row_ids = (
+        [row.get("row_id") if isinstance(row, Mapping) else None for row in rows]
+        if isinstance(rows, list)
+        else None
+    )
+    if observed_row_ids != expected:
         errors.append("rows must exactly match the predeclared context/backend matrix")
         rows = rows if isinstance(rows, list) else []
     statuses = {"completed", "unavailable", "error", "oom"}
@@ -187,41 +298,43 @@ def validate_replay_artifact(
                 quality = row["quality"]
                 gates = config["quality_gates"]
                 numeric_quality = ("max_abs_logit", "mean_abs_logit", "kl_divergence")
-                if any(
-                    not isinstance(quality.get(key), (int, float))
-                    or not math.isfinite(float(quality[key]))
-                    or float(quality[key]) < 0
+                quality_numbers_valid = all(
+                    _finite_number(quality.get(key)) and float(quality[key]) >= 0
                     for key in numeric_quality
-                ):
-                    errors.append(f"row {index} quality numeric metrics are invalid")
-                if not 0.0 <= float(quality.get("top1_agreement", -1.0)) <= 1.0:
-                    errors.append(f"row {index} top1_agreement is invalid")
-                if not isinstance(quality.get("greedy_agreement"), bool):
-                    errors.append(f"row {index} greedy_agreement is invalid")
-                computed_gate = (
-                    float(quality.get("max_abs_logit", math.inf))
-                    <= gates["max_abs_logit"]
-                    and float(quality.get("mean_abs_logit", math.inf))
-                    <= gates["mean_abs_logit"]
-                    and float(quality.get("kl_divergence", math.inf))
-                    <= gates["kl_divergence"]
-                    and float(quality.get("top1_agreement", -1.0))
-                    >= gates["top1_agreement"]
-                    and quality.get("greedy_agreement") is True
                 )
+                if not quality_numbers_valid:
+                    errors.append(f"row {index} quality numeric metrics are invalid")
+                top1 = quality.get("top1_agreement")
+                top1_valid = _finite_number(top1) and 0.0 <= float(top1) <= 1.0
+                if not top1_valid:
+                    errors.append(f"row {index} top1_agreement is invalid")
+                greedy = quality.get("greedy_agreement")
+                if not isinstance(greedy, bool):
+                    errors.append(f"row {index} greedy_agreement is invalid")
+                computed_gate = False
+                if quality_numbers_valid and top1_valid and isinstance(greedy, bool):
+                    computed_gate = (
+                        float(quality["max_abs_logit"]) <= gates["max_abs_logit"]
+                        and float(quality["mean_abs_logit"]) <= gates["mean_abs_logit"]
+                        and float(quality["kl_divergence"]) <= gates["kl_divergence"]
+                        and float(top1) >= gates["top1_agreement"]
+                        and greedy is True
+                    )
                 if row.get("quality_gate_pass") is not computed_gate:
                     errors.append(
                         f"row {index} quality_gate_pass disagrees with quality metrics"
                     )
                 backend = row.get("backend")
                 expected_layer_calls = expected_decode_tokens * 28
-                if backend == "baseline" and (
-                    any(
-                        float(quality.get(key, math.inf)) != 0.0
-                        for key in numeric_quality
+                if (
+                    backend == "baseline"
+                    and quality_numbers_valid
+                    and top1_valid
+                    and (
+                        any(float(quality[key]) != 0.0 for key in numeric_quality)
+                        or top1 != 1.0
+                        or greedy is not True
                     )
-                    or quality.get("top1_agreement") != 1.0
-                    or quality.get("greedy_agreement") is not True
                 ):
                     errors.append(
                         f"row {index} baseline quality must be exact zero-drift"
@@ -229,9 +342,9 @@ def validate_replay_artifact(
                 dispatch = row["dispatch"]
                 if dispatch.get("fallback") is not False:
                     errors.append(f"row {index} fallback must be false")
-                if (
-                    backend == "baseline"
-                    and dispatch.get("standard_attention_calls", 0) <= 0
+                if backend == "baseline" and (
+                    not _finite_number(dispatch.get("standard_attention_calls"))
+                    or dispatch["standard_attention_calls"] <= 0
                 ):
                     errors.append(f"row {index} baseline attention dispatch is missing")
                 if (
@@ -276,15 +389,18 @@ def validate_replay_artifact(
                     for key in memory_keys
                 ):
                     errors.append(f"row {index} memory byte accounting is invalid")
-                elif memory["unique_resident_bytes"] < memory["physical_cache_bytes"]:
-                    errors.append(
-                        f"row {index} unique resident bytes undercount physical cache"
-                    )
-                if backend == "parallel_direct" and (
-                    memory["workspace_bytes"] <= 0
-                    or memory["arena_capacity_bytes"] <= 0
-                ):
-                    errors.append(f"row {index} parallel memory reservation is missing")
+                else:
+                    if memory["unique_resident_bytes"] < memory["physical_cache_bytes"]:
+                        errors.append(
+                            f"row {index} unique resident bytes undercount physical cache"
+                        )
+                    if backend == "parallel_direct" and (
+                        memory["workspace_bytes"] <= 0
+                        or memory["arena_capacity_bytes"] <= 0
+                    ):
+                        errors.append(
+                            f"row {index} parallel memory reservation is missing"
+                        )
                 timing = row["timing"]
                 if (
                     not isinstance(timing.get("decode_token_ms"), list)
@@ -605,6 +721,27 @@ def run_replay(
         "model_path": None if model_path is None else str(model_path),
         "stream_seed": config["stream_seed"],
     }
+    if model_path is not None:
+        fixture, fixture_error = _fixture_identity(model_path, config)
+        if fixture_error is not None:
+            reason = f"model fixture rejected: {fixture_error}"
+            artifact["rows"] = [
+                _unavailable_row(context, backend, source, reason)
+                for context in config["contexts"]
+                for backend in config["backends"]
+            ]
+            artifact["status"] = "unavailable"
+            validation = validate_replay_artifact(artifact, config)
+            if not validation.valid:
+                raise RuntimeError(
+                    "unavailable artifact failed validation: "
+                    + "; ".join(validation.errors)
+                )
+            write_json(str(output_path), artifact)
+            return artifact
+        assert fixture is not None
+        source = {**source, "model_fixture": fixture}
+        artifact["source_identity"] = source
     seed_everything(config["stream_seed"], deterministic=True)
     try:
         import torch

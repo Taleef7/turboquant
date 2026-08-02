@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ import torch
 
 from scripts.replay_qwen25_fixed_tokens import (
     _direct_memory,
+    _fixture_identity,
     build_unavailable_artifact,
     expected_row_ids,
     load_replay_config,
@@ -20,6 +22,39 @@ from core.profiles import load_profile
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "configs" / "benchmarks" / "qwen25-fixed-replay-v1.json"
+
+
+def _write_snapshot_fixture(root: Path, *, revision: str | None = None) -> Path:
+    config = load_replay_config(CONFIG)
+    snapshot = (
+        root
+        / "models--Qwen--Qwen2.5-7B-Instruct"
+        / "snapshots"
+        / (revision or config["model_revision"])
+    )
+    snapshot.mkdir(parents=True)
+    model_config = {
+        "model_type": "qwen2",
+        "hidden_size": 3584,
+        "num_hidden_layers": 28,
+        "num_attention_heads": 28,
+        "num_key_value_heads": 4,
+    }
+    (snapshot / "config.json").write_text(json.dumps(model_config), encoding="utf-8")
+    (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (snapshot / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    (snapshot / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.embed_tokens.weight": "model-00001-of-00001.safetensors"
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snapshot / "model-00001-of-00001.safetensors").write_bytes(b"fixture")
+    return snapshot
 
 
 def _completed_fixture(config: dict) -> dict:
@@ -233,6 +268,65 @@ def test_validator_rejects_memory_undercount_mutation() -> None:
     result = validate_replay_artifact(artifact, config)
     assert not result.valid
     assert any("undercount physical" in error for error in result.errors)
+
+
+def test_validator_returns_errors_for_malformed_completed_rows() -> None:
+    config = load_replay_config(CONFIG)
+    artifact = build_unavailable_artifact(config, config_path=CONFIG, reason="fixture")
+    artifact["status"] = "diagnostic"
+    for row in artifact["rows"]:
+        row.update(
+            {
+                "status": "completed",
+                "quality": {},
+                "quality_gate_pass": False,
+                "dispatch": {},
+                "memory": {},
+                "timing": {},
+            }
+        )
+    result = validate_replay_artifact(artifact, config)
+    assert not result.valid
+    assert result.errors
+
+
+def test_fixture_identity_rejects_unpinned_local_path(tmp_path: Path) -> None:
+    config = load_replay_config(CONFIG)
+    snapshot = _write_snapshot_fixture(tmp_path, revision="wrong-revision")
+    identity, reason = _fixture_identity(snapshot, config)
+    assert identity is None
+    assert reason is not None
+    assert "pinned HF snapshot layout" in reason
+
+
+def test_fixture_identity_rejects_architecture_mismatch(tmp_path: Path) -> None:
+    config = load_replay_config(CONFIG)
+    snapshot = _write_snapshot_fixture(tmp_path)
+    config_payload = json.loads((snapshot / "config.json").read_text(encoding="utf-8"))
+    config_payload["num_hidden_layers"] = 32
+    (snapshot / "config.json").write_text(json.dumps(config_payload), encoding="utf-8")
+    identity, reason = _fixture_identity(snapshot, config)
+    assert identity is None
+    assert reason is not None
+    assert "architecture mismatch" in reason
+
+
+def test_fixture_identity_records_manifest_for_pinned_snapshot(tmp_path: Path) -> None:
+    config = load_replay_config(CONFIG)
+    snapshot = _write_snapshot_fixture(tmp_path)
+    identity, reason = _fixture_identity(snapshot, config)
+    assert reason is None
+    assert identity is not None
+    assert identity["snapshot_id"] == config["model_revision"]
+    assert identity["resolved_path"] == str(snapshot.resolve())
+    assert identity["manifest_sha256"]
+    assert {entry["path"] for entry in identity["files"]} == {
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "model.safetensors.index.json",
+        "model-00001-of-00001.safetensors",
+    }
 
 
 @pytest.mark.parametrize(
