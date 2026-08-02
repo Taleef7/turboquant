@@ -30,8 +30,10 @@ CUDA-event trials per row. The output is schema-v2 and explicitly labelled
 `diagnostic_only`; it records page-launch counters, allocator/workspace bytes,
 and a packed-reference parity check. `serial` is the default reference,
 `page-state` measures independent page states, and `parallel` measures the
-complete four-launch path (query rotation, page states, chronological
-reduction, and fixed-stride tail merge). The parallel row reports reusable
+complete path (identity query cast/copy, page states, chronological reduction,
+and fixed-stride tail merge). The identity cast/copy is included in each timed
+parallel launch; the model-specific non-identity rotation kernel belongs to
+the later integration stage. The parallel row reports reusable
 workspace bytes separately from packed arena capacity and runtime allocator
 bytes. These measurements are engineering diagnostics, not an end-to-end
 model or speed claim.

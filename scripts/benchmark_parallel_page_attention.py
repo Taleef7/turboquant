@@ -543,6 +543,10 @@ def _allocation_probe_parallel(
                 return _original(*args, **kwargs)
 
             stack.enter_context(_patch_attribute(torch, name, wrapped))
+        # The synthetic fixture uses an identity rotation.  Include the
+        # storage-owned cast/copy in the hot path without allocating a tensor;
+        # model-specific non-identity rotation is an integration concern.
+        workspace.rotated_query.copy_(query)  # type: ignore[attr-defined]
         launch_qwen25_page_states(
             query,
             arena,  # type: ignore[arg-type]
@@ -607,7 +611,7 @@ def _run_parallel_row(page_count: int, *, seed: int) -> dict[str, object]:
     arena.append_tail(tail_keys, tail_values)
     query = query_cpu.to(device)
     workspace = reserve_parallel_page_workspace(page_capacity=page_count, device=device)
-    workspace.rotated_query.copy_(query.float())
+    workspace.rotated_query.copy_(query)
     output = torch.empty((QUERY_HEADS, HEAD_DIM), device=device, dtype=torch.float32)
     scale = 1 / math.sqrt(HEAD_DIM)
     torch.cuda.synchronize()
@@ -615,6 +619,10 @@ def _run_parallel_row(page_count: int, *, seed: int) -> dict[str, object]:
     baseline_allocated = int(torch.cuda.memory_allocated())
 
     def launch_once() -> None:
+        # Keep the rotation-stage accounting honest: this diagnostic fixture
+        # uses identity rotation, so the stage is a dtype-casting copy into
+        # the session-owned buffer.  Task 6 owns the model rotation kernel.
+        workspace.rotated_query.copy_(query)
         launch_qwen25_page_states(
             query,
             arena,
