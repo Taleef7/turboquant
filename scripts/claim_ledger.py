@@ -15,9 +15,7 @@ from scripts.benchmark_schema import (
 )
 
 
-def _resolve_claim_value(
-    row: Mapping[str, Any], query: str, *, repo_root: Path
-) -> Any:
+def _resolve_claim_value(row: Mapping[str, Any], query: str, *, repo_root: Path) -> Any:
     if query.startswith("metrics."):
         return _resolve_dotted_path(row, query)
     if query.startswith("sidecar:") and "#" in query:
@@ -40,7 +38,9 @@ def _resolve_claim_value(
             payload = load_strict_json(sidecar_path)
             return _resolve_dotted_path(payload, json_path)
         except (OSError, UnicodeError, ValueError, KeyError) as exc:
-            raise ValueError(f"claim query cannot read sidecar {relative}: {exc}") from exc
+            raise ValueError(
+                f"claim query cannot read sidecar {relative}: {exc}"
+            ) from exc
     raise ValueError(f"claim query is not exact: {query!r}")
 
 
@@ -55,8 +55,24 @@ def _claims_from_payload(
     if not result.valid:
         raise ValueError("; ".join(result.errors))
     eligibility_errors: list[str] = []
-    if payload["status"] != "qualified":
-        eligibility_errors.append("claim ledger requires a qualified artifact")
+    if payload["status"] in {"failed", "invalid"}:
+        eligibility_errors.append(f"claim ledger rejects {payload['status']} artifacts")
+    elif payload["status"] not in {"qualified", "partial"}:
+        eligibility_errors.append(
+            "claim ledger requires a qualified or clean partial artifact"
+        )
+    if payload["status"] == "partial":
+        disallowed = {
+            row["status"]
+            for row in payload["rows"]
+            if row["status"] in {"failed", "invalid", "oom"}
+        }
+        if disallowed:
+            eligibility_errors.append(
+                "claim ledger rejects partial artifacts with "
+                + ", ".join(sorted(disallowed))
+                + " rows"
+            )
     if payload["source"]["dirty"]:
         eligibility_errors.append("claim ledger requires a clean source")
     artifact_id = payload["artifact_id"]
@@ -64,9 +80,7 @@ def _claims_from_payload(
     for claim in payload["claims"]:
         row = rows_by_id[claim["row_id"]]
         if row["status"] != "passed":
-            eligibility_errors.append(
-                f"claim row {claim['row_id']} must be passed"
-            )
+            eligibility_errors.append(f"claim row {claim['row_id']} must be passed")
     if eligibility_errors:
         raise ValueError("; ".join(eligibility_errors))
     resolved: list[dict[str, object]] = []

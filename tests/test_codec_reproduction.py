@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from copy import deepcopy
 import hashlib
 import importlib
 import json
@@ -87,9 +88,9 @@ def test_checked_in_config_materializes_independent_seed_schedules() -> None:
     assert [fixture["independent_query_seed"] for fixture in fixtures] == list(
         range(4_000_000, 4_000_012)
     )
-    assert [
-        fixture["high_inner_product_noise_seed"] for fixture in fixtures
-    ] == list(range(5_000_000, 5_000_012))
+    assert [fixture["high_inner_product_noise_seed"] for fixture in fixtures] == list(
+        range(5_000_000, 5_000_012)
+    )
 
 
 def test_checked_in_config_declares_formulas_and_pinned_glove_input() -> None:
@@ -119,14 +120,12 @@ def test_checked_in_config_declares_formulas_and_pinned_glove_input() -> None:
 
 def test_retrieval_dependency_is_optional_and_runtime_certified() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    runtime_input = (ROOT / "requirements" / "runtime.in").read_text(
-        encoding="utf-8"
-    )
+    runtime_input = (ROOT / "requirements" / "runtime.in").read_text(encoding="utf-8")
 
-    assert project["project"]["optional-dependencies"]["retrieval"] == [
-        "h5py>=3.16,<4"
-    ]
-    assert "h5py\n" in runtime_input
+    assert project["project"]["optional-dependencies"]["retrieval"] == ["h5py>=3.16,<4"]
+    assert runtime_input.splitlines().count("h5py>=3.16,<4") == 1
+    runtime_lock = (ROOT / "requirements" / "runtime.lock").read_text(encoding="utf-8")
+    assert runtime_lock.splitlines().count("h5py==3.16.0") == 1
 
 
 def test_execution_class_records_cpu_timing_and_lock_reproducibility() -> None:
@@ -137,13 +136,34 @@ def test_execution_class_records_cpu_timing_and_lock_reproducibility() -> None:
     assert extensions["environment"]["python_version"]
     assert extensions["environment"]["torch_version"]
     assert extensions["h5py_version"] == "3.16.0"
-    assert extensions["runtime_lock_sha256"] == hashlib.sha256(
-        (ROOT / "requirements" / "runtime.lock").read_bytes()
-    ).hexdigest()
+    assert (
+        extensions["runtime_lock_sha256"]
+        == hashlib.sha256(
+            (ROOT / "requirements" / "runtime.lock").read_bytes()
+        ).hexdigest()
+    )
     assert extensions["cpu_model"]
     assert extensions["operating_system"]
     assert extensions["torch_intraop_threads"] > 0
     assert extensions["torch_interop_threads"] > 0
+    assert set(extensions["thread_environment"]) == {
+        "MALLOC_ARENA_MAX",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "VECLIB_MAXIMUM_THREADS",
+    }
+    assert all(
+        isinstance(value, str) and value
+        for value in extensions["thread_environment"].values()
+    )
+    assert set(extensions["gpu_conditions"]) == {
+        "temperature_c",
+        "power_draw_w",
+        "competing_compute_processes",
+    }
     assert extensions["timing_policy"] == {
         "codec_setup_excluded": True,
         "fixture_generation_excluded": True,
@@ -167,9 +187,7 @@ def test_exact_canonical_matrix_has_1408_unique_rows_and_reuses_data() -> None:
     assert sum(row_id.startswith("syn-") for row_id in row_ids) == 1_344
     assert sum(row_id.startswith("glove200-") for row_id in row_ids) == 64
 
-    fixture_streams: dict[tuple[str, int], set[tuple[int, int, int]]] = defaultdict(
-        set
-    )
+    fixture_streams: dict[tuple[str, int], set[tuple[int, int, int]]] = defaultdict(set)
     for spec in specs:
         if spec["dataset"] == "synthetic":
             fixture_streams[(spec["distribution"], spec["dimension"])].add(
@@ -235,9 +253,7 @@ def test_query_fixtures_are_unit_length_independent_and_high_ip() -> None:
     np.testing.assert_allclose(
         np.linalg.norm(independent, axis=1), 1.0, atol=2e-6, rtol=0
     )
-    np.testing.assert_allclose(
-        np.linalg.norm(high_ip, axis=1), 1.0, atol=2e-6, rtol=0
-    )
+    np.testing.assert_allclose(np.linalg.norm(high_ip, axis=1), 1.0, atol=2e-6, rtol=0)
     np.testing.assert_allclose(
         np.sum(unit_vectors * high_ip, axis=1), 0.8, atol=2e-6, rtol=0
     )
@@ -272,13 +288,11 @@ def test_physical_byte_formula_matches_actual_packed_payload(
     codec_name: str, dimension: int, bits: int, count: int
 ) -> None:
     runner = _runner()
-    vectors = torch.linspace(
-        -1.0, 1.0, count * dimension, dtype=torch.float32
-    ).reshape(count, dimension)
+    vectors = torch.linspace(-1.0, 1.0, count * dimension, dtype=torch.float32).reshape(
+        count, dimension
+    )
     if codec_name == "mse":
-        codec = TurboQuantMSEReference(
-            TurboQuantMSEConfig(dimension, bits, 10_000)
-        )
+        codec = TurboQuantMSEReference(TurboQuantMSEConfig(dimension, bits, 10_000))
     else:
         codec = TurboQuantProductReference(
             TurboQuantProductConfig(dimension, bits, 10_000, 1_000_000)
@@ -300,8 +314,10 @@ def test_error_summary_uses_sample_sd_sem_and_student_t_interval() -> None:
     assert summary["sample_standard_deviation"] == 1.0
     assert summary["sem"] == pytest.approx(1.0 / math.sqrt(3.0))
     assert summary["student_t_95_ci"] == pytest.approx(
-        [2.0 - 4.302652729749 * math.sqrt(1.0 / 3.0),
-         2.0 + 4.302652729749 * math.sqrt(1.0 / 3.0)]
+        [
+            2.0 - 4.302652729749 * math.sqrt(1.0 / 3.0),
+            2.0 + 4.302652729749 * math.sqrt(1.0 / 3.0),
+        ]
     )
 
 
@@ -328,8 +344,7 @@ def test_product_expectation_uses_finite_float32_residual_norm() -> None:
     residual = vectors - mse_decoded
     stored = torch.linalg.vector_norm(residual, dim=-1).to(torch.float32)
     expected_vectors = mse_decoded + residual * (
-        stored.to(torch.float64)
-        / torch.linalg.vector_norm(residual, dim=-1)
+        stored.to(torch.float64) / torch.linalg.vector_norm(residual, dim=-1)
     ).unsqueeze(-1)
 
     actual = runner.product_float32_residual_expectation(
@@ -668,9 +683,7 @@ def test_paired_seed_block_bootstrap_is_deterministic_and_uses_seed_means() -> N
                     "mean_squared_l2_error": float(product_value),
                     "queries": {
                         "independent": {"rmse": float(product_value + 1.0)},
-                        "high_inner_product": {
-                            "rmse": float(product_value + 2.0)
-                        },
+                        "high_inner_product": {"rmse": float(product_value + 2.0)},
                     },
                 },
                 "extensions": {
@@ -686,7 +699,9 @@ def test_paired_seed_block_bootstrap_is_deterministic_and_uses_seed_means() -> N
             }
         )
 
-    aggregates = runner.aggregate_product_comparisons(rows, seed=1729, iterations=10_000)
+    aggregates = runner.aggregate_product_comparisons(
+        rows, seed=1729, iterations=10_000
+    )
 
     assert {aggregate["metric"] for aggregate in aggregates} == {
         "mean_squared_l2_error",
@@ -759,10 +774,10 @@ def test_glove_subset_is_normalized_and_recomputes_exact_top_one(
     assert "finite_float32_residual_expectation" not in scored["metrics"]
 
 
-def _tiny_config(tmp_path: Path) -> Path:
+def _tiny_config(tmp_path: Path, *, seed_count: int = 1) -> Path:
     config = _config()
     config["artifact_id"] = "codec-local-test"
-    config["seed_pairs"] = [config["seed_pairs"][0]]
+    config["seed_pairs"] = config["seed_pairs"][:seed_count]
     config["synthetic"]["dimensions"] = [64]
     config["synthetic"]["vector_count"] = 5
     config["synthetic"]["chunk_size"] = 2
@@ -770,9 +785,7 @@ def _tiny_config(tmp_path: Path) -> Path:
         "mse": {"nominal_total_bits": [1]},
         "product": {"nominal_total_bits": [2]},
     }
-    config["synthetic"]["distributions"] = [
-        config["synthetic"]["distributions"][0]
-    ]
+    config["synthetic"]["distributions"] = [config["synthetic"]["distributions"][0]]
     config["synthetic"]["fixtures"] = [config["synthetic"]["fixtures"][0]]
     config["glove200"]["url"] = "file:///definitely-not-present.hdf5"
     config["glove200"]["filename"] = "missing.hdf5"
@@ -796,9 +809,7 @@ def _tiny_config(tmp_path: Path) -> Path:
         "start": 0,
         "stop": 2,
         "dtype": "little-endian uint32",
-        "sha256": hashlib.sha256(
-            np.array([0, 1], dtype="<u4").tobytes()
-        ).hexdigest(),
+        "sha256": hashlib.sha256(np.array([0, 1], dtype="<u4").tobytes()).hexdigest(),
     }
     config["glove200"]["top_k"] = [1, 2]
     path = tmp_path / "tiny-codec-config.json"
@@ -891,26 +902,22 @@ def test_tiny_end_to_end_run_writes_valid_outputs_and_resumes_passed_row(
         "nominal_total_bits_per_coordinate",
         "queries",
     }
-    assert synthetic["extensions"]["timing_class"] == (
-        "local_reference_cpu_timing"
-    )
-    product = next(
-        row for row in first_manifest["rows"] if row["row_id"] == product_id
-    )
+    assert synthetic["extensions"]["timing_class"] == ("local_reference_cpu_timing")
+    product = next(row for row in first_manifest["rows"] if row["row_id"] == product_id)
     assert product["metrics"]["sample_count"] == 5
-    assert product["metrics"]["actual_physical_bytes"] == (
-        product["metrics"]["formula_physical_bytes"]
+    assert (
+        product["metrics"]["actual_physical_bytes"]
+        == (product["metrics"]["formula_physical_bytes"])
     )
-    assert product["metrics"]["effective_physical_bits_per_coordinate"] > (
-        product["metrics"]["nominal_total_bits_per_coordinate"]
+    assert (
+        product["metrics"]["effective_physical_bits_per_coordinate"]
+        > (product["metrics"]["nominal_total_bits_per_coordinate"])
     )
     assert set(product["metrics"]["finite_float32_residual_expectation"]) == {
         "independent",
         "high_inner_product",
     }
-    assert first_manifest["extensions"]["claim_labels"] == _config()[
-        "claim_labels"
-    ]
+    assert first_manifest["extensions"]["claim_labels"] == _config()["claim_labels"]
     assert first_manifest["extensions"]["retrieval_policy"] == {
         "device": "cpu",
         "base_chunk_size": 2_048,
@@ -949,28 +956,421 @@ def test_existing_corrupt_glove_file_marks_rows_invalid_not_unavailable(
     assert manifest["status"] == "invalid"
 
 
-def test_resume_fingerprint_binds_protocol_identity_config_spec_input_and_policy() -> None:
+def test_resume_fingerprint_binds_protocol_identity_config_spec_input_and_policy() -> (
+    None
+):
     runner = _runner()
     spec = runner.build_row_specs(_config())[0]
     inputs = {"synthetic_fixture_sha256": "1" * 64}
 
+    source = {"git_commit": "a" * 40, "dirty": False}
+    execution = runner._execution_class(_config())
+    paper = runner._paper(_config())
+    invocation = {
+        "argv": ["python", "scripts/run_codec_reproduction.py"],
+        "cwd": str(ROOT),
+        "normalized_command": ["python", "scripts/run_codec_reproduction.py"],
+    }
     fingerprint = runner._fingerprint(
         spec,
         CONFIG_PATH,
         inputs,
+        source=source,
+        execution_class=execution,
+        paper=paper,
+        invocation=invocation,
         retrieval_device="cpu",
         retrieval_chunk_size=2_048,
     )
 
-    assert fingerprint["protocol"] == "codec_reproduction_row_v1"
+    assert fingerprint["protocol"] == "codec_reproduction_row_v2"
     assert fingerprint["identity"] == runner.codec_identity(CONFIG_PATH)
-    assert fingerprint["config_sha256"] == hashlib.sha256(
-        CONFIG_PATH.read_bytes()
-    ).hexdigest()
+    assert (
+        fingerprint["config_sha256"]
+        == hashlib.sha256(CONFIG_PATH.read_bytes()).hexdigest()
+    )
     assert len(fingerprint["row_spec_sha256"]) == 64
     assert fingerprint["input_sha256"] == inputs
-    assert len(fingerprint["code_sha256"]) == 64
+    assert set(fingerprint["behavior_sha256"]) >= {
+        "scripts/run_codec_reproduction.py",
+        "scripts/benchmark_schema.py",
+        "scripts/repro_utils.py",
+    }
+    assert fingerprint["source"] == source
+    assert fingerprint["paper"] == paper
+    assert fingerprint["execution_class"]["name"] == execution["name"]
+    assert (
+        fingerprint["execution_class"]["extensions"]["runtime_lock_sha256"]
+        == (execution["extensions"]["runtime_lock_sha256"])
+    )
+    assert (
+        "timestamp_utc"
+        not in fingerprint["execution_class"]["extensions"]["environment"]
+    )
+    assert "invocation" not in fingerprint
     assert fingerprint["retrieval_policy"] == {
         "device": "cpu",
         "base_chunk_size": 2_048,
     }
+
+
+def test_sealed_rows_reject_metric_byte_timing_and_provenance_tampering(
+    tmp_path: Path,
+) -> None:
+    runner = _runner()
+    config_path = _tiny_config(tmp_path)
+    output_dir = tmp_path / "artifact"
+    manifest = runner.execute_reproduction(
+        config_path=config_path,
+        output_dir=output_dir,
+        dataset_cache=tmp_path / "cache",
+        allow_download=False,
+    )
+    persisted = json.loads(
+        (output_dir / "rows" / "syn-sphere-d64-mse-b1-s00.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    spec = next(
+        spec
+        for spec in runner.build_row_specs(config)
+        if spec["row_id"] == persisted["row_id"]
+    )
+    fingerprint = persisted["extensions"]["resume_fingerprint"]
+    identity = manifest["identity"]
+
+    assert persisted["extensions"]["result_sha256"] == runner.result_sha256(persisted)
+    runner.validate_persisted_row(
+        persisted,
+        spec,
+        identity,
+        fingerprint,
+        repo_root=tmp_path,
+    )
+
+    mutations = []
+    changed_metric = deepcopy(persisted)
+    changed_metric["metrics"]["mean_squared_l2_error"] += 1.0
+    mutations.append(changed_metric)
+    changed_bytes = deepcopy(persisted)
+    changed_bytes["metrics"]["actual_physical_bytes"] += 1
+    changed_bytes = runner.seal_row(changed_bytes)
+    mutations.append(changed_bytes)
+    changed_timing = deepcopy(persisted)
+    changed_timing["extensions"]["timing_class"] = "other_timing"
+    changed_timing = runner.seal_row(changed_timing)
+    mutations.append(changed_timing)
+    changed_source = deepcopy(persisted)
+    changed_source["extensions"]["resume_fingerprint"]["source"]["dirty"] = not (
+        changed_source["extensions"]["resume_fingerprint"]["source"]["dirty"]
+    )
+    changed_source = runner.seal_row(changed_source)
+    mutations.append(changed_source)
+    changed_runtime = deepcopy(persisted)
+    changed_runtime["extensions"]["resume_fingerprint"]["execution_class"][
+        "extensions"
+    ]["runtime_lock_sha256"] = "f" * 64
+    changed_runtime = runner.seal_row(changed_runtime)
+    mutations.append(changed_runtime)
+    changed_spec = deepcopy(persisted)
+    changed_spec["extensions"]["row_spec"]["dimension"] = 128
+    changed_spec = runner.seal_row(changed_spec)
+    mutations.append(changed_spec)
+    changed_sidecars = deepcopy(persisted)
+    changed_sidecars["sidecars"] = [
+        {"path": "missing-summary.json", "sha256": "0" * 64, "available": True}
+    ]
+    changed_sidecars = runner.seal_row(changed_sidecars)
+    mutations.append(changed_sidecars)
+
+    for changed in mutations:
+        with pytest.raises(ValueError):
+            runner.validate_persisted_row(
+                changed,
+                spec,
+                identity,
+                fingerprint,
+                repo_root=tmp_path,
+            )
+
+
+@pytest.mark.parametrize("stage", ("load", "exact_top1", "sidecar"))
+def test_shared_glove_preparation_oom_is_stage_specific(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    runner = _runner()
+    config = json.loads(_tiny_config(tmp_path).read_text(encoding="utf-8"))
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / config["glove200"]["filename"]).write_bytes(b"x")
+    monkeypatch.setattr(
+        runner,
+        "validate_glove_file",
+        lambda path, expected: {"sha256": "a" * 64},
+    )
+    base = np.eye(3, 64, dtype=np.float32)
+    queries = np.eye(2, 64, dtype=np.float32)
+    if stage == "load":
+        monkeypatch.setattr(
+            runner,
+            "load_normalized_glove_arrays",
+            lambda *args, **kwargs: (_ for _ in ()).throw(MemoryError("load")),
+        )
+    else:
+        monkeypatch.setattr(
+            runner,
+            "load_normalized_glove_arrays",
+            lambda *args, **kwargs: (base, queries),
+        )
+    if stage == "exact_top1":
+        monkeypatch.setattr(
+            runner,
+            "exact_top_one",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                torch.OutOfMemoryError("exact")
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            runner,
+            "exact_top_one",
+            lambda *args, **kwargs: np.array([0, 1], dtype="<u4"),
+        )
+    if stage == "sidecar":
+        monkeypatch.setattr(
+            runner,
+            "_atomic_write",
+            lambda *args, **kwargs: (_ for _ in ()).throw(MemoryError("sidecar")),
+        )
+
+    context = runner._prepare_glove(
+        config,
+        cache,
+        tmp_path / "artifact",
+        allow_download=False,
+        retrieval_device="cpu",
+        retrieval_chunk_size=2,
+    )
+
+    assert context["state"] == "oom"
+    assert stage.replace("_top1", "") in context["reason"]
+
+
+def test_shared_glove_oom_marks_all_glove_rows_and_keeps_synthetic_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner()
+    config_path = _tiny_config(tmp_path)
+    monkeypatch.setattr(
+        runner,
+        "_prepare_glove",
+        lambda *args, **kwargs: {
+            "state": "oom",
+            "reason": "GloVe load out of memory: injected",
+        },
+    )
+
+    manifest = runner.execute_reproduction(
+        config_path=config_path,
+        output_dir=tmp_path / "artifact",
+        dataset_cache=tmp_path / "cache",
+        allow_download=False,
+    )
+
+    assert manifest["pass_state_counts"]["passed"] == 2
+    assert manifest["pass_state_counts"]["oom"] == 1
+    assert manifest["status"] == "failed"
+
+
+def _aggregate_synthetic_rows(seed_count: int = 16) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for pair_id in range(seed_count):
+        for codec, offset in (("mse", 0.0), ("product", 0.25)):
+            base = pair_id / 10.0 + offset
+            rows.append(
+                {
+                    "row_id": f"syn-sphere-d64-{codec}-b2-s{pair_id:02d}",
+                    "status": "passed",
+                    "metrics": {
+                        "sample_count": 10_000,
+                        "mean_squared_l2_error": base + 1.0,
+                        "relative_squared_error": base + 2.0,
+                        "queries": {
+                            "independent": {
+                                "rmse": base + 3.0,
+                                "signed_bias": base + 4.0,
+                            },
+                            "high_inner_product": {
+                                "rmse": base + 5.0,
+                                "signed_bias": base + 6.0,
+                            },
+                        },
+                        "finite_float32_residual_expectation": (
+                            {
+                                "independent": {"signed_bias": base + 7.0},
+                                "high_inner_product": {"signed_bias": base + 8.0},
+                            }
+                            if codec == "product"
+                            else {}
+                        ),
+                    },
+                    "extensions": {
+                        "row_spec": {
+                            "dataset": "synthetic",
+                            "distribution": "sphere",
+                            "dimension": 64,
+                            "codec": codec,
+                            "nominal_total_bits": 2,
+                            "pair_id": pair_id,
+                        }
+                    },
+                }
+            )
+    return rows
+
+
+def test_across_seed_student_t_aggregates_require_exactly_16_seed_means() -> None:
+    runner = _runner()
+    rows = _aggregate_synthetic_rows()
+
+    first = runner.aggregate_seed_statistics(rows, expected_seed_count=16)
+    changed_counts = deepcopy(rows)
+    for index, row in enumerate(changed_counts):
+        row["metrics"]["sample_count"] = 10 + index
+    second = runner.aggregate_seed_statistics(changed_counts, expected_seed_count=16)
+
+    assert first == second
+    assert first
+    assert all(item["status"] == "complete" for item in first)
+    assert all(item["seed_count"] == 16 for item in first)
+    metric_names = {item["metric"] for item in first}
+    assert {
+        "mean_squared_l2_error",
+        "relative_squared_error",
+        "queries.independent.rmse",
+        "queries.independent.signed_bias",
+        "queries.high_inner_product.rmse",
+        "queries.high_inner_product.signed_bias",
+        "finite_float32_residual_expectation.independent.signed_bias",
+        "finite_float32_residual_expectation.high_inner_product.signed_bias",
+    } <= metric_names
+    complete = first[0]["statistics"]
+    assert set(complete) == {
+        "count",
+        "mean",
+        "sample_standard_deviation",
+        "sem",
+        "student_t_95_ci",
+    }
+
+    incomplete = runner.aggregate_seed_statistics(
+        _aggregate_synthetic_rows(15), expected_seed_count=16
+    )
+    assert incomplete
+    assert all(item["status"] == "incomplete" for item in incomplete)
+    assert all(item["seed_count"] == 15 for item in incomplete)
+    assert all("statistics" not in item for item in incomplete)
+
+
+def test_glove_retrieval_aggregates_across_all_16_seeds() -> None:
+    runner = _runner()
+    rows = [
+        {
+            "row_id": f"glove200-mse-b2-s{pair_id:02d}",
+            "status": "passed",
+            "metrics": {
+                "sample_count": 100_000,
+                "retrieval": {"1@1": 0.1 + pair_id / 100.0, "1@10": 0.5},
+            },
+            "extensions": {
+                "row_spec": {
+                    "dataset": "glove200",
+                    "dimension": 200,
+                    "codec": "mse",
+                    "nominal_total_bits": 2,
+                    "pair_id": pair_id,
+                }
+            },
+        }
+        for pair_id in range(16)
+    ]
+
+    aggregates = runner.aggregate_seed_statistics(rows, expected_seed_count=16)
+
+    assert {item["metric"] for item in aggregates} == {
+        "retrieval.1@1",
+        "retrieval.1@10",
+    }
+    assert all(item["status"] == "complete" for item in aggregates)
+
+
+def test_across_seed_roster_emits_incomplete_groups_without_survivor_rows(
+    tmp_path: Path,
+) -> None:
+    runner = _runner()
+    config_path = _tiny_config(tmp_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    specs = runner.build_row_specs(config)
+
+    aggregates = runner.aggregate_seed_statistics(
+        [], specs=specs, top_k=config["glove200"]["top_k"], expected_seed_count=16
+    )
+
+    assert aggregates
+    assert any(
+        item["dataset"] == "synthetic"
+        and item["metric"] == "mean_squared_l2_error"
+        and item["status"] == "incomplete"
+        and item["seed_count"] == 0
+        for item in aggregates
+    )
+
+
+def test_tiny_artifact_claim_bridge_is_deterministic_and_ledger_resolvable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts.claim_ledger import build_claim_ledger_from_payloads
+
+    runner = _runner()
+    monkeypatch.setattr(
+        runner,
+        "_source_metadata",
+        lambda: {"git_commit": "a" * 40, "dirty": False},
+    )
+    config_path = _tiny_config(tmp_path, seed_count=16)
+    output = tmp_path / "artifact"
+    first = runner.execute_reproduction(
+        config_path=config_path,
+        output_dir=output,
+        dataset_cache=tmp_path / "cache",
+        allow_download=False,
+    )
+    persisted_paths = sorted((output / "rows").glob("*.json"))
+    persisted_before = {path.name: path.read_bytes() for path in persisted_paths}
+    summary_path = output / "claim-summary.json"
+    summary_before = summary_path.read_bytes()
+    summary_mtime = summary_path.stat().st_mtime_ns
+    second = runner.execute_reproduction(
+        config_path=config_path,
+        output_dir=output,
+        dataset_cache=tmp_path / "cache",
+        allow_download=False,
+    )
+
+    assert summary_path.read_bytes() == summary_before
+    assert summary_path.stat().st_mtime_ns == summary_mtime
+    for path in persisted_paths:
+        if json.loads(path.read_text(encoding="utf-8"))["status"] == "passed":
+            assert path.read_bytes() == persisted_before[path.name]
+    assert len(first["rows"]) == 48
+    assert len(second["rows"]) == 48
+    assert first["claims"]
+    assert all(
+        claim["extensions"]["caution_labels"] == _config()["claim_labels"]
+        for claim in first["claims"]
+    )
+    assert all(claim["query"].startswith("sidecar:") for claim in first["claims"])
+    ledger = build_claim_ledger_from_payloads([first], repo_root=tmp_path)
+    assert ledger["claims"]

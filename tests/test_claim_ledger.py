@@ -103,8 +103,66 @@ def test_claim_ledger_rejects_dirty_partial_manifests(tmp_path: Path) -> None:
 
     with pytest.raises(
         ValueError,
-        match="claim ledger requires a qualified artifact.*clean source",
+        match="claim ledger requires a clean source",
     ):
+        build_claim_ledger_from_payloads([manifest], repo_root=tmp_path)
+
+
+def test_claim_ledger_accepts_clean_partial_artifact_with_passed_claim_row(
+    tmp_path: Path,
+) -> None:
+    manifest = make_valid_v2_artifact(tmp_path)
+    manifest["status"] = "partial"
+    unavailable = deepcopy(manifest["rows"][0])
+    unavailable.update(
+        {
+            "row_id": "row-unavailable",
+            "status": "unavailable",
+            "reason": "optional input missing",
+            "metrics": {},
+            "sidecars": [],
+        }
+    )
+    manifest["rows"].append(unavailable)
+    manifest["expected_row_ids"].append("row-unavailable")
+    manifest["pass_state_counts"]["unavailable"] = 1
+
+    ledger = build_claim_ledger_from_payloads([manifest], repo_root=tmp_path)
+
+    assert ledger["claims"][0]["row_id"] == "row-pass"
+
+
+@pytest.mark.parametrize("status", ("failed", "invalid"))
+def test_claim_ledger_rejects_failed_or_invalid_artifacts(
+    tmp_path: Path, status: str
+) -> None:
+    manifest = make_valid_v2_artifact(tmp_path)
+    manifest["status"] = status
+
+    with pytest.raises(ValueError, match="claim ledger rejects"):
+        build_claim_ledger_from_payloads([manifest], repo_root=tmp_path)
+
+
+def test_claim_ledger_rejects_partial_with_unclaimed_failed_row(
+    tmp_path: Path,
+) -> None:
+    manifest = make_valid_v2_artifact(tmp_path)
+    manifest["status"] = "partial"
+    failed = deepcopy(manifest["rows"][0])
+    failed.update(
+        {
+            "row_id": "row-failed",
+            "status": "failed",
+            "reason": "benchmark failed",
+            "metrics": {},
+            "sidecars": [],
+        }
+    )
+    manifest["rows"].append(failed)
+    manifest["expected_row_ids"].append("row-failed")
+    manifest["pass_state_counts"]["failed"] = 1
+
+    with pytest.raises(ValueError, match="partial artifacts with failed"):
         build_claim_ledger_from_payloads([manifest], repo_root=tmp_path)
 
 
@@ -144,9 +202,9 @@ def test_claim_ledger_reads_sidecar_only_for_an_explicit_sidecar_query(
     tmp_path: Path,
 ) -> None:
     manifest = make_valid_v2_artifact(tmp_path)
-    manifest["claims"][0]["query"] = (
-        "sidecar:evidence/row-pass.json#samples.0.latency_ms"
-    )
+    manifest["claims"][0][
+        "query"
+    ] = "sidecar:evidence/row-pass.json#samples.0.latency_ms"
 
     ledger = build_claim_ledger_from_payloads([manifest], repo_root=tmp_path)
 

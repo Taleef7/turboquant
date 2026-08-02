@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -44,10 +45,13 @@ from scripts.repro_utils import (  # noqa: E402
 )
 
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
-RESUME_PROTOCOL = "codec_reproduction_row_v1"
+RESUME_PROTOCOL = "codec_reproduction_row_v2"
 DEFAULT_RETRIEVAL_CHUNK_SIZE = 2_048
 _CODEC_SOURCE_PATHS = (
     "scripts/run_codec_reproduction.py",
+    "scripts/benchmark_schema.py",
+    "scripts/repro_utils.py",
+    "scripts/claim_ledger.py",
     "core/paper_mse.py",
     "core/paper_product.py",
     "core/paper_codebook.py",
@@ -70,13 +74,12 @@ def _sha256_json(value: object) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
-def _behavior_sha256() -> str:
-    digest = hashlib.sha256()
+def _behavior_sha256() -> dict[str, str]:
+    result: dict[str, str] = {}
     for relative in _CODEC_SOURCE_PATHS:
         path = ROOT / relative
-        digest.update(relative.encode("utf-8"))
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
+        result[relative] = sha256_file(path)
+    return result
 
 
 def codec_identity(config_path: str | Path) -> dict[str, str]:
@@ -93,11 +96,12 @@ def codec_identity(config_path: str | Path) -> dict[str, str]:
     }
 
 
-def _fixture_lookup(config: Mapping[str, Any]) -> dict[tuple[str, int], Mapping[str, Any]]:
+def _fixture_lookup(
+    config: Mapping[str, Any],
+) -> dict[tuple[str, int], Mapping[str, Any]]:
     fixtures = config["synthetic"]["fixtures"]
     return {
-        (fixture["distribution"], fixture["dimension"]): fixture
-        for fixture in fixtures
+        (fixture["distribution"], fixture["dimension"]): fixture for fixture in fixtures
     }
 
 
@@ -107,9 +111,7 @@ def build_row_specs(config: Mapping[str, Any]) -> list[dict[str, Any]]:
     synthetic = config["synthetic"]
     fixtures = _fixture_lookup(config)
     specs: list[dict[str, Any]] = []
-    for distribution in (
-        item["name"] for item in synthetic["distributions"]
-    ):
+    for distribution in (item["name"] for item in synthetic["distributions"]):
         for dimension in synthetic["dimensions"]:
             fixture = fixtures[(distribution, dimension)]
             for codec_name in ("mse", "product"):
@@ -155,9 +157,7 @@ def build_row_specs(config: Mapping[str, Any]) -> list[dict[str, Any]]:
                 pair_id = pair["pair_id"]
                 specs.append(
                     {
-                        "row_id": (
-                            f"glove200-{codec_name}-b{bits}-s{pair_id:02d}"
-                        ),
+                        "row_id": (f"glove200-{codec_name}-b{bits}-s{pair_id:02d}"),
                         "dataset": "glove200",
                         "dimension": dimension,
                         "codec": codec_name,
@@ -165,9 +165,7 @@ def build_row_specs(config: Mapping[str, Any]) -> list[dict[str, Any]]:
                         "pair_id": pair_id,
                         "rotation_seed": pair["rotation_seed"],
                         "projection_seed": (
-                            pair["projection_seed"]
-                            if codec_name == "product"
-                            else None
+                            pair["projection_seed"] if codec_name == "product" else None
                         ),
                     }
                 )
@@ -204,12 +202,14 @@ def _validate_config(config: Mapping[str, Any], *, canonical: bool) -> None:
     if canonical and (len(row_ids) != 1_408 or len(fixtures) != 12):
         raise ValueError("canonical config must materialize 1,408 rows and 12 fixtures")
     base_ids, query_ids = glove_selection_ids(config["glove200"])
-    if hashlib.sha256(base_ids.tobytes()).hexdigest() != (
-        config["glove200"]["base_selection"]["sha256"]
+    if (
+        hashlib.sha256(base_ids.tobytes()).hexdigest()
+        != (config["glove200"]["base_selection"]["sha256"])
     ):
         raise ValueError("GloVe base selection ID SHA-256 mismatch")
-    if hashlib.sha256(query_ids.tobytes()).hexdigest() != (
-        config["glove200"]["query_selection"]["sha256"]
+    if (
+        hashlib.sha256(query_ids.tobytes()).hexdigest()
+        != (config["glove200"]["query_selection"]["sha256"])
     ):
         raise ValueError("GloVe query selection ID SHA-256 mismatch")
 
@@ -218,9 +218,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
     payload = load_strict_json(Path(path))
     if not isinstance(payload, dict):
         raise ValueError("codec reproduction config must contain an object")
-    canonical = Path(path).resolve() == (
-        ROOT / "configs" / "benchmarks" / "codec-local-v1.json"
-    ).resolve()
+    canonical = (
+        Path(path).resolve()
+        == (ROOT / "configs" / "benchmarks" / "codec-local-v1.json").resolve()
+    )
     _validate_config(payload, canonical=canonical)
     return payload
 
@@ -242,17 +243,13 @@ def _synthetic_vectors(
     if distribution == "sphere":
         return _normalize_rows(generator.standard_normal((count, dimension)))
     if distribution == "gaussian":
-        values = generator.standard_normal((count, dimension)) / math.sqrt(
-            dimension
-        )
+        values = generator.standard_normal((count, dimension)) / math.sqrt(dimension)
     elif distribution == "heavy_tail":
         values = generator.standard_t(3, size=(count, dimension)) / math.sqrt(
             3 * dimension
         )
     elif distribution == "outlier":
-        values = generator.standard_normal((count, dimension)) / math.sqrt(
-            dimension
-        )
+        values = generator.standard_normal((count, dimension)) / math.sqrt(dimension)
         coordinates = generator.integers(0, dimension, size=count)
         signs = generator.integers(0, 2, size=count) * 2 - 1
         values[np.arange(count), coordinates] += 8.0 * signs
@@ -298,9 +295,7 @@ class _SyntheticStream:
         vectors = _synthetic_vectors(
             self.distribution, self.dimension, count, self.data
         )
-        independent, high_ip = _query_fixture(
-            vectors, self.independent, self.high_ip
-        )
+        independent, high_ip = _query_fixture(vectors, self.independent, self.high_ip)
         return {
             "vectors": vectors,
             "independent_queries": independent,
@@ -320,12 +315,8 @@ def _synthetic_stream(
         distribution=distribution,
         dimension=dimension,
         data=np.random.Generator(np.random.PCG64(data_seed)),
-        independent=np.random.Generator(
-            np.random.PCG64(independent_query_seed)
-        ),
-        high_ip=np.random.Generator(
-            np.random.PCG64(high_inner_product_noise_seed)
-        ),
+        independent=np.random.Generator(np.random.PCG64(independent_query_seed)),
+        high_ip=np.random.Generator(np.random.PCG64(high_inner_product_noise_seed)),
     )
 
 
@@ -375,9 +366,7 @@ class _Moments:
         if self.count < 2:
             raise ValueError("Student-t summary requires at least two observations")
         bias = self.total / self.count
-        variance = (
-            self.total_square - self.count * bias * bias
-        ) / (self.count - 1)
+        variance = (self.total_square - self.count * bias * bias) / (self.count - 1)
         standard_deviation = math.sqrt(max(0.0, variance))
         sem = standard_deviation / math.sqrt(self.count)
         critical = float(student_t.ppf(0.975, df=self.count - 1))
@@ -423,8 +412,7 @@ def product_float32_residual_expectation(
     ratio = torch.zeros_like(residual_norm)
     nonzero = residual_norm > 0
     ratio[nonzero] = (
-        stored_residual_norm.to(torch.float64)[nonzero]
-        / residual_norm[nonzero]
+        stored_residual_norm.to(torch.float64)[nonzero] / residual_norm[nonzero]
     )
     expected = mse_decoded + residual * ratio.unsqueeze(-1)
     return (queries.to(torch.float64) * expected).sum(dim=-1)
@@ -446,8 +434,307 @@ def can_resume_row(
 ) -> bool:
     return (
         row.get("status") in {"passed", "failed", "unsupported"}
-        and row.get("extensions", {}).get("resume_fingerprint")
-        == expected_fingerprint
+        and row.get("extensions", {}).get("resume_fingerprint") == expected_fingerprint
+    )
+
+
+def result_sha256(row: Mapping[str, Any]) -> str:
+    """Hash a persisted row while excluding the seal itself."""
+    payload = deepcopy(dict(row))
+    extensions = payload.get("extensions")
+    if isinstance(extensions, dict):
+        extensions.pop("result_sha256", None)
+    return _sha256_json(payload)
+
+
+def seal_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a JSON-safe copy with a deterministic content seal."""
+    payload = deepcopy(dict(row))
+    extensions = payload.setdefault("extensions", {})
+    if not isinstance(extensions, dict):
+        raise ValueError("row extensions must be an object")
+    extensions.pop("result_sha256", None)
+    extensions["result_sha256"] = result_sha256(payload)
+    return payload
+
+
+_BASE_METRIC_KEYS = {
+    "sample_count",
+    "dimension",
+    "mean_squared_l2_error",
+    "relative_squared_error",
+    "encode_latency_ms",
+    "decode_latency_ms",
+    "encode_latency_us_per_vector",
+    "decode_latency_us_per_vector",
+    "actual_physical_bytes",
+    "formula_physical_bytes",
+    "effective_physical_bits_per_coordinate",
+    "nominal_total_bits_per_coordinate",
+}
+_SIGNED_SUMMARY_KEYS = {
+    "count",
+    "rmse",
+    "signed_bias",
+    "sample_standard_deviation",
+    "sem",
+    "student_t_95_ci",
+}
+_GLOVE_METRIC_KEYS = {
+    "retrieval",
+    "retrieval_scoring_latency_ms",
+    "retrieval_scoring_device",
+    "retrieval_scoring_chunk_size",
+    "retrieval_algorithm",
+    "scoring_device",
+    "full_score_matrix_materialized",
+    "maximum_score_block",
+    "gpu_indexing_latency_ms",
+}
+
+
+def _require_finite_number(value: object, label: str) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+    ):
+        raise ValueError(f"{label} must be a finite number")
+    return float(value)
+
+
+def _validate_signed_summary(value: object, *, expected_count: int, label: str) -> None:
+    if not isinstance(value, Mapping) or set(value) != _SIGNED_SUMMARY_KEYS:
+        raise ValueError(f"{label} has an unexpected metric contract")
+    if value["count"] != expected_count:
+        raise ValueError(f"{label}.count does not match sample_count")
+    for key in _SIGNED_SUMMARY_KEYS - {"count", "student_t_95_ci"}:
+        _require_finite_number(value[key], f"{label}.{key}")
+    interval = value["student_t_95_ci"]
+    if not isinstance(interval, list) or len(interval) != 2:
+        raise ValueError(f"{label}.student_t_95_ci must contain two bounds")
+    for index, bound in enumerate(interval):
+        _require_finite_number(bound, f"{label}.student_t_95_ci.{index}")
+
+
+def _validate_declared_sidecars(
+    sidecars: object, *, repo_root: Path, expected_paths: Sequence[str]
+) -> None:
+    if not isinstance(sidecars, list):
+        raise ValueError("row sidecars must be a list")
+    actual_paths: list[str] = []
+    for sidecar in sidecars:
+        if not isinstance(sidecar, Mapping) or set(sidecar) != {
+            "path",
+            "sha256",
+            "available",
+        }:
+            raise ValueError("row sidecar declaration is malformed")
+        relative = sidecar["path"]
+        if (
+            not isinstance(relative, str)
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+        ):
+            raise ValueError("row sidecar path must be repository-relative")
+        target = (repo_root / relative).resolve()
+        if not target.is_relative_to(repo_root.resolve()) or not target.is_file():
+            raise ValueError(f"row sidecar is missing: {relative}")
+        if sidecar["available"] is not True:
+            raise ValueError(f"row sidecar is unavailable: {relative}")
+        if sidecar["sha256"] != sha256_file(target):
+            raise ValueError(f"row sidecar hash mismatch: {relative}")
+        actual_paths.append(relative)
+    if actual_paths != list(expected_paths):
+        raise ValueError("row sidecars do not match the declared metric contract")
+
+
+def validate_persisted_row(
+    row: Mapping[str, Any],
+    spec: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    fingerprint: Mapping[str, Any],
+    *,
+    repo_root: Path,
+) -> None:
+    """Strictly validate a row before it may be resumed or collected."""
+    if row.get("row_id") != spec["row_id"]:
+        raise ValueError("row ID does not match expected row")
+    if row.get("identity") != identity:
+        raise ValueError("row identity does not match artifact identity")
+    extensions = row.get("extensions")
+    if not isinstance(extensions, Mapping):
+        raise ValueError("row extensions must be an object")
+    if extensions.get("result_sha256") != result_sha256(row):
+        raise ValueError("row result seal mismatch")
+    if extensions.get("row_spec") != spec:
+        raise ValueError("row spec does not match expected row")
+    if extensions.get("resume_fingerprint") != fingerprint:
+        raise ValueError("row resume fingerprint does not match expected provenance")
+    if extensions.get("timing_class") != fingerprint.get("timing_class"):
+        raise ValueError("row timing class does not match expected provenance")
+    if set(extensions) != {
+        "row_spec",
+        "resume_fingerprint",
+        "timing_class",
+        "result_sha256",
+    } and not (
+        spec["dataset"] == "glove200"
+        and set(extensions)
+        == {
+            "row_spec",
+            "resume_fingerprint",
+            "timing_class",
+            "retrieval_scoring",
+            "result_sha256",
+        }
+    ):
+        raise ValueError("row extensions do not match the status contract")
+
+    status = row.get("status")
+    if status not in V2_ROW_STATES:
+        raise ValueError("row status is not a schema-v2 state")
+    if status == "passed":
+        if row.get("reason") is not None:
+            raise ValueError("passed row reason must be null")
+    elif not isinstance(row.get("reason"), str) or not row["reason"]:
+        raise ValueError("non-passed row must have a non-empty reason")
+
+    metrics = row.get("metrics")
+    if not isinstance(metrics, Mapping):
+        raise ValueError("row metrics must be an object")
+    if status != "passed":
+        if metrics or row.get("sidecars") != []:
+            raise ValueError("non-passed row must not declare measurements")
+        return
+
+    expected_keys = set(_BASE_METRIC_KEYS)
+    if spec["dataset"] == "synthetic":
+        expected_keys.add("queries")
+        if spec["codec"] == "product":
+            expected_keys.add("finite_float32_residual_expectation")
+    else:
+        expected_keys.update(_GLOVE_METRIC_KEYS)
+    if set(metrics) != expected_keys:
+        raise ValueError("passed row metrics do not match the exact contract")
+
+    contract = fingerprint.get("metric_contract")
+    if not isinstance(contract, Mapping):
+        raise ValueError("resume fingerprint is missing the metric contract")
+    count = contract["sample_count"]
+    dimension = spec["dimension"]
+    bits = spec["nominal_total_bits"]
+    if metrics["sample_count"] != count or metrics["dimension"] != dimension:
+        raise ValueError("row sample_count or dimension does not match the row spec")
+    if metrics["nominal_total_bits_per_coordinate"] != bits:
+        raise ValueError("row nominal bit width does not match the row spec")
+    formula = physical_bytes_formula(spec["codec"], dimension, bits, count)
+    if (
+        metrics["actual_physical_bytes"] != formula
+        or metrics["formula_physical_bytes"] != formula
+    ):
+        raise ValueError("row physical bytes do not match the codec formula")
+    expected_effective = formula * 8 / (count * dimension)
+    if metrics["effective_physical_bits_per_coordinate"] != expected_effective:
+        raise ValueError("row effective physical width does not match bytes")
+    for key in _BASE_METRIC_KEYS - {
+        "sample_count",
+        "dimension",
+        "actual_physical_bytes",
+        "formula_physical_bytes",
+        "nominal_total_bits_per_coordinate",
+    }:
+        _require_finite_number(metrics[key], f"metrics.{key}")
+
+    if spec["dataset"] == "synthetic":
+        queries = metrics["queries"]
+        if not isinstance(queries, Mapping) or set(queries) != {
+            "independent",
+            "high_inner_product",
+        }:
+            raise ValueError("synthetic query metrics have an unexpected contract")
+        for name in ("independent", "high_inner_product"):
+            _validate_signed_summary(
+                queries[name],
+                expected_count=count,
+                label=f"metrics.queries.{name}",
+            )
+        if spec["codec"] == "product":
+            expectation = metrics["finite_float32_residual_expectation"]
+            if not isinstance(expectation, Mapping) or set(expectation) != {
+                "independent",
+                "high_inner_product",
+            }:
+                raise ValueError("product expectation metrics are malformed")
+            for name in ("independent", "high_inner_product"):
+                _validate_signed_summary(
+                    expectation[name],
+                    expected_count=count,
+                    label=("metrics.finite_float32_residual_expectation." f"{name}"),
+                )
+        _validate_declared_sidecars(
+            row.get("sidecars"), repo_root=repo_root, expected_paths=()
+        )
+        return
+
+    expected_top_k = contract["top_k"]
+    retrieval = metrics["retrieval"]
+    if not isinstance(retrieval, Mapping) or set(retrieval) != {
+        f"1@{value}" for value in expected_top_k
+    }:
+        raise ValueError("GloVe retrieval metrics have an unexpected contract")
+    for key, value in retrieval.items():
+        number = _require_finite_number(value, f"metrics.retrieval.{key}")
+        if not 0.0 <= number <= 1.0:
+            raise ValueError(f"metrics.retrieval.{key} must be in [0, 1]")
+    if (
+        metrics["retrieval_scoring_device"] != fingerprint["retrieval_policy"]["device"]
+        or metrics["scoring_device"] != fingerprint["retrieval_policy"]["device"]
+        or metrics["retrieval_scoring_chunk_size"]
+        != fingerprint["retrieval_policy"]["base_chunk_size"]
+        or metrics["retrieval_algorithm"] != "exact_chunked_brute_force_dot_product"
+        or metrics["full_score_matrix_materialized"] is not False
+        or metrics["gpu_indexing_latency_ms"] is not None
+    ):
+        raise ValueError("GloVe retrieval labels do not match the policy")
+    maximum = metrics["maximum_score_block"]
+    if maximum != {
+        "rows": contract["query_count"],
+        "columns": min(fingerprint["retrieval_policy"]["base_chunk_size"], count),
+    }:
+        raise ValueError("GloVe maximum score block does not match the policy")
+    _require_finite_number(
+        metrics["retrieval_scoring_latency_ms"],
+        "metrics.retrieval_scoring_latency_ms",
+    )
+    retrieval_extension = extensions["retrieval_scoring"]
+    if not isinstance(retrieval_extension, Mapping) or set(retrieval_extension) != {
+        "device",
+        "base_chunk_size",
+        "codec_encode_decode_device",
+        "gpu_indexing_performed",
+        "retrieval_algorithm",
+        "scoring_device",
+        "full_score_matrix_materialized",
+        "maximum_score_block",
+    }:
+        raise ValueError("GloVe retrieval extension is malformed")
+    if retrieval_extension != {
+        "device": fingerprint["retrieval_policy"]["device"],
+        "base_chunk_size": fingerprint["retrieval_policy"]["base_chunk_size"],
+        "codec_encode_decode_device": "cpu",
+        "gpu_indexing_performed": False,
+        "retrieval_algorithm": "exact_chunked_brute_force_dot_product",
+        "scoring_device": fingerprint["retrieval_policy"]["device"],
+        "full_score_matrix_materialized": False,
+        "maximum_score_block": maximum,
+    }:
+        raise ValueError("GloVe retrieval extension does not match the policy")
+    expected_paths = contract["sidecar_paths"]
+    _validate_declared_sidecars(
+        row.get("sidecars"),
+        repo_root=repo_root,
+        expected_paths=expected_paths,
     )
 
 
@@ -474,9 +761,13 @@ def atomic_write_json(path: str | Path, payload: object) -> None:
     )
 
 
-def atomic_write_jsonl(
-    path: str | Path, rows: Iterable[Mapping[str, Any]]
-) -> None:
+def _atomic_write_if_changed(path: Path, payload: bytes) -> None:
+    if path.is_file() and path.read_bytes() == payload:
+        return
+    _atomic_write(path, payload)
+
+
+def atomic_write_jsonl(path: str | Path, rows: Iterable[Mapping[str, Any]]) -> None:
     ordered = sorted(rows, key=lambda row: row["row_id"])
     payload = b"".join(_canonical_bytes(row) + b"\n" for row in ordered)
     _atomic_write(Path(path), payload)
@@ -500,6 +791,9 @@ def collect_rows(
     row_dir: str | Path,
     specs: Sequence[Mapping[str, Any]],
     identity: Mapping[str, Any],
+    *,
+    fingerprints: Mapping[str, Mapping[str, Any]] | None = None,
+    repo_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Load every expected row, replacing missing or malformed files explicitly."""
     root = Path(row_dir)
@@ -518,8 +812,16 @@ def collect_rows(
                 raise ValueError("row ID does not match filename")
             if row.get("identity") != identity:
                 raise ValueError("row identity does not match artifact identity")
+            if fingerprints is not None:
+                validate_persisted_row(
+                    row,
+                    spec,
+                    identity,
+                    fingerprints[row_id],
+                    repo_root=repo_root or root.parent,
+                )
             rows.append(row)
-        except (OSError, UnicodeError, ValueError) as exc:
+        except (KeyError, OSError, TypeError, UnicodeError, ValueError) as exc:
             rows.append(_placeholder(row_id, identity, f"malformed row file: {exc}"))
     return rows
 
@@ -544,9 +846,7 @@ def paired_seed_block_bootstrap(
         0, differences.size, size=(iterations, differences.size)
     )
     bootstrap_means = differences[sampled].mean(axis=1)
-    lower, upper = np.quantile(
-        bootstrap_means, (0.025, 0.975), method="linear"
-    )
+    lower, upper = np.quantile(bootstrap_means, (0.025, 0.975), method="linear")
     return {
         "method": "paired_seed_block_percentile_bootstrap",
         "seed_block_count": int(differences.size),
@@ -557,8 +857,153 @@ def paired_seed_block_bootstrap(
     }
 
 
+def _dotted_metric(metrics: Mapping[str, Any], path: str) -> float | None:
+    current: object = metrics
+    for component in path.split("."):
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get(component)
+    if (
+        isinstance(current, (int, float))
+        and not isinstance(current, bool)
+        and math.isfinite(current)
+    ):
+        return float(current)
+    return None
+
+
+def _student_t_seed_summary(values: Sequence[float]) -> dict[str, object]:
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1 or array.size < 2 or not np.all(np.isfinite(array)):
+        raise ValueError("across-seed summary requires finite seed means")
+    mean = float(array.mean())
+    standard_deviation = float(array.std(ddof=1))
+    sem = standard_deviation / math.sqrt(array.size)
+    critical = float(student_t.ppf(0.975, df=array.size - 1))
+    return {
+        "count": int(array.size),
+        "mean": mean,
+        "sample_standard_deviation": standard_deviation,
+        "sem": sem,
+        "student_t_95_ci": [
+            mean - critical * sem,
+            mean + critical * sem,
+        ],
+    }
+
+
+def aggregate_seed_statistics(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    specs: Sequence[Mapping[str, Any]] = (),
+    top_k: Sequence[int] = (),
+    expected_seed_count: int = 16,
+) -> list[dict[str, Any]]:
+    """Summarize per-seed row means, never within-seed observation counts."""
+    grouped: dict[tuple[object, ...], dict[int, float]] = defaultdict(dict)
+    synthetic_metric_paths = (
+        "mean_squared_l2_error",
+        "relative_squared_error",
+        "queries.independent.rmse",
+        "queries.independent.signed_bias",
+        "queries.high_inner_product.rmse",
+        "queries.high_inner_product.signed_bias",
+        "finite_float32_residual_expectation.independent.signed_bias",
+        "finite_float32_residual_expectation.high_inner_product.signed_bias",
+    )
+    for spec in specs:
+        paths = (
+            tuple(f"retrieval.1@{value}" for value in top_k)
+            if spec["dataset"] == "glove200"
+            else synthetic_metric_paths[
+                : (
+                    len(synthetic_metric_paths)
+                    if spec["codec"] == "product"
+                    else len(synthetic_metric_paths) - 2
+                )
+            ]
+        )
+        for metric_path in paths:
+            key = (
+                spec.get("dataset"),
+                spec.get("distribution"),
+                spec.get("dimension"),
+                spec.get("codec"),
+                spec.get("nominal_total_bits"),
+                metric_path,
+            )
+            grouped[key]
+    for row in rows:
+        if row.get("status") != "passed":
+            continue
+        extensions = row.get("extensions")
+        spec = extensions.get("row_spec", {}) if isinstance(extensions, Mapping) else {}
+        if not isinstance(spec, Mapping):
+            continue
+        metrics = row.get("metrics")
+        if not isinstance(metrics, Mapping):
+            continue
+        paths: Iterable[str]
+        if spec.get("dataset") == "glove200":
+            retrieval = metrics.get("retrieval")
+            paths = (
+                (f"retrieval.{key}" for key in sorted(retrieval))
+                if isinstance(retrieval, Mapping)
+                else ()
+            )
+        elif spec.get("dataset") == "synthetic":
+            paths = synthetic_metric_paths
+        else:
+            continue
+        for metric_path in paths:
+            value = _dotted_metric(metrics, metric_path)
+            pair_id = spec.get("pair_id")
+            if value is None or not isinstance(pair_id, int):
+                continue
+            key = (
+                spec.get("dataset"),
+                spec.get("distribution"),
+                spec.get("dimension"),
+                spec.get("codec"),
+                spec.get("nominal_total_bits"),
+                metric_path,
+            )
+            if pair_id in grouped[key]:
+                raise ValueError("duplicate seed row in across-seed aggregate")
+            grouped[key][pair_id] = value
+    result: list[dict[str, Any]] = []
+    for key, seed_values in sorted(
+        grouped.items(), key=lambda item: tuple(str(part) for part in item[0])
+    ):
+        pair_ids = sorted(seed_values)
+        complete = len(pair_ids) == expected_seed_count and pair_ids == list(
+            range(expected_seed_count)
+        )
+        aggregate = {
+            "dataset": key[0],
+            "distribution": key[1],
+            "dimension": key[2],
+            "codec": key[3],
+            "nominal_total_bits": key[4],
+            "metric": key[5],
+            "expected_seed_count": expected_seed_count,
+            "seed_count": len(pair_ids),
+            "status": "complete" if complete else "incomplete",
+        }
+        if complete:
+            aggregate["statistics"] = _student_t_seed_summary(
+                [seed_values[pair_id] for pair_id in pair_ids]
+            )
+        result.append(aggregate)
+    return result
+
+
 def aggregate_product_comparisons(
-    rows: Sequence[Mapping[str, Any]], *, seed: int, iterations: int
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    seed: int,
+    iterations: int,
+    specs: Sequence[Mapping[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     metric_paths = (
         ("mean_squared_l2_error", ("mean_squared_l2_error",)),
@@ -571,6 +1016,48 @@ def aggregate_product_comparisons(
     groups: dict[tuple[object, ...], dict[str, dict[int, float]]] = defaultdict(
         lambda: {"mse": {}, "product": {}}
     )
+    synthetic_contracts = {
+        (
+            spec.get("distribution"),
+            spec.get("dimension"),
+            spec.get("nominal_total_bits"),
+        )
+        for spec in specs
+        if spec.get("dataset") == "synthetic"
+    }
+    mse_contracts = {
+        contract
+        for contract in synthetic_contracts
+        if any(
+            spec.get("dataset") == "synthetic"
+            and spec.get("codec") == "mse"
+            and (
+                spec.get("distribution"),
+                spec.get("dimension"),
+                spec.get("nominal_total_bits"),
+            )
+            == contract
+            for spec in specs
+        )
+    }
+    product_contracts = {
+        contract
+        for contract in synthetic_contracts
+        if any(
+            spec.get("dataset") == "synthetic"
+            and spec.get("codec") == "product"
+            and (
+                spec.get("distribution"),
+                spec.get("dimension"),
+                spec.get("nominal_total_bits"),
+            )
+            == contract
+            for spec in specs
+        )
+    }
+    for contract in mse_contracts & product_contracts:
+        for metric_name, _ in metric_paths:
+            groups[(*contract, metric_name)]
     for row in rows:
         if row.get("status") != "passed":
             continue
@@ -595,20 +1082,27 @@ def aggregate_product_comparisons(
     result: list[dict[str, Any]] = []
     for key, codecs in sorted(groups.items()):
         pair_ids = sorted(set(codecs["mse"]) & set(codecs["product"]))
-        if len(pair_ids) < 2:
-            continue
-        comparison = paired_seed_block_bootstrap(
-            [codecs["product"][pair_id] for pair_id in pair_ids],
-            [codecs["mse"][pair_id] for pair_id in pair_ids],
-            seed=seed,
-            iterations=iterations,
-        )
+        complete = len(pair_ids) == 16 and pair_ids == list(range(16))
+        comparison: dict[str, Any] = {
+            "distribution": key[0],
+            "dimension": key[1],
+            "nominal_total_bits": key[2],
+            "metric": key[3],
+            "expected_seed_count": 16,
+            "seed_block_count": len(pair_ids),
+            "status": "complete" if complete else "incomplete",
+        }
+        if complete:
+            comparison.update(
+                paired_seed_block_bootstrap(
+                    [codecs["product"][pair_id] for pair_id in pair_ids],
+                    [codecs["mse"][pair_id] for pair_id in pair_ids],
+                    seed=seed,
+                    iterations=iterations,
+                )
+            )
         result.append(
             {
-                "distribution": key[0],
-                "dimension": key[1],
-                "nominal_total_bits": key[2],
-                "metric": key[3],
                 **comparison,
             }
         )
@@ -632,9 +1126,7 @@ def glove_selection_ids(
             )
         ).astype("<u4")
     query_spec = glove_config["query_selection"]
-    query = np.arange(
-        query_spec["start"], query_spec["stop"], dtype="<u4"
-    )
+    query = np.arange(query_spec["start"], query_spec["stop"], dtype="<u4")
     return base, query
 
 
@@ -698,9 +1190,7 @@ def validate_glove_file(
     return metadata
 
 
-def _read_h5_rows(
-    dataset: Any, ids: np.ndarray, *, read_chunk_size: int
-) -> np.ndarray:
+def _read_h5_rows(dataset: Any, ids: np.ndarray, *, read_chunk_size: int) -> np.ndarray:
     if ids.ndim != 1 or np.any(ids[:-1] >= ids[1:]):
         raise ValueError("HDF5 row IDs must be strictly increasing")
     output = np.empty((len(ids), dataset.shape[1]), dtype=dataset.dtype)
@@ -738,9 +1228,7 @@ def load_normalized_glove_arrays(
     except ImportError as exc:
         raise ModuleNotFoundError("h5py is required for GloVe retrieval") from exc
     with h5py.File(Path(path), "r") as handle:
-        base = _read_h5_rows(
-            handle["train"], base_ids, read_chunk_size=read_chunk_size
-        )
+        base = _read_h5_rows(handle["train"], base_ids, read_chunk_size=read_chunk_size)
         query = _read_h5_rows(
             handle["test"], query_ids, read_chunk_size=read_chunk_size
         )
@@ -765,9 +1253,9 @@ def _stream_top_k(
     transform: Any | None = None,
 ) -> tuple[np.ndarray, float]:
     torch_device = _retrieval_device(device)
-    query_tensor = torch.from_numpy(
-        np.asarray(queries, dtype=np.float32)
-    ).to(torch_device)
+    query_tensor = torch.from_numpy(np.asarray(queries, dtype=np.float32)).to(
+        torch_device
+    )
     best_values: torch.Tensor | None = None
     best_ids: torch.Tensor | None = None
     scoring_seconds = 0.0
@@ -779,9 +1267,7 @@ def _stream_top_k(
         if torch_device.type == "cuda":
             torch.cuda.synchronize()
         scoring_start = time.perf_counter()
-        block_tensor = torch.from_numpy(np.ascontiguousarray(block)).to(
-            torch_device
-        )
+        block_tensor = torch.from_numpy(np.ascontiguousarray(block)).to(torch_device)
         scores = query_tensor @ block_tensor.T
         local_k = min(k, stop - start)
         values, indices = torch.topk(scores, k=local_k, dim=1)
@@ -792,9 +1278,7 @@ def _stream_top_k(
             candidate_values = torch.cat((best_values, values), dim=1)
             candidate_ids = torch.cat((best_ids, indices), dim=1)
             keep = min(k, candidate_values.shape[1])
-            best_values, positions = torch.topk(
-                candidate_values, k=keep, dim=1
-            )
+            best_values, positions = torch.topk(candidate_values, k=keep, dim=1)
             best_ids = torch.gather(candidate_ids, 1, positions)
         if torch_device.type == "cuda":
             torch.cuda.synchronize()
@@ -856,17 +1340,13 @@ def _codec(
         return cached  # type: ignore[return-value]
     if codec_name == "mse":
         value: TurboQuantMSEReference | TurboQuantProductReference = (
-            TurboQuantMSEReference(
-                TurboQuantMSEConfig(dimension, bits, rotation_seed)
-            )
+            TurboQuantMSEReference(TurboQuantMSEConfig(dimension, bits, rotation_seed))
         )
     elif codec_name == "product":
         if projection_seed is None:
             raise ValueError("product codec requires a projection seed")
         value = TurboQuantProductReference(
-            TurboQuantProductConfig(
-                dimension, bits, rotation_seed, projection_seed
-            )
+            TurboQuantProductConfig(dimension, bits, rotation_seed, projection_seed)
         )
     else:
         raise ValueError(f"unknown codec: {codec_name}")
@@ -951,9 +1431,7 @@ def _measure_codec_block(
                 query,
             )
             approximate = (query.to(torch.float64) * decoded).sum(dim=-1)
-            measurements.expectation_errors[name].add(
-                approximate - expected
-            )
+            measurements.expectation_errors[name].add(approximate - expected)
     return decoded.to(torch.float32).numpy()
 
 
@@ -997,12 +1475,10 @@ def _metrics_from_measurements(
             for name, values in measurements.query_errors.items()
         }
     if measurements.expectation_errors:
-        metrics["finite_float32_residual_expectation"] = (
-            {
-                name: values.signed_summary()
-                for name, values in measurements.expectation_errors.items()
-            }
-        )
+        metrics["finite_float32_residual_expectation"] = {
+            name: values.signed_summary()
+            for name, values in measurements.expectation_errors.items()
+        }
     return metrics
 
 
@@ -1025,16 +1501,12 @@ def _run_synthetic_row(
         dimension=spec["dimension"],
         data_seed=spec["data_seed"],
         independent_query_seed=spec["independent_query_seed"],
-        high_inner_product_noise_seed=spec[
-            "high_inner_product_noise_seed"
-        ],
+        high_inner_product_noise_seed=spec["high_inner_product_noise_seed"],
     )
     measurements = _new_measurements(spec["codec"])
     processed = 0
     while processed < spec["vector_count"]:
-        block_count = min(
-            spec["chunk_size"], spec["vector_count"] - processed
-        )
+        block_count = min(spec["chunk_size"], spec["vector_count"] - processed)
         fixture = stream.take(block_count)
         _measure_codec_block(
             codec,
@@ -1042,9 +1514,7 @@ def _run_synthetic_row(
             fixture["vectors"],
             {
                 "independent": fixture["independent_queries"],
-                "high_inner_product": fixture[
-                    "high_inner_product_queries"
-                ],
+                "high_inner_product": fixture["high_inner_product_queries"],
             },
             measurements,
         )
@@ -1123,9 +1593,7 @@ def score_glove_codec(
             "retrieval_scoring_latency_ms": scoring_seconds * 1_000,
             "retrieval_scoring_device": device,
             "retrieval_scoring_chunk_size": chunk_size,
-            "retrieval_algorithm": (
-                "exact_chunked_brute_force_dot_product"
-            ),
+            "retrieval_algorithm": ("exact_chunked_brute_force_dot_product"),
             "scoring_device": device,
             "full_score_matrix_materialized": False,
             "maximum_score_block": {
@@ -1138,9 +1606,9 @@ def score_glove_codec(
     return {"ranked_ids": ranked, "metrics": metrics}
 
 
-def _sidecar(path: Path) -> dict[str, Any]:
+def _sidecar(path: Path, *, repo_root: Path = ROOT) -> dict[str, Any]:
     try:
-        relative = path.resolve().relative_to(ROOT.resolve()).as_posix()
+        relative = path.resolve().relative_to(repo_root.resolve()).as_posix()
     except ValueError:
         return {}
     return {
@@ -1192,9 +1660,7 @@ def _run_glove_row(
                 "base_chunk_size": chunk_size,
                 "codec_encode_decode_device": "cpu",
                 "gpu_indexing_performed": False,
-                "retrieval_algorithm": (
-                    "exact_chunked_brute_force_dot_product"
-                ),
+                "retrieval_algorithm": ("exact_chunked_brute_force_dot_product"),
                 "scoring_device": device,
                 "full_score_matrix_materialized": False,
                 "maximum_score_block": {
@@ -1243,6 +1709,59 @@ def _download_atomic(url: str, destination: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _gpu_conditions() -> dict[str, object]:
+    unavailable: dict[str, object] = {
+        "temperature_c": "unavailable",
+        "power_draw_w": "unavailable",
+        "competing_compute_processes": "unavailable",
+    }
+    try:
+        sample = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=temperature.gpu,power.draw",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        first = sample.stdout.strip().splitlines()[0].split(",")
+        unavailable["temperature_c"] = float(first[0].strip())
+        unavailable["power_draw_w"] = float(first[1].strip())
+    except (
+        FileNotFoundError,
+        IndexError,
+        ValueError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ):
+        pass
+    try:
+        processes = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,process_name,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        unavailable["competing_compute_processes"] = [
+            line.strip() for line in processes.stdout.splitlines() if line.strip()
+        ]
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ):
+        pass
+    return unavailable
+
+
 def _execution_class(config: Mapping[str, Any]) -> dict[str, Any]:
     cuda = capture_cuda_metadata()
     cpu_model = platform.processor() or platform.machine()
@@ -1262,13 +1781,28 @@ def _execution_class(config: Mapping[str, Any]) -> dict[str, Any]:
             "cuda_available": bool(cuda["cuda_available"]),
             "environment": capture_env_metadata(),
             "h5py_version": package_version("h5py"),
-            "runtime_lock_sha256": sha256_file(
-                ROOT / "requirements" / "runtime.lock"
-            ),
+            "runtime_packages": {
+                name: package_version(name)
+                for name in ("h5py", "numpy", "scipy", "torch")
+            },
+            "runtime_lock_sha256": sha256_file(ROOT / "requirements" / "runtime.lock"),
             "cpu_model": cpu_model,
             "operating_system": platform.platform(),
             "torch_intraop_threads": torch.get_num_threads(),
             "torch_interop_threads": torch.get_num_interop_threads(),
+            "thread_environment": {
+                name: os.environ.get(name, "unavailable")
+                for name in (
+                    "MALLOC_ARENA_MAX",
+                    "MKL_NUM_THREADS",
+                    "NUMEXPR_NUM_THREADS",
+                    "OMP_NUM_THREADS",
+                    "OPENBLAS_NUM_THREADS",
+                    "PYTORCH_CUDA_ALLOC_CONF",
+                    "VECLIB_MAXIMUM_THREADS",
+                )
+            },
+            "gpu_conditions": _gpu_conditions(),
             "timing_policy": {
                 "codec_setup_excluded": True,
                 "fixture_generation_excluded": True,
@@ -1276,6 +1810,39 @@ def _execution_class(config: Mapping[str, Any]) -> dict[str, Any]:
                 "query_device_transfer_in_retrieval_scoring": False,
             },
         },
+    }
+
+
+def _invocation_metadata(
+    *,
+    config_path: Path,
+    output_dir: Path,
+    dataset_cache: Path,
+    allow_download: bool,
+    retrieval_device: str,
+    retrieval_chunk_size: int,
+    argv: Sequence[str] | None,
+) -> dict[str, object]:
+    normalized = [
+        sys.executable,
+        str((ROOT / "scripts" / "run_codec_reproduction.py").resolve()),
+        "--config",
+        str(config_path),
+        "--output-dir",
+        str(output_dir),
+        "--dataset-cache",
+        str(dataset_cache),
+        "--retrieval-device",
+        retrieval_device,
+        "--retrieval-base-chunk-size",
+        str(retrieval_chunk_size),
+    ]
+    if not allow_download:
+        normalized.append("--no-download")
+    return {
+        "argv": list(argv) if argv is not None else normalized,
+        "cwd": str(Path.cwd().resolve()),
+        "normalized_command": normalized,
     }
 
 
@@ -1327,18 +1894,28 @@ def build_manifest(
     paper: Mapping[str, Any],
     retrieval_device: str = "cpu",
     retrieval_chunk_size: int = DEFAULT_RETRIEVAL_CHUNK_SIZE,
+    claims: Sequence[Mapping[str, Any]] = (),
+    across_seed_statistics: Sequence[Mapping[str, Any]] | None = None,
+    product_comparisons: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     counts = Counter(row["status"] for row in rows)
     statistics = config["statistics"]
-    comparisons = aggregate_product_comparisons(
-        rows,
-        seed=statistics["seed"],
-        iterations=statistics["iterations"],
+    comparisons = (
+        list(product_comparisons)
+        if product_comparisons is not None
+        else aggregate_product_comparisons(
+            rows,
+            seed=statistics["seed"],
+            iterations=statistics["iterations"],
+        )
+    )
+    across_seeds = (
+        list(across_seed_statistics)
+        if across_seed_statistics is not None
+        else aggregate_seed_statistics(rows, expected_seed_count=16)
     )
     glove = config["glove200"]
-    query_count = (
-        glove["query_selection"]["stop"] - glove["query_selection"]["start"]
-    )
+    query_count = glove["query_selection"]["stop"] - glove["query_selection"]["start"]
     base_count = glove["base_selection"]["count"]
     return {
         "artifact_type": "codec_reproduction",
@@ -1364,23 +1941,20 @@ def build_manifest(
             },
         },
         "rows": sorted(rows, key=lambda row: row["row_id"]),
-        "pass_state_counts": {
-            state: counts[state] for state in V2_ROW_STATES
-        },
-        "claims": [],
+        "pass_state_counts": {state: counts[state] for state in V2_ROW_STATES},
+        "claims": list(claims),
         "extensions": {
             "config_sha256": sha256_file(config_path),
             "claim_labels": list(config["claim_labels"]),
             "timing_class": config["timing_class"],
+            "across_seed_statistics": across_seeds,
             "product_minus_mse_comparisons": comparisons,
             "retrieval_policy": {
                 "device": retrieval_device,
                 "base_chunk_size": retrieval_chunk_size,
                 "codec_encode_decode_device": "cpu",
                 "gpu_indexing_performed": False,
-                "retrieval_algorithm": (
-                    "exact_chunked_brute_force_dot_product"
-                ),
+                "retrieval_algorithm": ("exact_chunked_brute_force_dot_product"),
                 "scoring_device": retrieval_device,
                 "full_score_matrix_materialized": False,
                 "maximum_score_block": {
@@ -1426,16 +2000,78 @@ def _fingerprint(
     config_path: Path,
     input_hashes: Mapping[str, str],
     *,
+    source: Mapping[str, Any],
+    execution_class: Mapping[str, Any],
+    paper: Mapping[str, Any],
+    invocation: Mapping[str, Any],
     retrieval_device: str,
     retrieval_chunk_size: int,
+    sidecar_paths: Sequence[str] = (),
 ) -> dict[str, Any]:
+    config = load_config(config_path)
+    execution_extensions = execution_class.get("extensions", {})
+    stable_execution = {
+        key: execution_class[key]
+        for key in (
+            "name",
+            "gpu_name",
+            "total_vram_bytes",
+            "driver_version",
+            "cuda_runtime",
+        )
+    }
+    if isinstance(execution_extensions, Mapping):
+        environment = execution_extensions.get("environment")
+        stable_environment = (
+            {
+                key: value
+                for key, value in environment.items()
+                if key not in {"timestamp_utc", "gpu_free_vram_bytes"}
+            }
+            if isinstance(environment, Mapping)
+            else environment
+        )
+        stable_execution["extensions"] = {
+            key: execution_extensions.get(key)
+            for key in (
+                "runtime_packages",
+                "runtime_lock_sha256",
+                "cpu_model",
+                "operating_system",
+                "torch_intraop_threads",
+                "torch_interop_threads",
+                "thread_environment",
+                "timing_policy",
+            )
+        }
+        stable_execution["extensions"]["environment"] = stable_environment
+    glove = config["glove200"]
+    metric_contract = {
+        "sample_count": (
+            spec["vector_count"]
+            if spec["dataset"] == "synthetic"
+            else glove["base_selection"]["count"]
+        ),
+        "query_count": (
+            spec["vector_count"]
+            if spec["dataset"] == "synthetic"
+            else glove["query_selection"]["stop"] - glove["query_selection"]["start"]
+        ),
+        "top_k": list(glove["top_k"]) if spec["dataset"] == "glove200" else [],
+        "sidecar_paths": list(sidecar_paths),
+    }
     return {
         "protocol": RESUME_PROTOCOL,
         "identity": codec_identity(config_path),
         "config_sha256": sha256_file(config_path),
         "row_spec_sha256": _sha256_json(spec),
         "input_sha256": dict(input_hashes),
-        "code_sha256": _behavior_sha256(),
+        "behavior_sha256": _behavior_sha256(),
+        "source": dict(source),
+        "paper": dict(paper),
+        "execution_class": stable_execution,
+        "timing_class": config["timing_class"],
+        "metric_contract": metric_contract,
         "retrieval_policy": {
             "device": retrieval_device,
             "base_chunk_size": retrieval_chunk_size,
@@ -1445,20 +2081,29 @@ def _fingerprint(
 
 def _load_resumable(
     path: Path,
+    spec: Mapping[str, Any],
     fingerprint: Mapping[str, Any],
     identity: Mapping[str, Any],
+    *,
+    repo_root: Path,
 ) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     try:
         row = load_strict_json(path)
-    except (OSError, UnicodeError, ValueError):
+    except (KeyError, OSError, TypeError, UnicodeError, ValueError):
         return None
-    if (
-        isinstance(row, dict)
-        and row.get("identity") == identity
-        and can_resume_row(row, fingerprint)
-    ):
+    if isinstance(row, dict) and can_resume_row(row, fingerprint):
+        try:
+            validate_persisted_row(
+                row,
+                spec,
+                identity,
+                fingerprint,
+                repo_root=repo_root,
+            )
+        except ValueError:
+            return None
         return row
     return None
 
@@ -1471,6 +2116,7 @@ def _prepare_glove(
     allow_download: bool,
     retrieval_device: str,
     retrieval_chunk_size: int,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
     glove = config["glove200"]
     path = dataset_cache / glove["filename"]
@@ -1480,9 +2126,17 @@ def _prepare_glove(
         try:
             _download_atomic(glove["url"], path)
         except (OSError, urllib.error.URLError) as exc:
-            return {"state": "unavailable", "reason": f"GloVe download unavailable: {exc}"}
+            return {
+                "state": "unavailable",
+                "reason": f"GloVe download unavailable: {exc}",
+            }
     try:
         metadata = validate_glove_file(path, glove)
+    except (MemoryError, torch.OutOfMemoryError) as exc:
+        return {
+            "state": "oom",
+            "reason": f"GloVe validation out of memory: {exc}",
+        }
     except ModuleNotFoundError as exc:
         return {"state": "unavailable", "reason": str(exc)}
     except (OSError, ValueError) as exc:
@@ -1490,26 +2144,73 @@ def _prepare_glove(
     base_ids, query_ids = glove_selection_ids(glove)
     try:
         base, queries = load_normalized_glove_arrays(path, base_ids, query_ids)
+    except (MemoryError, torch.OutOfMemoryError) as exc:
+        return {
+            "state": "oom",
+            "reason": f"GloVe load out of memory: {exc}",
+        }
     except (OSError, ValueError, ModuleNotFoundError) as exc:
         return {"state": "invalid", "reason": f"GloVe computation error: {exc}"}
-    exact = exact_top_one(
-        base,
-        queries,
-        chunk_size=retrieval_chunk_size,
-        device=retrieval_device,
-    )
+    try:
+        exact = exact_top_one(
+            base,
+            queries,
+            chunk_size=retrieval_chunk_size,
+            device=retrieval_device,
+        )
+    except (MemoryError, torch.OutOfMemoryError) as exc:
+        return {
+            "state": "oom",
+            "reason": f"GloVe exact top1 out of memory: {exc}",
+        }
+    except (ArithmeticError, RuntimeError, TypeError, ValueError) as exc:
+        return {
+            "state": "invalid",
+            "reason": f"GloVe exact top1 computation error: {exc}",
+        }
+    exact = np.asarray(exact)
+    try:
+        exact_invalid = (
+            exact.ndim != 1
+            or not np.issubdtype(exact.dtype, np.integer)
+            or exact.shape[0] != queries.shape[0]
+            or np.any(exact < 0)
+            or np.any(exact >= base.shape[0])
+        )
+    except (TypeError, ValueError):
+        exact_invalid = True
+    if exact_invalid:
+        return {
+            "state": "invalid",
+            "reason": "GloVe exact top1 computation returned invalid IDs",
+        }
     sidecar_values = {
         "glove200-base-ids.u32": base_ids,
         "glove200-query-ids.u32": query_ids,
         "glove200-subset-exact-top1.u32": exact,
     }
     declared: list[dict[str, Any]] = []
-    for name, values in sidecar_values.items():
-        sidecar_path = output_dir / name
-        _atomic_write(sidecar_path, values.astype("<u4", copy=False).tobytes())
-        declaration = _sidecar(sidecar_path)
-        if declaration:
+    try:
+        for name, values in sidecar_values.items():
+            sidecar_path = output_dir / name
+            _atomic_write(sidecar_path, values.astype("<u4", copy=False).tobytes())
+            declaration = _sidecar(
+                sidecar_path,
+                repo_root=repo_root or output_dir.parent,
+            )
+            if not declaration:
+                raise ValueError("GloVe sidecar is outside the artifact root")
             declared.append(declaration)
+    except (MemoryError, torch.OutOfMemoryError) as exc:
+        return {
+            "state": "oom",
+            "reason": f"GloVe sidecar out of memory: {exc}",
+        }
+    except (OSError, ValueError) as exc:
+        return {
+            "state": "invalid",
+            "reason": f"GloVe sidecar write error: {exc}",
+        }
     return {
         "state": "ready",
         "metadata": metadata,
@@ -1519,6 +2220,151 @@ def _prepare_glove(
         "sidecars": declared,
         "sha256": metadata["sha256"],
     }
+
+
+def _artifact_repo_root(output_dir: Path) -> Path:
+    resolved = output_dir.resolve()
+    root = ROOT.resolve()
+    return root if resolved.is_relative_to(root) else resolved.parent
+
+
+def _summary_key(kind: str, value: Mapping[str, Any]) -> str:
+    parts = [
+        kind,
+        value.get("dataset", "all"),
+        value.get("distribution", "all"),
+        value.get("dimension", "all"),
+        value.get("codec", "all"),
+        value.get("nominal_total_bits", "all"),
+        value.get("metric", "all"),
+    ]
+    return "-".join(
+        "".join(character if character.isalnum() else "-" for character in str(part))
+        for part in parts
+    ).strip("-")
+
+
+def _summary_claim_paths(summary: Mapping[str, Any]) -> list[tuple[str, str]]:
+    complete = any(
+        value.get("status") == "complete"
+        for value in summary["across_seed_statistics"].values()
+    ) or any(
+        value.get("status") == "complete"
+        for value in summary["product_minus_mse_comparisons"].values()
+    )
+    if not complete:
+        return []
+    paths = [(f"pass-{state}", f"pass_state_counts.{state}") for state in V2_ROW_STATES]
+    for aggregate_id, aggregate in summary["across_seed_statistics"].items():
+        if aggregate.get("status") != "complete":
+            continue
+        for key in (
+            "count",
+            "mean",
+            "sample_standard_deviation",
+            "sem",
+        ):
+            paths.append(
+                (
+                    f"across-seed-{aggregate_id}-{key}",
+                    f"across_seed_statistics.{aggregate_id}.statistics.{key}",
+                )
+            )
+        for bound in range(2):
+            paths.append(
+                (
+                    f"across-seed-{aggregate_id}-ci-{bound}",
+                    "across_seed_statistics."
+                    f"{aggregate_id}.statistics.student_t_95_ci.{bound}",
+                )
+            )
+    for comparison_id, comparison in summary["product_minus_mse_comparisons"].items():
+        if comparison.get("status") != "complete":
+            continue
+        paths.append(
+            (
+                f"product-comparison-{comparison_id}-mean",
+                "product_minus_mse_comparisons."
+                f"{comparison_id}.product_minus_mse_mean",
+            )
+        )
+        for bound in range(2):
+            paths.append(
+                (
+                    f"product-comparison-{comparison_id}-ci-{bound}",
+                    "product_minus_mse_comparisons."
+                    f"{comparison_id}.bootstrap_95_ci.{bound}",
+                )
+            )
+    return paths
+
+
+def _claim_summary_bridge(
+    *,
+    output_dir: Path,
+    rows: Sequence[Mapping[str, Any]],
+    config: Mapping[str, Any],
+    across_seed_statistics: Sequence[Mapping[str, Any]],
+    product_comparisons: Sequence[Mapping[str, Any]],
+    repo_root: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    passed = sorted(
+        (row for row in rows if row.get("status") == "passed"),
+        key=lambda row: row["row_id"],
+    )
+    copied_rows = [deepcopy(dict(row)) for row in rows]
+    if not passed:
+        return copied_rows, []
+    counts = Counter(row["status"] for row in rows)
+    across_summary = {
+        _summary_key("across", aggregate): aggregate
+        for aggregate in across_seed_statistics
+    }
+    comparison_summary = {
+        _summary_key("comparison", comparison): comparison
+        for comparison in product_comparisons
+    }
+    summary = {
+        "summary_version": 1,
+        "artifact_id": config["artifact_id"],
+        "pass_state_counts": {state: counts[state] for state in V2_ROW_STATES},
+        "across_seed_statistics": across_summary,
+        "product_minus_mse_comparisons": comparison_summary,
+    }
+    summary_path = output_dir / "claim-summary.json"
+    summary_bytes = (
+        json.dumps(
+            summary,
+            allow_nan=False,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    _atomic_write_if_changed(summary_path, summary_bytes)
+    declaration = _sidecar(summary_path, repo_root=repo_root)
+    if not declaration:
+        raise ValueError("claim summary is outside the artifact root")
+    anchor_id = passed[0]["row_id"]
+    for index, row in enumerate(copied_rows):
+        if row["row_id"] == anchor_id:
+            row["sidecars"] = [*row["sidecars"], declaration]
+            copied_rows[index] = seal_row(row)
+            break
+    relative = declaration["path"]
+    claims = [
+        {
+            "claim_id": f"codec-local-{suffix}",
+            "artifact_id": config["artifact_id"],
+            "row_id": anchor_id,
+            "query": f"sidecar:{relative}#{json_path}",
+            "extensions": {
+                "caution_labels": list(config["claim_labels"]),
+            },
+        }
+        for suffix, json_path in _summary_claim_paths(summary)
+    ]
+    return copied_rows, claims
 
 
 def _write_aggregate_outputs(
@@ -1533,19 +2379,51 @@ def _write_aggregate_outputs(
     paper: Mapping[str, Any],
     retrieval_device: str,
     retrieval_chunk_size: int,
+    fingerprints: Mapping[str, Mapping[str, Any]],
+    repo_root: Path,
 ) -> dict[str, Any]:
-    rows = collect_rows(output_dir / "rows", specs, identity)
-    atomic_write_jsonl(output_dir / "rows.jsonl", rows)
+    rows = collect_rows(
+        output_dir / "rows",
+        specs,
+        identity,
+        fingerprints=fingerprints,
+        repo_root=repo_root,
+    )
+    statistics = config["statistics"]
+    across_seeds = aggregate_seed_statistics(
+        rows,
+        specs=specs,
+        top_k=config["glove200"]["top_k"],
+        expected_seed_count=16,
+    )
+    comparisons = aggregate_product_comparisons(
+        rows,
+        seed=statistics["seed"],
+        iterations=statistics["iterations"],
+        specs=specs,
+    )
+    manifest_rows, claims = _claim_summary_bridge(
+        output_dir=output_dir,
+        rows=rows,
+        config=config,
+        across_seed_statistics=across_seeds,
+        product_comparisons=comparisons,
+        repo_root=repo_root,
+    )
+    atomic_write_jsonl(output_dir / "rows.jsonl", manifest_rows)
     manifest = build_manifest(
         config=config,
         config_path=config_path,
-        rows=rows,
+        rows=manifest_rows,
         expected_row_ids=[spec["row_id"] for spec in specs],
         source=source,
         execution_class=execution_class,
         paper=paper,
         retrieval_device=retrieval_device,
         retrieval_chunk_size=retrieval_chunk_size,
+        claims=claims,
+        across_seed_statistics=across_seeds,
+        product_comparisons=comparisons,
     )
     atomic_write_json(output_dir / "manifest.json", manifest)
     return manifest
@@ -1559,6 +2437,7 @@ def execute_reproduction(
     allow_download: bool = True,
     retrieval_device: str = "cpu",
     retrieval_chunk_size: int = DEFAULT_RETRIEVAL_CHUNK_SIZE,
+    argv: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Execute or resume all declared rows and atomically rebuild the artifact."""
     path = Path(config_path).resolve()
@@ -1573,40 +2452,76 @@ def execute_reproduction(
     source = _source_metadata()
     execution = _execution_class(config)
     paper = _paper(config)
+    invocation = _invocation_metadata(
+        config_path=path,
+        output_dir=output,
+        dataset_cache=cache,
+        allow_download=allow_download,
+        retrieval_device=retrieval_device,
+        retrieval_chunk_size=retrieval_chunk_size,
+        argv=argv,
+    )
+    execution["extensions"]["invocation"] = invocation
+    repo_root = _artifact_repo_root(output)
     rows_dir = output / "rows"
     rows_dir.mkdir(parents=True, exist_ok=True)
 
     glove_specs = [spec for spec in specs if spec["dataset"] == "glove200"]
-    glove_context: dict[str, Any] | None = None
+    glove_context = _prepare_glove(
+        config,
+        cache,
+        output,
+        allow_download=allow_download,
+        retrieval_device=retrieval_device,
+        retrieval_chunk_size=retrieval_chunk_size,
+        repo_root=repo_root,
+    )
+    actual_glove_sha = (
+        glove_context.get("sha256") if glove_context["state"] == "ready" else None
+    )
+    glove_sidecar_paths = [
+        (output / name).resolve().relative_to(repo_root.resolve()).as_posix()
+        for name in (
+            "glove200-base-ids.u32",
+            "glove200-query-ids.u32",
+            "glove200-subset-exact-top1.u32",
+        )
+    ]
+    fingerprints = {
+        spec["row_id"]: _fingerprint(
+            spec,
+            path,
+            _input_hashes(
+                spec,
+                config,
+                glove_actual_sha256=actual_glove_sha,
+            ),
+            source=source,
+            execution_class=execution,
+            paper=paper,
+            invocation=invocation,
+            retrieval_device=retrieval_device,
+            retrieval_chunk_size=retrieval_chunk_size,
+            sidecar_paths=(
+                glove_sidecar_paths if spec["dataset"] == "glove200" else ()
+            ),
+        )
+        for spec in specs
+    }
     try:
         for spec in specs:
-            if spec["dataset"] == "glove200" and glove_context is None:
-                glove_context = _prepare_glove(
-                    config,
-                    cache,
-                    output,
-                    allow_download=allow_download,
-                    retrieval_device=retrieval_device,
-                    retrieval_chunk_size=retrieval_chunk_size,
-                )
-            actual_glove_sha = (
-                glove_context.get("sha256")
-                if glove_context and glove_context["state"] == "ready"
-                else None
-            )
-            fingerprint = _fingerprint(
-                spec,
-                path,
-                _input_hashes(
-                    spec,
-                    config,
-                    glove_actual_sha256=actual_glove_sha,
-                ),
-                retrieval_device=retrieval_device,
-                retrieval_chunk_size=retrieval_chunk_size,
-            )
+            fingerprint = fingerprints[spec["row_id"]]
             row_path = rows_dir / f"{spec['row_id']}.json"
-            if _load_resumable(row_path, fingerprint, identity) is not None:
+            if (
+                _load_resumable(
+                    row_path,
+                    spec,
+                    fingerprint,
+                    identity,
+                    repo_root=repo_root,
+                )
+                is not None
+            ):
                 continue
             try:
                 if spec["dataset"] == "synthetic":
@@ -1616,7 +2531,7 @@ def execute_reproduction(
                         fingerprint,
                         timing_class=config["timing_class"],
                     )
-                elif glove_context and glove_context["state"] == "ready":
+                elif glove_context["state"] == "ready":
                     row = _run_glove_row(
                         spec,
                         identity,
@@ -1631,7 +2546,6 @@ def execute_reproduction(
                         timing_class=config["timing_class"],
                     )
                 else:
-                    assert glove_context is not None
                     row = _unavailable_or_invalid_row(
                         spec,
                         identity,
@@ -1658,7 +2572,7 @@ def execute_reproduction(
                     reason=f"computation error: {exc}",
                     timing_class=config["timing_class"],
                 )
-            atomic_write_json(row_path, row)
+            atomic_write_json(row_path, seal_row(row))
     finally:
         manifest = _write_aggregate_outputs(
             output_dir=output,
@@ -1671,6 +2585,8 @@ def execute_reproduction(
             paper=paper,
             retrieval_device=retrieval_device,
             retrieval_chunk_size=retrieval_chunk_size,
+            fingerprints=fingerprints,
+            repo_root=repo_root,
         )
     if len(glove_specs) == 0:
         raise ValueError("config must declare at least one GloVe row")
@@ -1709,6 +2625,7 @@ def main() -> None:
         allow_download=not args.no_download,
         retrieval_device=args.retrieval_device,
         retrieval_chunk_size=args.retrieval_base_chunk_size,
+        argv=[sys.executable, *sys.argv],
     )
     print(
         json.dumps(

@@ -7,5 +7,5 @@ bitsandbytes
 safetensors
 numpy
 scipy
-h5py
+h5py>=3.16,<4
 einops
