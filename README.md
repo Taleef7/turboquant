@@ -25,6 +25,14 @@ capacity admission fails and no 32K child is launched. The 8K systems comparison
 also shows no end-to-end speed or VRAM win. See [results](docs/RESULTS.md) and
 the [benchmark protocol](docs/BENCHMARK_PROTOCOL.md).
 
+The first codec-focused reproduction is independently qualified as
+`codec-local-v1` from clean commit
+`871cbc9058d4befe4b0f5e35b687d1b5f525cb2c`: 1,408/1,408 persisted rows pass,
+588/588 across-seed groups are complete, and all 108 declared Product/MSE
+comparison groups are complete. It is a local, bounded reproduction with
+explicit limits, not a paper-equivalence claim. See the [reproduction report](docs/REPRODUCTION.md)
+and [claim ledger](docs/CLAIMS.md) for exact queries and conditions.
+
 ## What is implemented and tested
 
 - A `PackedKVBlockStore` with fixed 256-token blocks, physically packed indices,
@@ -118,6 +126,10 @@ quality gate passes. Use [the protocol](docs/BENCHMARK_PROTOCOL.md) to interpret
 
 - [Results](docs/RESULTS.md): current artifact-backed 8K result, 32K capacity
   stop, systems comparison, and retired invalid v4 history.
+- [Codec reproduction](docs/REPRODUCTION.md): canonical local matrix, GloVe
+  retrieval results, runtime conditions, and limitations.
+- [Claim ledger](docs/CLAIMS.md): safe statements with exact artifact/query
+  bindings and the rules for resolving them.
 - [Benchmark protocol](docs/BENCHMARK_PROTOCOL.md): artifact schema, matrix,
   statistical and invalid-run rules.
 - [Portability](docs/PORTABILITY.md): model capability contracts and adapter

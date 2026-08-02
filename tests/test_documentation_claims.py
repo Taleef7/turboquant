@@ -15,6 +15,8 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_DOCUMENTS = (
     ROOT / "README.md",
+    ROOT / "docs" / "REPRODUCTION.md",
+    ROOT / "docs" / "CLAIMS.md",
     ROOT / "TESTING_RESULTS.md",
     ROOT / "ISSUES.md",
     ROOT / "docs" / "PAPER_CLAIMS_STATUS.md",
@@ -44,10 +46,12 @@ THIRTY_TWO_K_SUCCESS = re.compile(
 
 def public_claim_corpus() -> str:
     """Return normalized text for all public plans and script documentation."""
-    return normalize_claim_text("\n".join(
-        path.read_text(encoding="utf-8") if path.exists() else ""
-        for path in PUBLIC_DOCUMENTS
-    ))
+    return normalize_claim_text(
+        "\n".join(
+            path.read_text(encoding="utf-8") if path.exists() else ""
+            for path in PUBLIC_DOCUMENTS
+        )
+    )
 
 
 def read_public_docs() -> str:
@@ -57,9 +61,11 @@ def read_public_docs() -> str:
 
 def load_ci_steps() -> tuple[SimpleNamespace, ...]:
     """Read the simple `run` steps in the checked-in CPU workflow without PyYAML."""
-    lines = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    lines = (
+        (ROOT / ".github" / "workflows" / "ci.yml")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
     steps: list[SimpleNamespace] = []
     index = 0
     while index < len(lines):
@@ -201,9 +207,9 @@ def test_any_future_32k_success_claim_must_name_a_qualified_artifact() -> None:
             if "no 32k success" in lowered:
                 continue
             if is_32k_success_claim(line):
-                assert has_qualified_artifact_id(line), (
-                    f"32K success claim in {path.name} must name a qualified artifact: {line}"
-                )
+                assert has_qualified_artifact_id(
+                    line
+                ), f"32K success claim in {path.name} must name a qualified artifact: {line}"
 
 
 def test_readme_links_direct_profile_and_benchmark_protocol() -> None:
@@ -211,6 +217,34 @@ def test_readme_links_direct_profile_and_benchmark_protocol() -> None:
 
     assert "[direct profile](configs/profiles/qwen25-7b-direct-v1.json)" in readme
     assert "[benchmark protocol](docs/BENCHMARK_PROTOCOL.md)" in readme
+
+
+def test_reproduction_report_binds_the_canonical_codec_artifact() -> None:
+    report = (ROOT / "docs" / "REPRODUCTION.md").read_text(encoding="utf-8")
+    claims = (ROOT / "docs" / "CLAIMS.md").read_text(encoding="utf-8")
+
+    for document in (report, claims):
+        assert "codec-local-v1" in document
+        assert "871cbc9058d4befe4b0f5e35b687d1b5f525cb2c" in document
+        assert "1,408" in document
+        assert "3,858" in document
+
+    assert "108/108" in report
+    assert "588/588" in report
+    assert "sidecar:artifacts/codec-local-v1/claim-summary.json" in claims
+    assert "claims.json" in claims
+
+
+def test_public_codec_docs_reject_equivalence_and_performance_overclaims() -> None:
+    corpus = public_claim_corpus()
+
+    for forbidden in (
+        "paper equivalent",
+        "paper-scale reproduction",
+        "pareto win",
+        "32k qualified",
+    ):
+        assert forbidden not in corpus
 
 
 def test_results_record_the_capacity_limited_final_evidence_outcome() -> None:
