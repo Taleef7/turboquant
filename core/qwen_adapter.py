@@ -40,6 +40,10 @@ class PackedAttentionMetrics:
     packed_decode_calls: int = 0
     packed_blocks_consumed: int = 0
     packed_reference_decode_calls: int = 0
+    parallel_decode_calls: int = 0
+    parallel_page_launches: int = 0
+    parallel_reduction_launches: int = 0
+    parallel_tail_launches: int = 0
     max_logit_drift: float | None = None
     packed_reference_max_error: float | None = None
 
@@ -103,7 +107,9 @@ def qwen25_packed_attention(
     """Transformers ``AttentionInterface`` callable registered by this module."""
     session = _ACTIVE_SESSION.get()
     if session is None or not session.owns(module):
-        raise UnsupportedCapabilityError("Qwen2.5 packed attention requires an active installed session.")
+        raise UnsupportedCapabilityError(
+            "Qwen2.5 packed attention requires an active installed session."
+        )
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4 or query.shape[0] != 1:
         raise UnsupportedCapabilityError("direct decode requires batch_size=1.")
     query_length = query.shape[-2]
@@ -116,7 +122,9 @@ def qwen25_packed_attention(
             None,
         )
     if query_length != 1 or session.phase != "decode":
-        raise UnsupportedCapabilityError("direct packed attention requires a standard prompt prefill first.")
+        raise UnsupportedCapabilityError(
+            "direct packed attention requires a standard prompt prefill first."
+        )
     output = session.packed_decode(module, query, scale=kwargs.get("scaling"))
     return output, None
 
@@ -125,7 +133,13 @@ class PackedAttentionSession:
     """Context-scoped direct attention route; no process-global mutable cache."""
 
     def __init__(
-        self, model: object, profile: CompressionProfile, capabilities: ModelCapabilities
+        self,
+        model: object,
+        profile: CompressionProfile,
+        capabilities: ModelCapabilities,
+        *,
+        maximum_sequence_length: int | None = None,
+        use_parallel_page_attention: bool = False,
     ) -> None:
         self.model = model
         self.profile = profile
@@ -133,8 +147,33 @@ class PackedAttentionSession:
         self.layers = _attention_layers(model)
         if len(self.layers) != capabilities.layer_count:
             raise UnsupportedCapabilityError(_UNSUPPORTED_LAYOUT)
-        self._layer_ids = {id(module): index for index, module in enumerate(self.layers)}
-        self.cache = PackedDynamicCache(profile, layer_count=len(self.layers))
+        self._layer_ids = {
+            id(module): index for index, module in enumerate(self.layers)
+        }
+        if type(use_parallel_page_attention) is not bool:  # noqa: E721
+            raise TypeError("use_parallel_page_attention must be a bool.")
+        if maximum_sequence_length is not None:
+            if type(maximum_sequence_length) is not int:  # noqa: E721
+                raise TypeError("maximum_sequence_length must be a built-in int.")
+            if maximum_sequence_length < 1:
+                raise ValueError("maximum_sequence_length must be positive.")
+            if not use_parallel_page_attention:
+                raise UnsupportedCapabilityError(
+                    "maximum_sequence_length reservation requires the opt-in parallel page path."
+                )
+        if use_parallel_page_attention and maximum_sequence_length is None:
+            raise UnsupportedCapabilityError(
+                "parallel page attention requires an explicit maximum_sequence_length."
+            )
+        self.maximum_sequence_length = maximum_sequence_length
+        self.use_parallel_page_attention = use_parallel_page_attention
+        self.cache = PackedDynamicCache(
+            profile,
+            layer_count=len(self.layers),
+            maximum_sequence_length=maximum_sequence_length
+            if use_parallel_page_attention
+            else None,
+        )
         self.cache.set_update_guard(self._require_permitted_cache_update)
         self.metrics = PackedAttentionMetrics()
         self.phase = "idle"
@@ -142,16 +181,23 @@ class PackedAttentionSession:
         self._previous_implementation: object | None = None
         self._last_logits: torch.Tensor | None = None
         self._prepared_layers: dict[int, _PreparedLayerDecode] = {}
+        self._parallel_workspace: Any | None = None
+        self._parallel_workspace_device: torch.device | None = None
+        self._parallel_outputs: dict[int, torch.Tensor] = {}
         self.compare_packed_reference = False
         self.use_packed_reference_backend = False
 
     def owns(self, module: object) -> bool:
         return id(module) in self._layer_ids
 
-    def _require_permitted_cache_update(self, key_states: torch.Tensor, layer_idx: int) -> None:
+    def _require_permitted_cache_update(
+        self, key_states: torch.Tensor, layer_idx: int
+    ) -> None:
         """Reject unsupported attention calls before a K/V append can occur."""
         if _ACTIVE_SESSION.get() is not self:
-            raise UnsupportedCapabilityError("Qwen2.5 packed cache requires its active session.")
+            raise UnsupportedCapabilityError(
+                "Qwen2.5 packed cache requires its active session."
+            )
         tokens = key_states.shape[-2]
         if self.phase == "prefill" and tokens > 1:
             return
@@ -164,9 +210,13 @@ class PackedAttentionSession:
     def __enter__(self) -> "PackedAttentionSession":
         active = _ACTIVE_SESSION.get()
         if active is not None and active is not self:
-            raise UnsupportedCapabilityError("nested Qwen2.5 packed attention sessions are unsupported.")
+            raise UnsupportedCapabilityError(
+                "nested Qwen2.5 packed attention sessions are unsupported."
+            )
         if self._token is None:
-            self._previous_implementation = getattr(self.model.config, "_attn_implementation", None)
+            self._previous_implementation = getattr(
+                self.model.config, "_attn_implementation", None
+            )
             self.model.config._attn_implementation = _BACKEND_NAME
             self._token = _ACTIVE_SESSION.set(self)
         return self
@@ -185,21 +235,41 @@ class PackedAttentionSession:
             yield
         self.phase = previous
 
-    def _validate_request(self, request: DecodeRequest, input_ids: torch.Tensor) -> None:
+    def _validate_request(
+        self, request: DecodeRequest, input_ids: torch.Tensor
+    ) -> None:
         require_direct_decode_support(self.capabilities, request)
-        if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        if (
+            not isinstance(input_ids, torch.Tensor)
+            or input_ids.ndim != 2
+            or input_ids.shape[0] != 1
+        ):
             raise UnsupportedCapabilityError("direct decode requires batch_size=1.")
-        if input_ids.device.type != "cpu" and self.cache._device is not None and input_ids.device != self.cache._device:
-            raise UnsupportedCapabilityError("Qwen2.5 packed decode does not support cache device changes.")
+        if (
+            input_ids.device.type != "cpu"
+            and self.cache._device is not None
+            and input_ids.device != self.cache._device
+        ):
+            raise UnsupportedCapabilityError(
+                "Qwen2.5 packed decode does not support cache device changes."
+            )
 
     def prefill(
-        self, prompt_ids: torch.Tensor, *, request: DecodeRequest = DecodeRequest(), use_cache: bool = True
+        self,
+        prompt_ids: torch.Tensor,
+        *,
+        request: DecodeRequest = DecodeRequest(),
+        use_cache: bool = True,
     ) -> Any:
         self._validate_request(request, prompt_ids)
         if use_cache is not True:
-            raise UnsupportedCapabilityError("direct decode requires an enabled KV cache.")
+            raise UnsupportedCapabilityError(
+                "direct decode requires an enabled KV cache."
+            )
         if prompt_ids.shape[1] <= 1:
-            raise UnsupportedCapabilityError("direct packed attention requires a standard prompt prefill first.")
+            raise UnsupportedCapabilityError(
+                "direct packed attention requires a standard prompt prefill first."
+            )
         with self._active("prefill"):
             result = self.model(
                 prompt_ids,
@@ -211,17 +281,27 @@ class PackedAttentionSession:
         return result
 
     def decode_one(
-        self, token_ids: torch.Tensor | None = None, *, request: DecodeRequest = DecodeRequest(), use_cache: bool = True
+        self,
+        token_ids: torch.Tensor | None = None,
+        *,
+        request: DecodeRequest = DecodeRequest(),
+        use_cache: bool = True,
     ) -> Any:
         if token_ids is None:
             if self._last_logits is None:
-                raise UnsupportedCapabilityError("direct packed attention requires a standard prompt prefill first.")
+                raise UnsupportedCapabilityError(
+                    "direct packed attention requires a standard prompt prefill first."
+                )
             token_ids = self._last_logits[:, -1:].argmax(dim=-1)
         self._validate_request(request, token_ids)
         if use_cache is not True:
-            raise UnsupportedCapabilityError("direct decode requires an enabled KV cache.")
+            raise UnsupportedCapabilityError(
+                "direct decode requires an enabled KV cache."
+            )
         if token_ids.shape[1] != 1 or self.cache.sequence_length() < 1:
-            raise UnsupportedCapabilityError("direct packed attention requires a standard prompt prefill first.")
+            raise UnsupportedCapabilityError(
+                "direct packed attention requires a standard prompt prefill first."
+            )
         with self._active("decode"):
             result = self.model(token_ids, past_key_values=self.cache, use_cache=True)
         self._last_logits = result.logits
@@ -261,7 +341,9 @@ class PackedAttentionSession:
             debug = cached.debug
         else:
             rotation = store.key_codec._rotation.to(query.device, dtype=torch.float32)
-            key_codebook = store.key_codec._centroids.to(query.device, dtype=torch.float32)
+            key_codebook = store.key_codec._centroids.to(
+                query.device, dtype=torch.float32
+            )
             gqa_mapping = (
                 torch.arange(query.shape[1], device=query.device, dtype=torch.int32)
                 // gqa_groups
@@ -269,7 +351,9 @@ class PackedAttentionSession:
             debug = PackedAttentionHotPathDebugState()
         blocks = tuple(
             PackedAttentionBlock(
-                packed_keys=block.keys.indices.reshape(num_kv_heads, block.logical_tokens, -1),
+                packed_keys=block.keys.indices.reshape(
+                    num_kv_heads, block.logical_tokens, -1
+                ),
                 key_norms=block.keys.norms.reshape(num_kv_heads, block.logical_tokens),
                 key_codebook=key_codebook,
                 key_bits=store.key_codec.layout.bits,
@@ -308,17 +392,144 @@ class PackedAttentionSession:
         self._prepared_layers[layer_idx] = cached
         return cached
 
-    def packed_decode(self, module: object, query: torch.Tensor, *, scale: float | None) -> torch.Tensor:
-        from kernels.packed_attention import PackedAttentionBlock, PackedAttentionDebugState, packed_attention_decode
+    def _parallel_workspace_for(self, device: torch.device) -> Any:
+        from core.parallel_page_workspace import reserve_parallel_page_workspace
+
+        if not self.use_parallel_page_attention or self.maximum_sequence_length is None:
+            raise UnsupportedCapabilityError(
+                "parallel page attention requires an explicit capacity reservation."
+            )
+        if device.type != "cuda":
+            raise UnsupportedCapabilityError(
+                "parallel page attention requires CUDA; the serial path remains available."
+            )
+        if self._parallel_workspace is not None:
+            if self._parallel_workspace_device != device:
+                raise UnsupportedCapabilityError(
+                    "parallel page workspace device changes are unsupported."
+                )
+            return self._parallel_workspace
+        tail_capacity = self.profile.block_size + self.profile.fp16_window - 1
+        page_capacity = max(
+            1,
+            math.ceil(
+                max(0, self.maximum_sequence_length - tail_capacity)
+                / self.profile.block_size
+            ),
+        )
+        self._parallel_workspace = reserve_parallel_page_workspace(
+            page_capacity=page_capacity,
+            device=device,
+        )
+        self._parallel_workspace_device = device
+        # Allocate one model-facing output slot per layer during first-use
+        # setup.  Decode launches then only overwrite session-owned buffers;
+        # no per-token output allocation is allowed on the fast path.
+        output_dtype = self.cache._dtype or torch.float16
+        self._parallel_outputs = {
+            layer_idx: torch.empty((1, 1, 28, 128), dtype=output_dtype, device=device)
+            for layer_idx in range(len(self.layers))
+        }
+        return self._parallel_workspace
+
+    def _parallel_decode(
+        self,
+        layer_idx: int,
+        store: object,
+        query: torch.Tensor,
+        *,
+        scale: float,
+    ) -> torch.Tensor:
+        from kernels.qwen25_parallel_page_attention import (
+            launch_qwen25_page_reduction,
+            launch_qwen25_page_states,
+            launch_qwen25_query_rotation,
+            launch_qwen25_tail_merge,
+        )
+
+        if query.shape != (1, 28, 1, 128) or not query.is_contiguous():
+            raise UnsupportedCapabilityError(
+                "parallel page attention requires contiguous Qwen2.5 query shape [1, 28, 1, 128]."
+            )
+        arena = store.arena  # type: ignore[attr-defined]
+        if arena is None:
+            raise UnsupportedCapabilityError(
+                "parallel page attention requires an arena-backed cache."
+            )
+        layout = arena.layout
+        if (
+            layout.page_tokens != 256
+            or layout.num_kv_heads != 4
+            or layout.head_dim != 128
+            or layout.key_packed_width != 128
+            or layout.value_packed_width != 96
+            or layout.value_groups != 4
+            or store.key_codec.layout.qjl_enabled  # type: ignore[attr-defined]
+        ):
+            raise UnsupportedCapabilityError(
+                "parallel page attention requires the canonical Qwen2.5 packed layout."
+            )
+        workspace = self._parallel_workspace_for(query.device)
+        prepared_codec = store.key_codec.prepare_device(query.device)  # type: ignore[attr-defined]
+        launch_qwen25_query_rotation(query, prepared_codec.rotation, workspace)
+        launch_qwen25_page_states(
+            query,
+            arena,
+            prepared_codec,
+            workspace,
+            used_pages=arena.used_pages,
+            scale=scale,
+        )
+        launch_qwen25_page_reduction(workspace, used_pages=arena.used_pages)
+        output = self._parallel_outputs.get(layer_idx)
+        if (
+            output is None
+            or output.device != query.device
+            or output.dtype != query.dtype
+        ):
+            raise UnsupportedCapabilityError(
+                "parallel page output buffers were not reserved for this cache device/dtype."
+            )
+        launch_qwen25_tail_merge(
+            query,
+            arena.tail_keys,
+            arena.tail_values,
+            workspace,
+            tail_length=arena.tail_length,
+            tail_head_stride=arena.tail_keys.stride(1),
+            tail_token_stride=arena.tail_keys.stride(2),
+            scale=scale,
+            output=output,
+            tail_query=query,
+        )
+        self.metrics.parallel_decode_calls += 1
+        self.metrics.parallel_page_launches += 1
+        self.metrics.parallel_reduction_launches += 1
+        self.metrics.parallel_tail_launches += 1
+        return output
+
+    def packed_decode(
+        self, module: object, query: torch.Tensor, *, scale: float | None
+    ) -> torch.Tensor:
+        from kernels.packed_attention import (
+            PackedAttentionBlock,
+            PackedAttentionDebugState,
+            packed_attention_decode,
+        )
 
         layer_idx = self._layer_ids.get(id(module))
         if layer_idx is None:
             raise UnsupportedCapabilityError(_UNSUPPORTED_LAYOUT)
         store = self.cache.store_for(layer_idx)
         if store.sequence_length() < 1:
-            raise UnsupportedCapabilityError("direct packed attention requires a standard prompt prefill first.")
+            raise UnsupportedCapabilityError(
+                "direct packed attention requires a standard prompt prefill first."
+            )
         if self.use_packed_reference_backend:
-            from core.reference_attention import ReferenceAttentionLayout, packed_reference_decode
+            from core.reference_attention import (
+                ReferenceAttentionLayout,
+                packed_reference_decode,
+            )
 
             reference = packed_reference_decode(
                 query,
@@ -332,66 +543,84 @@ class PackedAttentionSession:
             )
             self.metrics.packed_reference_decode_calls += 1
             return reference.transpose(1, 2).contiguous()
-        tail = next(store.iter_fp16_window(), None)
-        window = None if tail is None else (tail[0].squeeze(0), tail[1].squeeze(0))
-        attention_scale = float(scale) if scale is not None else 1 / math.sqrt(query.shape[-1])
-        if query.is_cuda:
-            prepared = self._prepared_layer_decode(
+        attention_scale = (
+            float(scale) if scale is not None else 1 / math.sqrt(query.shape[-1])
+        )
+        if self.use_parallel_page_attention:
+            output = self._parallel_decode(
                 layer_idx, store, query, scale=attention_scale
             )
-            output = prepared.prepared.launch(query.squeeze(0), fp16_window=window)
-            packed_blocks_consumed = prepared.block_count
+            packed_blocks_consumed = store.block_count
+            parallel_output = True
         else:
-            blocks = (
-                PackedAttentionBlock(
-                    packed_keys=block.keys.indices.reshape(
-                        query.shape[1] // self.capabilities.num_key_value_groups,
-                        block.logical_tokens,
-                        -1,
-                    ),
-                    key_norms=block.keys.norms.reshape(
-                        query.shape[1] // self.capabilities.num_key_value_groups,
-                        block.logical_tokens,
-                    ),
-                    key_codebook=store.key_codec._centroids.to(query.device),
-                    key_bits=store.key_codec.layout.bits,
-                    packed_values=block.values.indices.reshape(
-                        query.shape[1] // self.capabilities.num_key_value_groups,
-                        block.logical_tokens,
-                        -1,
-                    ),
-                    value_mins=block.values.mins.reshape(
-                        query.shape[1] // self.capabilities.num_key_value_groups,
-                        block.logical_tokens,
-                        -1,
-                    ),
-                    value_scales=block.values.scales.reshape(
-                        query.shape[1] // self.capabilities.num_key_value_groups,
-                        block.logical_tokens,
-                        -1,
-                    ),
-                    value_bits=store.value_codec.layout.bits,
-                    value_group_size=store.value_codec.layout.group_size,
+            tail = next(store.iter_fp16_window(), None)
+            window = None if tail is None else (tail[0].squeeze(0), tail[1].squeeze(0))
+            parallel_output = False
+            if query.is_cuda:
+                prepared = self._prepared_layer_decode(
+                    layer_idx, store, query, scale=attention_scale
                 )
-                for block in store.iter_blocks()
-            )
-            debug = PackedAttentionDebugState()
-            output = packed_attention_decode(
-                query.squeeze(0),
-                blocks,
-                store.key_codec._rotation.to(query.device),
-                torch.arange(query.shape[1], device=query.device, dtype=torch.int32)
-                // self.capabilities.num_key_value_groups,
-                scale=attention_scale,
-                fp16_window=window,
-                debug=debug,
-                allow_torch_fallback=True,
-            )
-            packed_blocks_consumed = debug.blocks_consumed
+                output = prepared.prepared.launch(query.squeeze(0), fp16_window=window)
+                packed_blocks_consumed = prepared.block_count
+            else:
+                blocks = (
+                    PackedAttentionBlock(
+                        packed_keys=block.keys.indices.reshape(
+                            query.shape[1] // self.capabilities.num_key_value_groups,
+                            block.logical_tokens,
+                            -1,
+                        ),
+                        key_norms=block.keys.norms.reshape(
+                            query.shape[1] // self.capabilities.num_key_value_groups,
+                            block.logical_tokens,
+                        ),
+                        key_codebook=store.key_codec._centroids.to(query.device),
+                        key_bits=store.key_codec.layout.bits,
+                        packed_values=block.values.indices.reshape(
+                            query.shape[1] // self.capabilities.num_key_value_groups,
+                            block.logical_tokens,
+                            -1,
+                        ),
+                        value_mins=block.values.mins.reshape(
+                            query.shape[1] // self.capabilities.num_key_value_groups,
+                            block.logical_tokens,
+                            -1,
+                        ),
+                        value_scales=block.values.scales.reshape(
+                            query.shape[1] // self.capabilities.num_key_value_groups,
+                            block.logical_tokens,
+                            -1,
+                        ),
+                        value_bits=store.value_codec.layout.bits,
+                        value_group_size=store.value_codec.layout.group_size,
+                    )
+                    for block in store.iter_blocks()
+                )
+                debug = PackedAttentionDebugState()
+                output = packed_attention_decode(
+                    query.squeeze(0),
+                    blocks,
+                    store.key_codec._rotation.to(query.device),
+                    torch.arange(query.shape[1], device=query.device, dtype=torch.int32)
+                    // self.capabilities.num_key_value_groups,
+                    scale=attention_scale,
+                    fp16_window=window,
+                    debug=debug,
+                    allow_torch_fallback=True,
+                )
+                packed_blocks_consumed = debug.blocks_consumed
+        model_output = (
+            output
+            if parallel_output
+            else output.unsqueeze(0).transpose(1, 2).contiguous()
+        )
         self.metrics.packed_decode_calls += 1
         self.metrics.packed_blocks_consumed += packed_blocks_consumed
         if self.compare_packed_reference:
-            from core.reference_attention import ReferenceAttentionLayout, packed_reference_decode
+            from core.reference_attention import (
+                ReferenceAttentionLayout,
+                packed_reference_decode,
+            )
 
             reference = packed_reference_decode(
                 query,
@@ -403,16 +632,20 @@ class PackedAttentionSession:
                 ),
                 scale=float(scale) if scale is not None else None,
             )
+            reference_model = reference.transpose(1, 2).contiguous()
             self.metrics.packed_reference_max_error = float(
-                (output.unsqueeze(0).float() - reference.float()).abs().max().item()
+                (model_output.float() - reference_model.float()).abs().max().item()
             )
-        return output.unsqueeze(0).transpose(1, 2).contiguous()
+        return model_output
 
 
 def install_qwen25_packed_backend(
     model: object,
     profile: CompressionProfile,
     revision: ModelCapabilities | object | None = None,
+    *,
+    maximum_sequence_length: int | None = None,
+    use_parallel_page_attention: bool = False,
 ) -> PackedAttentionSession:
     """Install a session object for the sole supported Qwen2.5 direct profile."""
     try:
@@ -420,22 +653,38 @@ def install_qwen25_packed_backend(
         from transformers import AttentionInterface
     except ImportError as exc:  # pragma: no cover - dependency-specific boundary.
         raise UnsupportedCapabilityError(_UNSUPPORTED_LAYOUT) from exc
-    if tuple(int(part) for part in transformers.__version__.split(".")[:3]) < (4, 57, 3):
+    if tuple(int(part) for part in transformers.__version__.split(".")[:3]) < (
+        4,
+        57,
+        3,
+    ):
         raise UnsupportedCapabilityError(_UNSUPPORTED_LAYOUT)
     if not hasattr(AttentionInterface, "register"):
         raise UnsupportedCapabilityError(_UNSUPPORTED_LAYOUT)
     if not isinstance(profile, CompressionProfile):
         raise TypeError("profile must be a CompressionProfile.")
-    if revision is not None and not isinstance(revision, (ModelCapabilities, ModelRevision)):
+    if revision is not None and not isinstance(
+        revision, (ModelCapabilities, ModelRevision)
+    ):
         raise TypeError("revision must be a ModelRevision, ModelCapabilities, or None.")
     if isinstance(revision, ModelRevision) and revision != profile.revision:
-        raise UnsupportedCapabilityError("Qwen2.5 packed decode revision does not match the profile.")
+        raise UnsupportedCapabilityError(
+            "Qwen2.5 packed decode revision does not match the profile."
+        )
     capabilities = revision if isinstance(revision, ModelCapabilities) else None
     if capabilities is None:
         capabilities = derive_model_capabilities(
-            model.config, profile.revision, load_model_manifest(profile.model_manifest_path)
+            model.config,
+            profile.revision,
+            load_model_manifest(profile.model_manifest_path),
         )
     require_direct_decode_support(capabilities, DecodeRequest())
     require_qwen25_packed_layout(capabilities)
     AttentionInterface.register(_BACKEND_NAME, qwen25_packed_attention)
-    return PackedAttentionSession(model, profile, capabilities)
+    return PackedAttentionSession(
+        model,
+        profile,
+        capabilities,
+        maximum_sequence_length=maximum_sequence_length,
+        use_parallel_page_attention=use_parallel_page_attention,
+    )

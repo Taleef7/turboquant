@@ -195,6 +195,31 @@ def _validate_arena(
 if _TRITON_AVAILABLE:
 
     @triton.jit
+    def _qwen25_query_rotation_kernel(
+        query_ptr,
+        rotation_ptr,
+        rotated_query_ptr,
+        BLOCK_OUT: tl.constexpr,
+    ):
+        """Rotate one contiguous [28, 128] query without an output allocation."""
+        head = tl.program_id(0)
+        output_block = tl.program_id(1)
+        output_dims = output_block * BLOCK_OUT + tl.arange(0, BLOCK_OUT)
+        input_dims = tl.arange(0, 128)
+        query_values = tl.load(query_ptr + head * 128 + input_dims).to(tl.float32)
+        rotation = tl.load(
+            rotation_ptr + output_dims[:, None] * 128 + input_dims[None, :],
+            mask=output_dims[:, None] < 128,
+            other=0.0,
+        ).to(tl.float32)
+        rotated = tl.sum(rotation * query_values[None, :], axis=1)
+        tl.store(
+            rotated_query_ptr + head * 128 + output_dims,
+            rotated,
+            mask=output_dims < 128,
+        )
+
+    @triton.jit
     def _qwen25_page_states_kernel(
         rotated_query_ptr,
         packed_keys_ptr,
@@ -333,7 +358,7 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _qwen25_tail_merge_kernel(
-        rotated_query_ptr,
+        query_ptr,
         tail_keys_ptr,
         tail_values_ptr,
         reduced_max_ptr,
@@ -352,7 +377,10 @@ if _TRITON_AVAILABLE:
         head = tl.program_id(0)
         kv_head = head // 7
         dims = tl.arange(0, 128)
-        query = tl.load(rotated_query_ptr + head * 128 + dims)
+        # The caller chooses the tail query space.  The adapter passes the raw
+        # query for model-space tail keys; low-level callers default to the
+        # codec-rotated workspace query.
+        query = tl.load(query_ptr + head * 128 + dims).to(tl.float32)
         merged_max = tl.load(reduced_max_ptr + head)
         merged_denominator = tl.load(reduced_denominator_ptr + head)
         merged_numerator = tl.load(reduced_numerator_ptr + head * 128 + dims)
@@ -443,6 +471,44 @@ def launch_qwen25_page_states(
         SCALE=float(scale),
         BLOCK_T=16,
         num_warps=4,
+    )
+
+
+def launch_qwen25_query_rotation(
+    query: torch.Tensor,
+    rotation: torch.Tensor,
+    workspace: ParallelPageWorkspace,
+) -> None:
+    """Rotate one decode query into the reusable float32 workspace."""
+    _require_triton_cuda()
+    if not isinstance(workspace, ParallelPageWorkspace):
+        raise TypeError("workspace must be a ParallelPageWorkspace.")
+    if not isinstance(rotation, torch.Tensor):
+        raise TypeError("rotation must be a torch.Tensor.")
+    device = workspace.rotated_query.device
+    query_2d, _ = _validate_query(query, device)
+    _validate_workspace(workspace, device=device, used_pages=0)
+    if (
+        rotation.device != device
+        or rotation.shape != (_HEAD_DIM, _HEAD_DIM)
+        or rotation.dtype != torch.float32
+        or not rotation.is_contiguous()
+    ):
+        raise ValueError(
+            "rotation must be contiguous float32 [128, 128] on the workspace device."
+        )
+    if not query_2d.is_contiguous():
+        raise ValueError("query must be contiguous for allocation-free rotation.")
+    _qwen25_query_rotation_kernel[
+        (
+            _QUERY_HEADS,
+            4,
+        )
+    ](
+        query_2d,
+        rotation,
+        workspace.rotated_query,
+        BLOCK_OUT=32,
     )
 
 
@@ -542,13 +608,23 @@ def launch_qwen25_tail_merge(
     tail_token_stride: int,
     scale: float,
     output: torch.Tensor,
+    tail_query: torch.Tensor | None = None,
 ) -> None:
-    """Merge reduced pages and a raw fixed-stride tail into ``output``."""
+    """Merge reduced pages and a fixed-stride tail into ``output``.
+
+    By default ``query`` is interpreted in codec-rotated space, matching the
+    low-level page-kernel contract.  Adapters that retain raw model-space tail
+    keys may pass ``tail_query`` explicitly; this avoids allocating a rotated
+    tail-key buffer while preserving the public kernel behavior.
+    """
     _require_triton_cuda()
     if not isinstance(workspace, ParallelPageWorkspace):
         raise TypeError("workspace must be a ParallelPageWorkspace.")
     device = workspace.rotated_query.device
     query_2d, _ = _validate_query(query, device)
+    tail_query_2d = workspace.rotated_query
+    if tail_query is not None:
+        tail_query_2d, _ = _validate_query(tail_query, device)
     _validate_workspace(workspace, device=device, used_pages=0)
     tail_capacity = _validate_tail(
         tail_keys,
@@ -568,20 +644,23 @@ def launch_qwen25_tail_merge(
         raise ValueError("output must be a tensor on the workspace device.")
     if output.ndim == 2 and tuple(output.shape) == (_QUERY_HEADS, _HEAD_DIM):
         output_2d = output
-    elif output.ndim == 4 and tuple(output.shape) == (1, _QUERY_HEADS, 1, _HEAD_DIM):
+    elif output.ndim == 4 and tuple(output.shape) in {
+        (1, _QUERY_HEADS, 1, _HEAD_DIM),
+        (1, 1, _QUERY_HEADS, _HEAD_DIM),
+    }:
         output_2d = output.view(_QUERY_HEADS, _HEAD_DIM)
     else:
-        raise ValueError("output must have shape [28, 128] or [1, 28, 1, 128].")
+        raise ValueError(
+            "output must have shape [28, 128], [1, 28, 1, 128], or [1, 1, 28, 128]."
+        )
     if output.dtype not in _SUPPORTED_FLOAT_DTYPES:
         raise TypeError("output must use fp16, bf16, or fp32.")
     if output_2d.stride(-1) != 1:
         raise ValueError("output feature dimension must have unit stride.")
     if output_2d.stride(0) <= 0:
         raise ValueError("output head stride must be positive.")
-    if workspace.rotated_query.data_ptr() == query_2d.data_ptr():
-        raise ValueError("workspace.rotated_query must not alias the raw query.")
     _qwen25_tail_merge_kernel[(_QUERY_HEADS,)](
-        workspace.rotated_query,
+        tail_query_2d,
         tail_keys,
         tail_values,
         workspace.reduced_max,
@@ -603,6 +682,7 @@ __all__ = [
     "ParallelPageWorkspace",
     "launch_qwen25_page_reduction",
     "launch_qwen25_page_states",
+    "launch_qwen25_query_rotation",
     "launch_qwen25_tail_merge",
     "page_state_grid",
 ]
