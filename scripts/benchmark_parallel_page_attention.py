@@ -574,6 +574,13 @@ def _allocation_probe_parallel(
     return count
 
 
+def _parallel_arena_tail_views(
+    arena: object,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """Return the arena-owned raw-tail views used by the measured path."""
+    return arena.tail_views()  # type: ignore[attr-defined]
+
+
 def _run_parallel_row(page_count: int, *, seed: int) -> dict[str, object]:
     """Measure the complete four-launch page-state/reduction/tail diagnostic."""
     import torch
@@ -609,6 +616,10 @@ def _run_parallel_row(page_count: int, *, seed: int) -> dict[str, object]:
     tail_keys = tail_cpu[0].unsqueeze(0).to(device)
     tail_values = tail_cpu[1].unsqueeze(0).to(device)
     arena.append_tail(tail_keys, tail_values)
+    arena_tail_keys, arena_tail_values = _parallel_arena_tail_views(arena)
+    # The arena owns the historical tail after append.  Drop the dense setup
+    # tensors before baseline capture so they are not hidden from accounting.
+    del tail_keys, tail_values
     query = query_cpu.to(device)
     workspace = reserve_parallel_page_workspace(page_capacity=page_count, device=device)
     workspace.rotated_query.copy_(query)
@@ -634,12 +645,12 @@ def _run_parallel_row(page_count: int, *, seed: int) -> dict[str, object]:
         launch_qwen25_page_reduction(workspace, used_pages=page_count)
         launch_qwen25_tail_merge(
             query,
-            tail_keys,
-            tail_values,
+            arena_tail_keys,
+            arena_tail_values,
             workspace,
             tail_length=TAIL_TOKENS,
-            tail_head_stride=tail_keys.stride(1),
-            tail_token_stride=tail_keys.stride(2),
+            tail_head_stride=arena_tail_keys.stride(1),
+            tail_token_stride=arena_tail_keys.stride(2),
             scale=scale,
             output=output,
         )
@@ -654,7 +665,13 @@ def _run_parallel_row(page_count: int, *, seed: int) -> dict[str, object]:
         "tail": 1,
         "fallback": 0,
         "allocation": _allocation_probe_parallel(
-            query, arena, prepared, workspace, tail_keys, tail_values, output
+            query,
+            arena,
+            prepared,
+            workspace,
+            arena_tail_keys,
+            arena_tail_values,
+            output,
         ),
     }
     for _ in range(WARMUP_RUNS):

@@ -13,7 +13,9 @@ import torch
 from scripts.benchmark_parallel_page_attention import (
     DEFAULT_PAGE_COUNTS,
     MEASURED_TRIALS,
+    _parallel_arena_tail_views,
     _parallel_page_workspace_nbytes,
+    _synthetic_arena,
     WARMUP_RUNS,
     validate_parallel_page_artifact,
 )
@@ -203,6 +205,25 @@ def test_mixed_contract_rejects_inconsistent_serial_parallel_tail_accounting() -
     result = validate_parallel_page_artifact(artifact)
     assert not result.valid
     assert any("tail logical-byte accounting" in error for error in result.errors)
+
+
+@pytest.mark.gpu
+def test_parallel_benchmark_tail_views_are_arena_owned() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    arena, _blocks_cpu, _prepared = _synthetic_arena(
+        1, seed=2222, device=torch.device("cuda")
+    )
+    keys = torch.randn((1, 4, 8, 128), device="cuda", dtype=torch.float16)
+    values = torch.randn_like(keys)
+    arena.append_tail(keys, values)
+    view_keys, view_values = _parallel_arena_tail_views(arena)
+    assert view_keys.data_ptr() == arena.tail_keys.data_ptr()
+    assert view_values.data_ptr() == arena.tail_values.data_ptr()
+    assert view_keys.stride(1) == arena.tail_keys.stride(1)
+    assert view_keys.stride(2) == arena.tail_keys.stride(2)
+    assert view_values.stride(1) == arena.tail_values.stride(1)
+    assert view_values.stride(2) == arena.tail_values.stride(2)
 
 
 def test_page_state_workspace_bytes_include_all_reduction_buffers() -> None:
