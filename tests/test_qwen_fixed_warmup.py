@@ -100,6 +100,7 @@ def _completed_fixture(config: dict) -> dict:
 def test_config_declares_fixed_warmup_matrix() -> None:
     config = load_warmup_config(CONFIG)
     assert config["contexts"] == [1024, 2048]
+    assert config["stream_seed"] == 26009
     assert config["warmup_tokens"] == 1
     assert config["measured_decode_tokens"] == 3
     assert config["repeats"] == 3

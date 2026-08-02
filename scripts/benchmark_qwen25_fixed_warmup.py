@@ -72,6 +72,8 @@ def load_warmup_config(path: str | Path = CONFIG_PATH) -> dict[str, Any]:
         errors.append("fixture_manifest_sha256 must be a lowercase SHA-256 digest")
     if payload.get("contexts") != [1024, 2048]:
         errors.append("contexts must be the predeclared [1024, 2048] matrix")
+    if type(payload.get("stream_seed")) is not int:  # noqa: E721
+        errors.append("stream_seed must be a built-in int")
     for key in ("warmup_tokens", "measured_decode_tokens", "repeats"):
         if type(payload.get(key)) is not int or payload[key] < 1:  # noqa: E721
             errors.append(f"{key} must be a positive built-in int")
@@ -580,7 +582,7 @@ def run_warmup(
         "local_files_only": not allow_download,
         "cache_dir": None if cache_dir is None else str(cache_dir),
         "model_path": None if model_path is None else str(model_path),
-        "stream_seed": 26009,
+        "stream_seed": config["stream_seed"],
     }
     if model_path is not None:
         fixture, fixture_error = _fixture_identity(model_path, config)
@@ -596,7 +598,8 @@ def run_warmup(
         source = {**source, "model_fixture": fixture}
         artifact["source_identity"] = source
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    seed_everything(26009, deterministic=True)
+    stream_seed = int(config["stream_seed"])
+    seed_everything(stream_seed, deterministic=True)
     try:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -641,7 +644,7 @@ def run_warmup(
             + int(config["warmup_tokens"])
             + int(config["measured_decode_tokens"])
         )
-        stream = _fixed_stream(tokenizer, total_tokens, 26009 + context)
+        stream = _fixed_stream(tokenizer, total_tokens, stream_seed + context)
         prompt_ids = stream[:, :context].to(model.device)
         decode_ids = stream[:, context:].to(model.device)
         baseline_row: dict[str, Any] | None = None
