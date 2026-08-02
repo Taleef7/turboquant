@@ -123,6 +123,29 @@ def test_serial_contract_accepts_complete_diagnostic_artifact() -> None:
     assert result.valid, result.errors
 
 
+def test_page_state_contract_accepts_one_grid_launch_per_page_set() -> None:
+    artifact = _artifact()
+    artifact["artifact_id"] = "parallel-page-state"
+    artifact["extensions"] = {
+        "implementation": "page-state",
+        "implementations": ["page-state"],
+    }
+    artifact["expected_row_ids"] = [
+        f"page-state-pages-{page_count}" for page_count in DEFAULT_PAGE_COUNTS
+    ]
+    rows = []
+    for row in artifact["rows"]:  # type: ignore[index]
+        row = copy.deepcopy(row)
+        row["row_id"] = row["row_id"].replace("serial-", "page-state-")
+        row["metrics"]["launch_counts"].update(  # type: ignore[index]
+            {"page": 1, "tail": 0}
+        )
+        rows.append(row)
+    artifact["rows"] = rows
+    result = validate_parallel_page_artifact(artifact)
+    assert result.valid, result.errors
+
+
 def test_contract_rejects_missing_page_row() -> None:
     artifact = _artifact()
     artifact["rows"] = artifact["rows"][:-1]  # type: ignore[index]
