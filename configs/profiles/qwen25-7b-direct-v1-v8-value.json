@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "name": "qwen25-7b-direct-v1-v8-value",
+  "adapter_status": "direct-adapter",
+  "model_manifest_path": "../models/qwen25-7b.json",
+  "model_manifest_sha256": "85347eeea4ce8cc072f9102bbe595b5c6df63f125bc8cd35938387a3e91cd45f",
+  "model_revision": {
+    "model_id": "Qwen/Qwen2.5-7B-Instruct",
+    "revision": "a09a35458c702b33eeacc393d103063234e8bc28"
+  },
+  "model_architecture": {
+    "model_type": "qwen2",
+    "adapter_status": "direct-adapter",
+    "architecture_complete": true,
+    "num_hidden_layers": 28,
+    "layer_types": [
+      "full_attention", "full_attention", "full_attention", "full_attention",
+      "full_attention", "full_attention", "full_attention", "full_attention",
+      "full_attention", "full_attention", "full_attention", "full_attention",
+      "full_attention", "full_attention", "full_attention", "full_attention",
+      "full_attention", "full_attention", "full_attention", "full_attention",
+      "full_attention", "full_attention", "full_attention", "full_attention",
+      "full_attention", "full_attention", "full_attention", "full_attention"
+    ],
+    "num_attention_heads": 28,
+    "num_key_value_heads": 4,
+    "head_dim": 128,
+    "rope_settings": {
+      "rope_theta": 1000000.0
+    },
+    "is_text_model": true,
+    "is_multimodal": false,
+    "cache_behavior": "enabled"
+  },
+  "block_size": 256,
+  "key_bits": 8,
+  "value_bits": 8,
+  "value_group_size": 32,
+  "fp16_window": 128,
+  "evidence_codebooks": [
+    "../../codebooks/codebook_d128_b8.json",
+    "../../codebooks/codebook_d128_b8.json"
+  ],
+  "cache_implementation": "packed_kv_block_store",
+  "profile_sha256": "2c0384ee4254c2f58991237cb7e6b084efd4186a41da7482ec1c52168db4e1ca"
+}
