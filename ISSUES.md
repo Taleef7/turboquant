@@ -1,6 +1,6 @@
 # TurboQuant Forge Issue Tracker
 
-**Last reconciled:** 2026-07-18
+**Last reconciled:** 2026-08-02
 **Evidence baseline:** `artifacts/qualified-semantic-final/20260718T074435Z-5c9d4c34b0f0`
 
 This tracker separates implementation closure from evidence promotion. A code
@@ -37,6 +37,12 @@ systems child is structurally valid and direct-dispatched, but direct is slower
 records `8k_capacity_admission_failed`; no 32K child is launched. Do not use
 kernel parity, the short model smoke, or the retired invalid v4 artifact to
 close this issue.
+
+The later local warmup diagnostic is also complete (8/8 rows) but does not close
+promotion: all six packed rows fail the strict full-logit gates. See
+[LOCAL_LONG_CONTEXT_RESULTS.md](docs/LOCAL_LONG_CONTEXT_RESULTS.md) and the
+clean artifact bound to commit `14f2fdd`; it records no promotion closure or
+end-to-end speed/VRAM advantage claim.
 
 ### Promotion criteria
 
