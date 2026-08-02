@@ -301,24 +301,49 @@ class PackedKVBlockStore:
         combined_keys[..., old_tail_tokens:, :].copy_(keys)
         combined_values[..., old_tail_tokens:, :].copy_(values)
 
-        encoded: list[tuple[PackedKeyPayload, PackedValuePayload]] = []
+        # Prepare the immutable key constants once for this device.  The old
+        # payload API retains an unpack closure for reference attention; the
+        # arena path only needs raw arrays and should not build those closures
+        # for every historical page.
+        prepared = self._key_codec.prepare_device(keys.device)
+        encoded: list[
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]
+        ] = []
         for page_id in range(pages_to_flush):
             start = page_id * self.block_size
             stop = start + self.block_size
-            encoded.append(
-                (
-                    self._key_codec.encode(combined_keys[..., start:stop, :]),
-                    self._value_codec.encode(combined_values[..., start:stop, :]),
+            (
+                key_indices,
+                key_norms,
+                key_signs,
+                key_gamma,
+            ) = self._key_codec._encode_arrays(
+                combined_keys[..., start:stop, :], prepared=prepared
+            )
+            if key_signs is not None or key_gamma is not None:
+                raise UnsupportedCapabilityError(
+                    "arena-backed storage does not support QJL key payloads yet."
                 )
+            value_indices, value_mins, value_scales = self._value_codec._encode_arrays(
+                combined_values[..., start:stop, :]
+            )
+            encoded.append(
+                (key_indices, key_norms, value_indices, value_mins, value_scales)
             )
         self._arena.clear_tail()
-        for key_payload, value_payload in encoded:
+        for key_indices, key_norms, value_indices, value_mins, value_scales in encoded:
             self._arena.append_encoded_page(
-                key_indices=key_payload.indices,
-                key_norms=key_payload.norms,
-                value_indices=value_payload.indices,
-                value_mins=value_payload.mins,
-                value_scales=value_payload.scales,
+                key_indices=key_indices,
+                key_norms=key_norms,
+                value_indices=value_indices,
+                value_mins=value_mins,
+                value_scales=value_scales,
             )
         remainder_start = pages_to_flush * self.block_size
         remainder_keys = combined_keys[..., remainder_start:, :]

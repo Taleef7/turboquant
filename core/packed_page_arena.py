@@ -302,6 +302,80 @@ class PackedPageArena:
         self._used_pages += 1
         return target
 
+    def append_key_page(
+        self,
+        *,
+        key_indices: torch.Tensor,
+        key_norms: torch.Tensor,
+        page_id: int | None = None,
+    ) -> int:
+        """Append key arrays when the value arrays are produced separately.
+
+        This is intentionally a small primitive for codecs that can write keys
+        directly into the arena.  The page becomes visible immediately; callers
+        that also produce values should call :meth:`write_value_page` before
+        exposing the store to readers.
+        """
+        target = self._used_pages if page_id is None else page_id
+        if type(target) is not int:  # noqa: E721
+            raise TypeError("page_id must be a built-in int.")
+        if target != self._used_pages:
+            raise ValueError("pages must be appended in chronological order.")
+        if target >= self.layout.page_capacity:
+            raise OverflowError("packed page arena capacity is exhausted.")
+        key_indices_view = self._page_tensor(
+            key_indices,
+            "key_indices",
+            width=self.layout.key_packed_width,
+            dtype=torch.uint8,
+            rank=3,
+        )
+        key_norms_view = self._page_tensor(
+            key_norms, "key_norms", width=None, dtype=self.kv_dtype, rank=2
+        )
+        self.key_indices[target].copy_(key_indices_view)
+        self.key_norms[target].copy_(key_norms_view)
+        self._used_pages += 1
+        return target
+
+    def write_value_page(
+        self,
+        *,
+        value_indices: torch.Tensor,
+        value_mins: torch.Tensor,
+        value_scales: torch.Tensor,
+        page_id: int,
+    ) -> None:
+        """Fill value arrays for an already appended key page."""
+        if type(page_id) is not int:  # noqa: E721
+            raise TypeError("page_id must be a built-in int.")
+        if not 0 <= page_id < self._used_pages:
+            raise IndexError("page_id is outside the used page range.")
+        value_indices_view = self._page_tensor(
+            value_indices,
+            "value_indices",
+            width=self.layout.value_packed_width,
+            dtype=torch.uint8,
+            rank=3,
+        )
+        value_mins_view = self._page_tensor(
+            value_mins,
+            "value_mins",
+            width=self.layout.value_groups,
+            dtype=self.kv_dtype,
+            rank=3,
+        )
+        value_scales_view = self._page_tensor(
+            value_scales,
+            "value_scales",
+            width=self.layout.value_groups,
+            dtype=self.kv_dtype,
+            rank=3,
+        )
+        self.value_indices[page_id].copy_(value_indices_view)
+        self.value_mins[page_id].copy_(value_mins_view)
+        self.value_scales[page_id].copy_(value_scales_view)
+
     def append_tail(self, keys: torch.Tensor, values: torch.Tensor) -> None:
         """Copy raw K/V tokens into the next fixed-stride tail slots."""
         expected_prefix = (1, self.layout.num_kv_heads)

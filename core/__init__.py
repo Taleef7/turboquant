@@ -11,7 +11,15 @@ from core.capabilities import (
     require_qwen25_packed_layout,
 )
 from core.errors import UnsupportedCapabilityError
-from core.codec import KeyCodec, KeyLayout, PackedKeyPayload, PackedValuePayload, ValueCodec, ValueLayout
+from core.codec import (
+    KeyCodec,
+    KeyLayout,
+    PackedKeyPayload,
+    PackedValuePayload,
+    PreparedKeyCodecDevice,
+    ValueCodec,
+    ValueLayout,
+)
 from core.packed_store import (
     PackedKVBlock,
     PackedKVBlockStore,
@@ -19,7 +27,13 @@ from core.packed_store import (
     PhysicalByteBreakdown,
     create_packed_kv_block_store,
 )
-from core.packing import pack_indices, pack_sign_bits, tensor_nbytes, unpack_indices, unpack_sign_bits
+from core.packing import (
+    pack_indices,
+    pack_sign_bits,
+    tensor_nbytes,
+    unpack_indices,
+    unpack_sign_bits,
+)
 from core.profiles import CacheImplementation, CompressionProfile, load_profile
 from core.reference_attention import (
     ReferenceAttentionDebugState,
@@ -39,6 +53,7 @@ __all__ = [
     "KeyCodec",
     "KeyLayout",
     "PackedKeyPayload",
+    "PreparedKeyCodecDevice",
     "PackedKVBlock",
     "PackedDynamicCache",
     "PackedAttentionSession",

@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from core.codec import KeyCodec, KeyLayout, ValueCodec, ValueLayout
+from core.packed_page_arena import PackedPageArena, PackedPageArenaLayout
 from core.packing import tensor_nbytes, unpack_indices, unpack_sign_bits
 
 
@@ -32,7 +33,9 @@ def test_key_codec_packs_discrete_indices_and_reconstructs_requested_dtype() -> 
 def test_key_codec_zero_vectors_are_finite() -> None:
     codec = KeyCodec(KeyLayout(head_dim=128, bits=6, norm_dtype=torch.float16))
 
-    decoded = codec.encode(torch.zeros((1, 1, 3, 128), dtype=torch.bfloat16)).unpack_reference()
+    decoded = codec.encode(
+        torch.zeros((1, 1, 3, 128), dtype=torch.bfloat16)
+    ).unpack_reference()
 
     assert decoded.dtype == torch.bfloat16
     assert torch.isfinite(decoded).all()
@@ -55,7 +58,12 @@ def test_qjl_uses_lower_mse_width_and_one_bit_sign_payload() -> None:
     assert tensor_nbytes(payload.qjl_signs) == heads * math.ceil(tokens * qjl_dim / 8)
     assert payload.physical_nbytes() == sum(
         tensor_nbytes(tensor)
-        for tensor in (payload.indices, payload.norms, payload.qjl_signs, payload.qjl_gamma)
+        for tensor in (
+            payload.indices,
+            payload.norms,
+            payload.qjl_signs,
+            payload.qjl_gamma,
+        )
     )
     decoded_signs = unpack_sign_bits(payload.qjl_signs, tokens * qjl_dim)
     assert torch.all((decoded_signs == -1) | (decoded_signs == 1))
@@ -63,7 +71,11 @@ def test_qjl_uses_lower_mse_width_and_one_bit_sign_payload() -> None:
 
 
 def test_value_codec_group_metadata_and_exact_reference_decode() -> None:
-    source = torch.linspace(-2, 2, 1 * 2 * 3 * 64, dtype=torch.float32).reshape(1, 2, 3, 64).half()
+    source = (
+        torch.linspace(-2, 2, 1 * 2 * 3 * 64, dtype=torch.float32)
+        .reshape(1, 2, 3, 64)
+        .half()
+    )
     codec = ValueCodec(ValueLayout(head_dim=64, bits=6, group_size=16))
 
     payload = codec.encode(source)
@@ -75,8 +87,59 @@ def test_value_codec_group_metadata_and_exact_reference_decode() -> None:
     assert decoded.dtype == source.dtype
     assert torch.isfinite(decoded).all()
     assert payload.physical_nbytes() == sum(
-        tensor_nbytes(tensor) for tensor in (payload.indices, payload.mins, payload.scales)
+        tensor_nbytes(tensor)
+        for tensor in (payload.indices, payload.mins, payload.scales)
     )
+
+
+def test_prepared_key_device_constants_are_cached_and_encode_into_writes_arena() -> (
+    None
+):
+    codec = KeyCodec(KeyLayout(head_dim=128, bits=8, norm_dtype=torch.float16))
+    prepared = codec.prepare_device(torch.device("cpu"))
+    cached = codec.prepare_device(torch.device("cpu"))
+    assert prepared is cached
+    assert prepared.rotation.data_ptr() == cached.rotation.data_ptr()
+    assert prepared.centroids.data_ptr() == cached.centroids.data_ptr()
+    assert prepared.boundaries.data_ptr() == cached.boundaries.data_ptr()
+
+    arena = PackedPageArena.reserve(
+        PackedPageArenaLayout(1, 256, 2, 128, 128, 96, 4, 383),
+        device=torch.device("cpu"),
+        kv_dtype=torch.float16,
+    )
+    source = torch.randn((1, 2, 256, 128), dtype=torch.float16)
+    page_id = codec.encode_into(source, arena, 0, prepared=prepared)
+    reference = codec.encode(source)
+    assert page_id == 0
+    assert arena.used_pages == 1
+    page = arena.page_views(0)
+    assert torch.equal(page["key_indices"].reshape(2 * 256, -1), reference.indices)
+    assert torch.equal(page["key_norms"].reshape(2 * 256), reference.norms)
+
+
+def test_prepared_key_constants_reject_device_or_layout_mismatch() -> None:
+    codec = KeyCodec(KeyLayout(head_dim=128, bits=8, norm_dtype=torch.float16))
+    prepared = codec.prepare_device(torch.device("cpu"))
+    arena = PackedPageArena.reserve(
+        PackedPageArenaLayout(1, 256, 2, 128, 128, 96, 4, 383),
+        device=torch.device("cpu"),
+        kv_dtype=torch.float16,
+    )
+    with pytest.raises(ValueError):
+        codec.encode_into(
+            torch.randn((1, 2, 255, 128), dtype=torch.float16),
+            arena,
+            0,
+            prepared=prepared,
+        )
+    with pytest.raises(ValueError):
+        codec.encode_into(
+            torch.randn((1, 2, 256, 128), dtype=torch.float16, device="meta"),
+            arena,
+            0,
+            prepared=prepared,
+        )
 
 
 @pytest.mark.parametrize("bits", [True, 1, 9])

@@ -162,6 +162,60 @@ def test_page_and_tail_pointers_stay_stable_and_prior_page_is_immutable() -> Non
         assert torch.equal(getattr(arena, name)[0], expected)
 
 
+def test_store_arena_tail_append_reuses_reserved_allocations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arena = PackedPageArena.reserve(
+        make_layout(pages=1, tail=383),
+        device=torch.device("cpu"),
+        kv_dtype=torch.float16,
+    )
+    store = PackedKVBlockStore(
+        KeyCodec(KeyLayout(head_dim=128, bits=8, norm_dtype=torch.float16)),
+        ValueCodec(ValueLayout(head_dim=128, bits=6, group_size=32)),
+        num_kv_heads=4,
+        arena=arena,
+    )
+    keys = torch.randn((1, 4, 128, 128), dtype=torch.float16)
+    store.append(keys, keys + 1)
+    pointers = arena.data_pointers()
+
+    def fail_allocation(*_args: object, **_kwargs: object) -> torch.Tensor:
+        raise AssertionError("tail-only arena append allocated a new tensor")
+
+    monkeypatch.setattr(torch, "empty", fail_allocation)
+    monkeypatch.setattr(torch, "empty_like", fail_allocation)
+    monkeypatch.setattr(torch, "cat", fail_allocation)
+    store.append(keys[..., :1, :], keys[..., :1, :] + 1)
+
+    assert arena.data_pointers() == pointers
+    assert arena.tail_length == 129
+
+
+def test_store_arena_reuses_one_prepared_constant_bundle_across_pages() -> None:
+    codec = KeyCodec(KeyLayout(head_dim=128, bits=8, norm_dtype=torch.float16))
+    arena = PackedPageArena.reserve(
+        make_layout(pages=3, tail=383),
+        device=torch.device("cpu"),
+        kv_dtype=torch.float16,
+    )
+    store = PackedKVBlockStore(
+        codec,
+        ValueCodec(ValueLayout(head_dim=128, bits=6, group_size=32)),
+        num_kv_heads=4,
+        arena=arena,
+    )
+    pointers = arena.data_pointers()
+    keys = torch.randn((1, 4, 640, 128), dtype=torch.float16)
+    store.append(keys, keys + 1)
+
+    prepared = codec.prepare_device(torch.device("cpu"))
+    assert codec.prepare_device(torch.device("cpu")) is prepared
+    assert len(codec._prepared_devices) == 1
+    assert arena.used_pages == 2
+    assert arena.data_pointers() == pointers
+
+
 @pytest.mark.parametrize("tokens", [127, 128, 255, 256, 383, 384, 639, 640])
 def test_store_arena_preserves_chronological_pages_and_tail_at_boundaries(
     tokens: int,
