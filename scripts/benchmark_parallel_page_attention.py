@@ -392,10 +392,21 @@ def _run_page_state_row(page_count: int, *, seed: int) -> dict[str, object]:
         ]
     )
     repeat_again = workspace.page_numerator
-    cache_bytes = _storage_bytes(blocks_cpu)
+    cache_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in (
+            arena.key_indices,
+            arena.key_norms,
+            arena.value_indices,
+            arena.value_mins,
+            arena.value_scales,
+        )
+    )
     peak_allocated = int(torch.cuda.max_memory_allocated())
     runtime_bytes = max(0, peak_allocated - baseline_allocated)
-    workspace_bytes = page_count * QUERY_HEADS * (4 + 4 + HEAD_DIM * 4)
+    workspace_bytes = QUERY_HEADS * HEAD_DIM * 4 + page_count * QUERY_HEADS * (
+        4 + 4 + HEAD_DIM * 4
+    )
     return {
         "row_id": f"page-state-pages-{page_count}",
         "status": "passed",
