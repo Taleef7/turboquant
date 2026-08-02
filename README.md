@@ -17,13 +17,22 @@ The only implemented model adapter is Qwen2.5-7B-Instruct, using the checked-in
 narrow: text-only, batch size one, standard prefill, greedy single-token decode,
 one CUDA device, and full-attention layers.
 
-The current evidence artifact is
+The canonical release-ladder artifact is
 `artifacts/qualified-semantic-final/20260718T074435Z-5c9d4c34b0f0`, bound to
 commit `5c9d4c34b0f0c31d015e2166ae7ad401858b202d`. Its report is structurally
 valid but overall `failed`: the 8K quality matrix is qualified, while 32K
 capacity admission fails and no 32K child is launched. The 8K systems comparison
 also shows no end-to-end speed or VRAM win. See [results](docs/RESULTS.md) and
 the [benchmark protocol](docs/BENCHMARK_PROTOCOL.md).
+
+The latest clean local engineering checkpoint is separate from that release
+attempt. The Qwen2.5 warmup, fused page, and value-bit artifacts are
+diagnostic-only, bound to code commit `eba1c5b`, and documented in the
+[local results](docs/LOCAL_LONG_CONTEXT_RESULTS.md),
+[fused-page results](docs/LOCAL_FUSED_PAGE_RESULTS.md), and
+[value ablation](docs/LOCAL_VALUE_BIT_ABLATION.md). They do not close the
+quality, 32K, or end-to-end performance gates. The exact transfer and Slurm
+workflow for continuing on Purdue Gilbreth is [the Gilbreth handoff](docs/GILBRETH_HANDOFF.md).
 
 The first codec-focused reproduction is independently qualified as
 `codec-local-v1` from clean commit
@@ -73,9 +82,9 @@ diagnostic evidence only and is not retrieval-safe evidence.
 | Family | Current state | Promotion requirement |
 | --- | --- | --- |
 | Qwen2.5-7B text | Direct adapter | Keep its pinned manifest/profile and pass the direct GPU/evidence suites. |
-| Qwen3 dense text | Manifest-only | Implement an adapter, prove config/layout parity, then run its own quality and systems artifacts. |
-| Qwen3.5 hybrid | Manifest-only | Compress only full-attention KV layers; preserve linear-attention recurrent state natively. |
-| Gemma 4 E4B | Manifest-only | Build a dedicated adapter, validate multimodal/cache boundaries, and pass capacity preflight plus evidence. |
+| Qwen3 dense text (`Qwen/Qwen3-8B`) | Manifest-only | Implement an adapter, prove config/layout parity, then run its own quality and systems artifacts. |
+| Qwen3.5 hybrid/multimodal (`Qwen/Qwen3.5-9B`) | Manifest-only | Compress only full-attention KV layers; preserve linear-attention recurrent state and multimodal state natively. |
+| Gemma 4 E4B multimodal (`google/gemma-4-E4B`) | Manifest-only | Build a dedicated adapter, validate multimodal/cache boundaries, and pass capacity preflight plus evidence. |
 
 Read [portability](docs/PORTABILITY.md) for the exact capability rules and
 non-KV exclusions.
@@ -145,6 +154,9 @@ quality gate passes. Use [the protocol](docs/BENCHMARK_PROTOCOL.md) to interpret
 - [Paper comparison](docs/PAPER_COMPARISON.md): clean-room scope and gaps.
 - [Replication checklist](docs/REPLICATION_CHECKLIST.md): repeatable local
   verification steps.
+- [Gilbreth handoff](docs/GILBRETH_HANDOFF.md): current branch/artifact state,
+  Slurm setup, environment checks, transfer instructions, and the next
+  experiment matrix for a cluster agent.
 - [Issue tracker](ISSUES.md): resolved implementation work and open promotion
   tasks.
 

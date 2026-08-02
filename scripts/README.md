@@ -6,6 +6,13 @@ them from the repository root with the pinned runtime in
 the validator reads an existing artifact before treating a measurement as
 evidence.
 
+For the current branch, ignored-artifact transfer, Slurm policy, and the
+ordered Gilbreth continuation, read
+[`docs/GILBRETH_HANDOFF.md`](../docs/GILBRETH_HANDOFF.md) first. The older
+`scripts/test_long_context.py` and `configs/retrieval_profile.json` are legacy
+prototype surfaces; they are not the direct Forge evidence path and must not be
+used to claim 32K qualification.
+
 ## `run_direct_benchmark.py`
 
 Runs an interleaved baseline, packed-reference, and Triton-direct systems
@@ -165,3 +172,8 @@ For the current measured evidence and its scope, see
 [`docs/RESULTS.md`](../docs/RESULTS.md). The local-foundation design describes
 the next evidence requirements in
 [`docs/superpowers/specs/2026-07-31-turboquant-forge-v1-design.md`](../docs/superpowers/specs/2026-07-31-turboquant-forge-v1-design.md).
+
+When moving to Gilbreth, run a tiny Slurm preflight first, then the CPU tests,
+GPU mechanics, synthetic page diagnostic, and only then the pinned Qwen2.5
+4K/8K replay. Copy raw JSON/logs out of `$RCAC_SCRATCH` to durable storage and
+validate on the receiving machine; a copied Markdown table is not provenance.

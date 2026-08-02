@@ -30,8 +30,13 @@ python scripts/benchmark_qwen25_fixed_warmup.py \
   --output artifacts/qwen25-fixed-warmup-local-v2.json
 python scripts/validate_qwen_fixed_warmup.py \
   --config configs/benchmarks/qwen25-fixed-warmup-local-v2.json \
-  artifacts/qwen25-fixed-warmup-local-v2.json
+artifacts/qwen25-fixed-warmup-local-v2.json
 ```
+
+The model-cache path above is local WSL-only. For a Gilbreth rerun, resolve the
+same pinned snapshot into `$RCAC_SCRATCH` or durable Depot storage and follow
+[GILBRETH_HANDOFF.md](GILBRETH_HANDOFF.md); do not copy the `/home/taleef`
+path or run the benchmark on a login node.
 
 The clean artifact contains 8/8 completed rows: 2/8 strict quality-gate
 passes (the two baseline rows) and 6/8 strict quality-gate failures (all

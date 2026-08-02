@@ -16,6 +16,15 @@ implementation.
 | LongBench, RULER, or ANN/vector-search comparisons | Not implemented | No runner or result artifact is shipped for these benchmark families. |
 | Multi-model adapter portability | Not established | Qwen3, Qwen3.5, and Gemma 4 are manifest-only/fail-closed entries. |
 
+## Post-v1 engineering checkpoint
+
+The later clean diagnostics are not paper-equivalence evidence and do not
+change the rows above. The Qwen2.5 4K/8K warmup remains strict-gate negative
+for all six packed rows; the fused page schedule is a synthetic mechanical
+measurement; and the v8 value ablation is larger/slower than v6. They are
+bound to code commit `eba1c5b` and are described in
+[RESULTS.md](RESULTS.md) and the [Gilbreth handoff](GILBRETH_HANDOFF.md).
+
 ## Safe release statements
 
 - Forge has a tested direct packed-decode implementation only for the pinned

@@ -28,6 +28,13 @@ allocator peaks than baseline. The top-level report remains `failed`: its
 effective contexts were materially shorter than requested and its binding was
 incomplete; it must not be combined with the newer artifact to create a claim.
 
+The latest local engineering checkpoint is separate diagnostic evidence, bound
+to `eba1c5b`: Qwen2.5 4K/8K packed rows fail strict full-logit gates, the fused
+page schedule is synthetic-only, and the v8 value ablation is negative. See
+[RESULTS.md](RESULTS.md) and [GILBRETH_HANDOFF.md](GILBRETH_HANDOFF.md) for
+the raw-artifact workflow and the next cluster matrix. None of these results
+establishes paper equivalence, 32K qualification, or an end-to-end win.
+
 ## Deliberate differences from the legacy prototype
 
 `TurboQuantCacheV2` is retained only to preserve historical experiments. It

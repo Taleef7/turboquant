@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -17,9 +18,26 @@ from scripts.benchmark_parallel_page_attention import (
     _parallel_page_workspace_nbytes,
     _synthetic_arena,
     WARMUP_RUNS,
+    _execution_class,
     validate_parallel_page_artifact,
 )
 from scripts.benchmark_schema import validate_artifact
+
+
+def test_execution_class_does_not_alias_h100_or_unknown_to_a10(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda: SimpleNamespace(name="NVIDIA H100 PCIe", total_memory=80 * 1024**3),
+    )
+    assert _execution_class()["name"] == "gilbreth_h100"
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda: SimpleNamespace(name="NVIDIA Future GPU", total_memory=24 * 1024**3),
+    )
+    assert _execution_class()["name"] == "unknown_gpu"
 
 
 def _metrics(page_count: int) -> dict[str, object]:

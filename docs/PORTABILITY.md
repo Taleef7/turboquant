@@ -21,15 +21,24 @@ replacement.
 
 | Family | What the manifest currently proves | What it does not prove | Adapter promotion gate |
 | --- | --- | --- | --- |
-| Qwen3 dense | Dense full-attention configuration can be parsed and checked. | That Transformers layout, cache updates, or kernels work with Forge. | Dedicated adapter, pinned layout tests, direct/reference GPU tests, and its own quality/systems artifacts. |
-| Qwen3.5 hybrid | Full-attention layers are distinguishable from linear-attention layers. | That recurrent linear state can be compressed or substituted. | Preserve every linear-attention state natively; compress only full-attention KV blocks; then run hybrid adapter and evidence tests. |
-| Gemma 4 E4B | The entry is manifest-only, multimodal, and requires capacity preflight. | A text/vision interface, cache layout, or viable GPU footprint. | Dedicated adapter, explicit processor/vision boundary tests, cache-capacity preflight, and qualified evidence. |
+| Qwen3 dense (`Qwen/Qwen3-8B`) | The current manifest records the 36-layer, 32-query-head/8-KV-head dense layout. | That Transformers layout, cache updates, or kernels work with Forge. | Dedicated adapter, pinned layout tests, direct/reference GPU tests, and its own quality/systems artifacts. |
+| Qwen3.5 hybrid (`Qwen/Qwen3.5-9B`) | The current manifest records a multimodal 3:1 linear/full-attention hybrid and marks it non-text-only. | That recurrent linear state can be compressed or substituted. | Preserve every linear-attention state natively; compress only full-attention KV blocks; then run hybrid adapter and evidence tests. |
+| Gemma 4 E4B (`google/gemma-4-E4B`) | The current manifest records a multimodal, cache-enabled entry and requires capacity preflight. | A text/vision interface, cache layout, or viable GPU footprint. | Dedicated adapter, explicit processor/vision boundary tests, cache-capacity preflight, and qualified evidence. |
 
-For Qwen3.5, `compressible_layer_indices` contains only `full_attention` layers;
+For Qwen3.5, the official Transformers architecture is multimodal and includes
+optional fused `causal_conv1d`/`fla` dependencies. `compressible_layer_indices` contains only `full_attention` layers;
 `native_state_layer_indices` contains the linear layers. Current direct support
 rejects linear-attention layers because native-state handling has not been
 implemented. This is intentional: no hybrid state is silently treated as KV
 cache.
+
+The manifest metadata was refreshed against the official
+[Qwen3 documentation](https://huggingface.co/docs/transformers/model_doc/qwen3_5),
+[Qwen3-8B model card](https://huggingface.co/Qwen/Qwen3-8B), and
+[Gemma 4 E4B model card](https://huggingface.co/google/gemma-4-E4B) on
+2026-08-02. These are discovery metadata, not adapter support or a pinned
+upstream revision; pin an immutable upstream revision before implementing an
+adapter.
 
 ## KV-memory accounting boundary
 

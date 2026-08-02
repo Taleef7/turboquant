@@ -1,6 +1,6 @@
 # Forge Evidence Results
 
-## Current result: valid 8K evidence, failed release attempt
+## Canonical release-ladder result: valid 8K evidence, failed release attempt
 
 **Raw artifact ID:** `qualified-semantic-final/20260718T074435Z-5c9d4c34b0f0`
 
@@ -21,6 +21,28 @@ python scripts/reproduce_release.py --mode qualified --output-dir artifacts/repr
 The command exits nonzero whenever a declared quality, systems, capacity, or
 provenance gate does not pass, while retaining its report and child logs. A
 failed release attempt is not a release qualification.
+
+## Latest local engineering checkpoint (diagnostic only)
+
+The release artifact above is the canonical historical release-ladder result.
+The latest implementation checkpoint is documented separately so its numbers
+are not mistaken for a new qualification. Clean raw artifacts are bound to
+`eba1c5b0239971ab2b78e1acceadda0885b6cb28` (the publication-only documentation
+commit is `cd502e2`):
+
+- [Local long-context results](LOCAL_LONG_CONTEXT_RESULTS.md): Qwen2.5 4K/8K
+  warmup; all six packed rows fail strict full-logit gates, despite exact
+  top-1/greedy choices in the small matrix.
+- [Local fused-page results](LOCAL_FUSED_PAGE_RESULTS.md): synthetic fused
+  reduction/tail is 25.2–79.5% faster than serial over 3–63 pages; this is not
+  model-level evidence.
+- [Local value-bit ablation](LOCAL_VALUE_BIT_ABLATION.md): the 8-bit-value
+  candidate is roughly 12% larger and 49–59.5% slower than v6 and also fails
+  the strict full-logit gates.
+
+These diagnostics do not establish a 32K result or an end-to-end speed/VRAM
+win. Their raw JSON is ignored by Git; preserve it externally and rerun the
+validator when source, environment, model, or configuration changes.
 
 ## Qualified 8K quality matrix
 

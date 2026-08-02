@@ -51,6 +51,8 @@ DECLARED_EXECUTION_CLASS_NAMES = (
     "gilbreth_a100_40gb",
     "gilbreth_a30",
     "gilbreth_a10",
+    "gilbreth_h100",
+    "unknown_gpu",
 )
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _V2_ARTIFACT_KEYS = {
@@ -87,6 +89,8 @@ ExecutionClassName = Literal[
     "gilbreth_a100_40gb",
     "gilbreth_a30",
     "gilbreth_a10",
+    "gilbreth_h100",
+    "unknown_gpu",
 ]
 
 

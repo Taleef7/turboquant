@@ -5,6 +5,10 @@ ladder. A passed unit test or completed process is not permission to describe a
 profile as qualified; use the status rules in
 [BENCHMARK_PROTOCOL.md](BENCHMARK_PROTOCOL.md).
 
+Sections 1–6 are the native-WSL/local workflow. For Gilbreth, do not reuse the
+local `/home/taleef` model-cache path or run commands on the login node; use
+[GILBRETH_HANDOFF.md](GILBRETH_HANDOFF.md).
+
 ## 1. Prepare the environment
 
 Use Python 3.11+ and the pinned runtime lock. The GPU path is supported on
@@ -38,6 +42,16 @@ The final command must print a 40-character commit SHA. For a different
 checkout, set `GIT_DIR` to that repository's WSL-translated
 `.git/worktrees/<worktree-name>` path and keep `GIT_WORK_TREE` at the checkout
 root. Leave these variables set for the `reproduce_release.py` command below.
+
+### Gilbreth continuation
+
+For the current branch/artifact state, Slurm commands, CUDA/module checks,
+durable artifact transfer, and the ordered 16K/32K follow-up, use the
+[Gilbreth handoff](GILBRETH_HANDOFF.md). It is separate from the native-WSL
+instructions above. The local Qwen2.5 fixture is pinned to snapshot
+`a09a35458c702b33eeacc393d103063234e8bc28` with PyTorch `2.7.0+cu128`,
+Transformers `4.57.3`, and Triton `3.3.0`; do not substitute a model or assume
+Gilbreth exposes CUDA 12.8 without recording the replacement environment.
 
 ## 2. Run download-free CPU verification
 
@@ -100,5 +114,8 @@ retired invalid evidence.
 - Treat `failed`, `invalid`, and `inconclusive` as non-qualifying states.
 - Cite the raw artifact ID with any physical-byte, peak-memory, latency, or
   quality statement.
+- Raw JSON under `artifacts/` is ignored by Git. Copy it and its logs/hashes to
+  durable storage before switching machines; a documentation summary alone is
+  not enough to validate a claim.
 - Do not promote Qwen3, Qwen3.5, or Gemma 4 from a manifest-only entry without
   the adapter/evidence steps in [PORTABILITY.md](PORTABILITY.md).

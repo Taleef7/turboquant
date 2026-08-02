@@ -7,6 +7,7 @@ artifacts.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,7 @@ PUBLIC_DOCUMENTS = (
     ROOT / "docs" / "PORTABILITY.md",
     ROOT / "docs" / "BENCHMARK_PROTOCOL.md",
     ROOT / "docs" / "RESULTS.md",
+    ROOT / "docs" / "GILBRETH_HANDOFF.md",
     ROOT / "UPDATED_PLAN.md",
     ROOT / "scripts" / "README.md",
 )
@@ -217,6 +219,15 @@ def test_readme_links_direct_profile_and_benchmark_protocol() -> None:
 
     assert "[direct profile](configs/profiles/qwen25-7b-direct-v1.json)" in readme
     assert "[benchmark protocol](docs/BENCHMARK_PROTOCOL.md)" in readme
+
+
+def test_legacy_retrieval_profile_cannot_claim_current_32k_support() -> None:
+    profile = json.loads(
+        (ROOT / "configs" / "retrieval_profile.json").read_text(encoding="utf-8")
+    )
+    assert profile["name"].startswith("legacy-")
+    assert profile["quality_gate"]["status"] == "legacy_unqualified"
+    assert "not 32K-qualified" in profile["description"]
 
 
 def test_reproduction_report_binds_the_canonical_codec_artifact() -> None:

@@ -44,7 +44,11 @@ parallel rows now use the fused reduction/tail launch and remain diagnostic;
 the 4K sample is faster than baseline while the 8K sample is slower, so there
 is still no end-to-end speed/VRAM advantage claim. See
 [LOCAL_LONG_CONTEXT_RESULTS.md](docs/LOCAL_LONG_CONTEXT_RESULTS.md) and the
-clean artifact bound to commit `eba1c5b`.
+clean artifact bound to commit `eba1c5b`. The synthetic fused-page artifact
+`artifacts/local-page-fused-clean-eba1c5b.json` is a separate mechanical
+diagnostic, not model-level evidence. To continue this issue on Gilbreth,
+follow [GILBRETH_HANDOFF.md](docs/GILBRETH_HANDOFF.md), preserve the declared
+quality gates, and run the 16K/32K matrix only after a capacity preflight.
 
 The isolated value-bit ablation likewise remains diagnostic: the opt-in 8-bit
 value profile fails the same full-logit gates, is roughly 12% larger in cache

@@ -20,6 +20,19 @@ The artifact is bound to
 5070 Ti Laptop GPU (12,820,480,000 reported total VRAM), WSL2, Python 3.12.3,
 PyTorch 2.7.0+cu128, Transformers 4.57.3, and Triton 3.3.0.
 
+## Latest diagnostic checkpoint
+
+The current implementation checkpoint is not the historical release artifact
+above. Clean diagnostic JSON is bound to code commit `eba1c5b` and is described
+in [LOCAL_LONG_CONTEXT_RESULTS.md](docs/LOCAL_LONG_CONTEXT_RESULTS.md),
+[LOCAL_FUSED_PAGE_RESULTS.md](docs/LOCAL_FUSED_PAGE_RESULTS.md), and
+[LOCAL_VALUE_BIT_ABLATION.md](docs/LOCAL_VALUE_BIT_ABLATION.md). The Qwen2.5
+4K/8K warmup has 8/8 complete rows but all six packed rows fail strict
+full-logit gates; the fused synthetic schedule is faster than serial but is
+not model-level evidence; and the v8 value ablation is larger/slower and also
+fails the strict gates. These artifacts do not change the historical release
+status or establish a 32K/end-to-end win.
+
 ## Current release outcome
 
 `repro_report.json` records the following state:
@@ -92,3 +105,5 @@ not evidence for Forge's packed direct backend.
 For the exact acceptance and invalidation rules, read
 [docs/BENCHMARK_PROTOCOL.md](docs/BENCHMARK_PROTOCOL.md). For a reproduction
 sequence, read [docs/REPLICATION_CHECKLIST.md](docs/REPLICATION_CHECKLIST.md).
+For a cluster continuation with raw-artifact transfer rules, read
+[docs/GILBRETH_HANDOFF.md](docs/GILBRETH_HANDOFF.md).

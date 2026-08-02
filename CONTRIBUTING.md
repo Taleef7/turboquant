@@ -9,26 +9,30 @@ This repository is currently optimized for a **Qwen-focused reproducibility path
 ## 1) Environment
 
 ```bash
-python -m venv venv312
-source venv312/bin/activate
-pip install -r requirements.txt
+python3.12 -m venv ~/.venvs/turboquant-forge
+source ~/.venvs/turboquant-forge/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements/runtime.lock
+python -m pip install pytest ruff
 ```
 
-For RTX 50-series (`sm_120`), use PyTorch nightly `cu128` before installing requirements.
+The lock pins the supported local WSL runtime, including stable PyTorch
+`2.7.0+cu128`. Do not add an unpinned nightly wheel to a reproducibility run;
+on Gilbreth, follow [the cluster handoff](docs/GILBRETH_HANDOFF.md) and record
+any compatible replacement environment.
 
 ## 2) Core verification commands
 
 ```bash
 # Fast check
-python scripts/reproduce_release.py --mode quick --output-dir results/repro_quick
+python scripts/reproduce_release.py --mode quick --output-dir artifacts/repro_quick
 
 # Release-check path (Qwen scope)
-python scripts/reproduce_release.py --mode full --output-dir results/repro_full
+python scripts/reproduce_release.py --mode qualified --output-dir artifacts/repro_qualified
 
 # Unit tests
-pytest scripts/test_math.py scripts/test_kernels.py -q
-pytest scripts/test_long_context_harness.py scripts/test_cache_config.py scripts/test_qjl_config.py -q
-pytest scripts/test_repro_utils.py scripts/test_reproduce_release.py -q
+python -m pytest tests -m "not gpu" -q
+python -m pytest tests/test_documentation_claims.py -q
 ```
 
 ## 3) Claims discipline

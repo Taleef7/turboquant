@@ -107,7 +107,8 @@ retrieval policy so another run can explain environmental differences.
   advantage. The separate Qwen2.5 systems artifact remains the source of the
   current negative 8K systems result, and 32K is not qualified.
 - RaBitQ/PQ baselines, QJL residuals, NIAH/RULER/LongBench-E, and a Gilbreth
-  hardware run are separate follow-on work.
+  hardware run are separate follow-on work. The current cluster execution
+  sequence and transfer rules are in [GILBRETH_HANDOFF.md](GILBRETH_HANDOFF.md).
 
 ## Reproduce from a clean environment
 

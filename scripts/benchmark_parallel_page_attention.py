@@ -126,8 +126,14 @@ def _execution_class() -> dict[str, object]:
         class_name = "gilbreth_a100_40gb"
     elif "a30" in lowered:
         class_name = "gilbreth_a30"
-    else:
+    elif "h100" in lowered:
+        class_name = "gilbreth_h100"
+    elif "a10" in lowered:
         class_name = "gilbreth_a10"
+    else:
+        # Never label an unknown GPU as a known Gilbreth class.  A wrong class
+        # poisons comparisons and can make a cluster run look like an A10 run.
+        class_name = "unknown_gpu"
     return {
         "name": class_name,
         "gpu_name": name,

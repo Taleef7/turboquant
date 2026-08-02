@@ -2,8 +2,10 @@
 
 Every public numeric statement about the codec experiment should be traceable
 to the clean `codec-local-v1` artifact and, where applicable, to the generated
-`claims.json` ledger. The ledger resolves the manifest's exact queries and
-verifies the SHA-256 of every referenced sidecar before returning a value.
+`claims.json` ledger. Qwen2.5 systems diagnostics use their own raw JSON and
+remain outside this codec ledger. Each ledger resolves the manifest's exact
+queries and verifies the SHA-256 of every referenced sidecar before returning
+a value.
 
 Canonical source identity:
 
@@ -19,6 +21,16 @@ The source tree was clean when the artifact was generated. The ledger contains
 3,858 resolved claim records. A claim is not considered release evidence if it
 comes from a dirty source, a failed/invalid/OOM row, an incomplete 16-seed
 block, or a sidecar whose hash no longer matches the manifest.
+
+## Separate Qwen2.5 diagnostic evidence
+
+The latest local warmup, fused-page, and value-bit artifacts are diagnostic-only
+and are documented in [RESULTS.md](RESULTS.md) and the linked local result
+pages. They are bound to source commit `eba1c5b`, have empty public claim lists,
+and do not qualify compressed logits, 32K context, or an end-to-end speed/VRAM
+win. Do not copy their numbers into this codec ledger; validate their raw JSON
+with the corresponding runner validator after transferring it to another
+machine.
 
 ## Safe statements and exact evidence
 

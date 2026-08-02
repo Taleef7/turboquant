@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-Long-context validation for TurboQuant (Issue #1: 128K Context Validation)
+Legacy long-context prototype; not the Forge direct-backend evidence runner.
+
+This file is retained for historical debugging only. Its old profile and
+results must not be used to claim 32K/64K/128K qualification. Use
+``benchmark_qwen25_fixed_warmup.py`` and the validator-first release ladder for
+current evidence; see ``docs/GILBRETH_HANDOFF.md`` for cluster execution.
+
+Historical validation for TurboQuant (Issue #1: 128K Context Validation)
 
 Tests:
 1. Needle-in-Haystack (NIAH) - hide a fact in a long document, query it
