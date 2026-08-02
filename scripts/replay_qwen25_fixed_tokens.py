@@ -58,6 +58,13 @@ def load_replay_config(path: str | Path = CONFIG_PATH) -> dict[str, Any]:
         errors.append("model_id must bind the pinned Qwen2.5 model")
     if payload.get("model_revision") != PINNED_QWEN25_HUB_REVISION:
         errors.append("model_revision must bind the pinned Qwen2.5 revision")
+    manifest_sha256 = payload.get("fixture_manifest_sha256")
+    if (
+        not isinstance(manifest_sha256, str)
+        or len(manifest_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in manifest_sha256)
+    ):
+        errors.append("fixture_manifest_sha256 must be a lowercase SHA-256 digest")
     contexts = payload.get("contexts")
     if contexts != [1024, 2048]:
         errors.append("contexts must be the predeclared [1024, 2048] matrix")
@@ -187,13 +194,20 @@ def _fixture_identity(
     manifest_bytes = json.dumps(files, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
     )
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    expected_manifest_sha256 = config.get("fixture_manifest_sha256")
+    if expected_manifest_sha256 and manifest_sha256 != expected_manifest_sha256:
+        return None, (
+            "local fixture manifest SHA-256 does not match the predeclared "
+            f"pinned digest (got {manifest_sha256})"
+        )
     return {
         "model_id": model_id,
         "snapshot_id": revision,
         "resolved_path": str(snapshot),
         "architecture": expected_architecture,
         "files": files,
-        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "manifest_sha256": manifest_sha256,
     }, None
 
 

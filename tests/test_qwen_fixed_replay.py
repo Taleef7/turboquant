@@ -314,7 +314,11 @@ def test_fixture_identity_rejects_architecture_mismatch(tmp_path: Path) -> None:
 def test_fixture_identity_records_manifest_for_pinned_snapshot(tmp_path: Path) -> None:
     config = load_replay_config(CONFIG)
     snapshot = _write_snapshot_fixture(tmp_path)
-    identity, reason = _fixture_identity(snapshot, config)
+    # The synthetic fixture has its own digest; disable the production digest
+    # only to exercise manifest construction and recording in isolation.
+    identity, reason = _fixture_identity(
+        snapshot, {**config, "fixture_manifest_sha256": None}
+    )
     assert reason is None
     assert identity is not None
     assert identity["snapshot_id"] == config["model_revision"]
@@ -327,6 +331,15 @@ def test_fixture_identity_records_manifest_for_pinned_snapshot(tmp_path: Path) -
         "model.safetensors.index.json",
         "model-00001-of-00001.safetensors",
     }
+
+
+def test_fixture_identity_rejects_manifest_mismatch(tmp_path: Path) -> None:
+    config = load_replay_config(CONFIG)
+    snapshot = _write_snapshot_fixture(tmp_path)
+    identity, reason = _fixture_identity(snapshot, config)
+    assert identity is None
+    assert reason is not None
+    assert "manifest SHA-256" in reason
 
 
 @pytest.mark.parametrize(
