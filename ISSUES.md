@@ -38,11 +38,18 @@ records `8k_capacity_admission_failed`; no 32K child is launched. Do not use
 kernel parity, the short model smoke, or the retired invalid v4 artifact to
 close this issue.
 
-The later local warmup diagnostic is also complete (8/8 rows) but does not close
-promotion: all six packed rows fail the strict full-logit gates. See
+The latest local warmup diagnostic is also complete (8/8 rows) but does not
+close promotion: all six packed rows fail the strict full-logit gates. The
+parallel rows now use the fused reduction/tail launch and remain diagnostic;
+the 4K sample is faster than baseline while the 8K sample is slower, so there
+is still no end-to-end speed/VRAM advantage claim. See
 [LOCAL_LONG_CONTEXT_RESULTS.md](docs/LOCAL_LONG_CONTEXT_RESULTS.md) and the
-clean artifact bound to commit `14f2fdd`; it records no promotion closure or
-end-to-end speed/VRAM advantage claim.
+clean artifact bound to commit `eba1c5b`.
+
+The isolated value-bit ablation likewise remains diagnostic: the opt-in 8-bit
+value profile fails the same full-logit gates, is roughly 12% larger in cache
+storage, and is slower than the production 6-bit profile. See
+[LOCAL_VALUE_BIT_ABLATION.md](docs/LOCAL_VALUE_BIT_ABLATION.md).
 
 ### Promotion criteria
 

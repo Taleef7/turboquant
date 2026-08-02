@@ -1,22 +1,24 @@
 # Local long-context warmup results
 
-This page records one reproducible, diagnostic-only Qwen2.5 run at 4,096 and
-8,192 prompt tokens. It is intentionally separate from the canonical v1
-qualification matrix and makes no end-to-end speed or VRAM advantage claim.
+This page records the latest reproducible, diagnostic-only Qwen2.5 run at 4,096
+and 8,192 prompt tokens. It is intentionally separate from the canonical v1
+qualification matrix and makes no compressed-quality equivalence or end-to-end
+speed/VRAM advantage claim.
 
 ## Artifact and environment
 
 | Check | Value |
 | --- | --- |
-| Raw artifact | `artifacts/qwen25-fixed-warmup-local-v2-clean-14f2fdd.json` |
+| Raw artifact | `artifacts/qwen25-fixed-warmup-local-v2-clean-eba1c5b.json` |
 | Artifact status | `diagnostic` |
-| Bound commit | `14f2fdd988e763aa9ac9470d60ce7f481b2404c9` |
+| Bound commit | `eba1c5b0239971ab2b78e1acceadda0885b6cb28` |
 | Source tree | clean (`dirty: false`) |
 | Model | `Qwen/Qwen2.5-7B-Instruct` at `a09a35458c702b33eeacc393d103063234e8bc28` |
 | GPU | NVIDIA GeForce RTX 5070 Ti Laptop GPU, 12,820,480,000 reported bytes |
 | Runtime | PyTorch 2.7.0+cu128, Transformers 4.57.3, Triton 3.3.0 |
 | Matrix | contexts `[4096, 8192]`; 1 warmup token; 3 measured tokens; 3 repeats |
 | Stream | fixed stream seed `26009`; four declared backends |
+| Parallel dispatch | rotation + page-state + fused reduce-tail; 336 fused launches per row |
 
 The raw artifact is intentionally kept in the ignored `artifacts/` directory.
 Re-run and validate it from the repository root with:
@@ -87,13 +89,13 @@ runtime allocations and must not be substituted for the cache-store columns:
 | Row | Peak allocated | Peak reserved |
 | --- | ---: | ---: |
 | 4096 baseline | 7,350,514,688 | 7,908,360,192 |
-| 4096 packed_reference | 7,221,051,904 | 7,704,936,448 |
-| 4096 serial_direct | 7,488,783,360 | 7,981,760,512 |
+| 4096 packed_reference | 7,208,123,392 | 7,692,353,536 |
+| 4096 serial_direct | 7,488,783,360 | 7,979,663,360 |
 | 4096 parallel_direct | 7,996,485,632 | 8,401,190,912 |
-| 8192 baseline | 9,036,626,944 | 10,252,976,128 |
-| 8192 packed_reference | 8,726,489,088 | 9,783,214,080 |
-| 8192 serial_direct | 8,649,229,312 | 9,724,493,824 |
-| 8192 parallel_direct | 9,449,949,184 | 10,515,120,128 |
+| 8192 baseline | 9,541,866,496 | 10,252,976,128 |
+| 8192 packed_reference | 8,856,180,736 | 10,141,827,072 |
+| 8192 serial_direct | 8,649,229,312 | 9,711,910,912 |
+| 8192 parallel_direct | 9,451,259,904 | 9,885,974,528 |
 
 ## Decode timing
 
@@ -104,17 +106,25 @@ the per-token millisecond samples.
 
 | Row | Decode p50 (ms) | Decode p95 (ms) | Decode mean (ms) |
 | --- | ---: | ---: | ---: |
-| 4096 baseline | 35.911885 | 50.607248 | 38.186000 |
-| 4096 packed_reference | 537.599579 | 644.405826 | 486.532809 |
-| 4096 serial_direct | 66.566217 | 101.180962 | 70.860440 |
-| 4096 parallel_direct | 41.491307 | 59.779783 | 47.121943 |
-| 8192 baseline | 32.683900 | 36.615455 | 33.336203 |
-| 8192 packed_reference | 741.899146 | 1,252.948109 | 832.049827 |
-| 8192 serial_direct | 104.796978 | 161.947371 | 119.201555 |
-| 8192 parallel_direct | 41.764538 | 61.793438 | 48.139988 |
+| 4096 baseline | 50.098296 | 86.400800 | 53.227072 |
+| 4096 packed_reference | 377.151137 | 418.487952 | 381.256013 |
+| 4096 serial_direct | 55.603562 | 93.821098 | 63.612640 |
+| 4096 parallel_direct | 40.309744 | 40.784259 | 40.203191 |
+| 8192 baseline | 33.096978 | 33.870528 | 32.945721 |
+| 8192 packed_reference | 636.455898 | 753.271662 | 657.683460 |
+| 8192 serial_direct | 75.780827 | 97.403243 | 78.991288 |
+| 8192 parallel_direct | 42.904359 | 59.859284 | 48.127724 |
 
 These timings are a small fixed-token diagnostic, not a throughput or
 end-to-end latency qualification. The artifact has an empty `claims` list.
+
+The fused parallel lane is faster than the baseline at 4K in this sample
+(`40.31 ms` vs `50.10 ms` p50, `-19.5%`) but slower at 8K (`42.90 ms` vs
+`33.10 ms`, `+29.6%`). Its cache-store accounting is smaller than baseline by
+`36.9%` at 4K and `44.8%` at 8K, while total CUDA allocator peaks move in the
+opposite direction at 4K (`+8.8%` allocated, `+6.2%` reserved) and are modestly
+lower at 8K (`-1.0%` allocated, `-3.6%` reserved). These mixed results are why
+the artifact makes no end-to-end win claim.
 
 ## Scope and limitations
 
@@ -126,5 +136,5 @@ end-to-end latency qualification. The artifact has an empty `claims` list.
 - Cache-store bytes and CUDA allocator peaks answer different questions; the
   latter include model/runtime allocations. This artifact does not establish
   an end-to-end speed or VRAM advantage.
-- The artifact is diagnostic-only, bound to commit `14f2fdd`, and should be
+- The artifact is diagnostic-only, bound to commit `eba1c5b`, and should be
   revalidated after any source, profile, model, or benchmark-config change.

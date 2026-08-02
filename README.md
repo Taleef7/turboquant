@@ -128,6 +128,10 @@ quality gate passes. Use [the protocol](docs/BENCHMARK_PROTOCOL.md) to interpret
   stop, systems comparison, and retired invalid v4 history.
 - [Local long-context results](docs/LOCAL_LONG_CONTEXT_RESULTS.md): clean
   Qwen2.5 4K/8K warmup artifact with quality, storage, timing, and limits.
+- [Local fused page results](docs/LOCAL_FUSED_PAGE_RESULTS.md): clean synthetic
+  page-count measurements, fused launch contract, parity, and allocation data.
+- [Local value-bit ablation](docs/LOCAL_VALUE_BIT_ABLATION.md): clean v6/v8
+  quality, storage, timing, and provenance comparison.
 - [Codec reproduction](docs/REPRODUCTION.md): canonical local matrix, GloVe
   retrieval results, runtime conditions, and limitations.
 - [Claim ledger](docs/CLAIMS.md): safe statements with exact artifact/query

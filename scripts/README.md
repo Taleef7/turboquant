@@ -83,7 +83,9 @@ python scripts/validate_qwen_fixed_warmup.py \
 ```
 
 The v2 run is diagnostic-only and is not a replacement for the canonical v1
-artifact or its 1,024/2,048-token qualification matrix.
+artifact or its 1,024/2,048-token qualification matrix. Its parallel lane uses
+the physical rotation kernel, page-state kernel, and fused reduction/tail
+kernel; see [the local result](../docs/LOCAL_LONG_CONTEXT_RESULTS.md).
 
 ## `benchmark_qwen25_value_ablation.py`
 
@@ -117,13 +119,11 @@ CUDA-event trials per row. The output is schema-v2 and explicitly labelled
 `diagnostic_only`; it records page-launch counters, allocator/workspace bytes,
 and a packed-reference parity check. `serial` is the default reference,
 `page-state` measures independent page states, and `parallel` measures the
-complete path (identity query cast/copy, page states, chronological reduction,
-and fixed-stride tail merge). The identity cast/copy is included in each timed
-parallel launch; the model-specific non-identity rotation kernel belongs to
-the later integration stage. The parallel row reports reusable
+complete path (query rotation, page states, and one fused chronological
+reduction plus fixed-stride tail merge). The parallel row reports reusable
 workspace bytes separately from packed arena capacity and runtime allocator
 bytes. These measurements are engineering diagnostics, not an end-to-end
-model or speed claim.
+model or speed claim. See [the clean fused result](../docs/LOCAL_FUSED_PAGE_RESULTS.md).
 The synthetic harness binds its identity to the Qwen2.5 architecture manifest;
 it does not load or hash model weight files.
 
