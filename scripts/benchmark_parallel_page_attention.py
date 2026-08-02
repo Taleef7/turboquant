@@ -316,6 +316,20 @@ def _page_state_oracle(
     return page_max, page_denominator, page_numerator
 
 
+def _parallel_page_workspace_nbytes(workspace: object) -> int:
+    """Count every allocated tensor in the page-state workspace exactly once."""
+    tensors = (
+        workspace.rotated_query,  # type: ignore[attr-defined]
+        workspace.page_max,  # type: ignore[attr-defined]
+        workspace.page_denominator,  # type: ignore[attr-defined]
+        workspace.page_numerator,  # type: ignore[attr-defined]
+        workspace.reduced_max,  # type: ignore[attr-defined]
+        workspace.reduced_denominator,  # type: ignore[attr-defined]
+        workspace.reduced_numerator,  # type: ignore[attr-defined]
+    )
+    return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+
+
 def _run_page_state_row(page_count: int, *, seed: int) -> dict[str, object]:
     import torch
     from kernels.qwen25_parallel_page_attention import (
@@ -404,9 +418,7 @@ def _run_page_state_row(page_count: int, *, seed: int) -> dict[str, object]:
     )
     peak_allocated = int(torch.cuda.max_memory_allocated())
     runtime_bytes = max(0, peak_allocated - baseline_allocated)
-    workspace_bytes = QUERY_HEADS * HEAD_DIM * 4 + page_count * QUERY_HEADS * (
-        4 + 4 + HEAD_DIM * 4
-    )
+    workspace_bytes = _parallel_page_workspace_nbytes(workspace)
     return {
         "row_id": f"page-state-pages-{page_count}",
         "status": "passed",

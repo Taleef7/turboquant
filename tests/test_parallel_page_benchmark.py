@@ -9,9 +9,11 @@ import subprocess
 import sys
 
 import pytest
+import torch
 from scripts.benchmark_parallel_page_attention import (
     DEFAULT_PAGE_COUNTS,
     MEASURED_TRIALS,
+    _parallel_page_workspace_nbytes,
     WARMUP_RUNS,
     validate_parallel_page_artifact,
 )
@@ -144,6 +146,23 @@ def test_page_state_contract_accepts_one_grid_launch_per_page_set() -> None:
     artifact["rows"] = rows
     result = validate_parallel_page_artifact(artifact)
     assert result.valid, result.errors
+
+
+def test_page_state_workspace_bytes_include_all_reduction_buffers() -> None:
+    workspace = type(
+        "Workspace",
+        (),
+        {
+            "rotated_query": torch.empty((28, 128), dtype=torch.float32),
+            "page_max": torch.empty((3, 28), dtype=torch.float32),
+            "page_denominator": torch.empty((3, 28), dtype=torch.float32),
+            "page_numerator": torch.empty((3, 28, 128), dtype=torch.float32),
+            "reduced_max": torch.empty((28,), dtype=torch.float32),
+            "reduced_denominator": torch.empty((28,), dtype=torch.float32),
+            "reduced_numerator": torch.empty((28, 128), dtype=torch.float32),
+        },
+    )()
+    assert _parallel_page_workspace_nbytes(workspace) == 72_576
 
 
 def test_contract_rejects_missing_page_row() -> None:
