@@ -192,6 +192,39 @@ def test_store_arena_tail_append_reuses_reserved_allocations(
     assert arena.tail_length == 129
 
 
+def test_store_arena_boundary_flush_uses_reserved_scratch_without_hot_allocations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arena = PackedPageArena.reserve(
+        make_layout(pages=2, tail=383),
+        device=torch.device("cpu"),
+        kv_dtype=torch.float16,
+    )
+    store = PackedKVBlockStore(
+        KeyCodec(KeyLayout(head_dim=128, bits=8, norm_dtype=torch.float16)),
+        ValueCodec(ValueLayout(head_dim=128, bits=6, group_size=32)),
+        num_kv_heads=4,
+        arena=arena,
+    )
+    keys = torch.randn((1, 4, 383, 128), dtype=torch.float16)
+    store.append(keys, keys + 1)
+    pointers = arena.data_pointers()
+
+    def fail_allocation(*_args: object, **_kwargs: object) -> torch.Tensor:
+        raise AssertionError("boundary append allocated a new tensor")
+
+    monkeypatch.setattr(torch, "empty", fail_allocation)
+    monkeypatch.setattr(torch, "empty_like", fail_allocation)
+    monkeypatch.setattr(torch, "clone", fail_allocation)
+    monkeypatch.setattr(torch, "cat", fail_allocation)
+    monkeypatch.setattr(torch.Tensor, "contiguous", fail_allocation)
+    store.append(keys[..., :1, :], keys[..., :1, :] + 1)
+
+    assert arena.used_pages == 1
+    assert arena.tail_length == 128
+    assert arena.data_pointers() == pointers
+
+
 def test_store_arena_reuses_one_prepared_constant_bundle_across_pages() -> None:
     codec = KeyCodec(KeyLayout(head_dim=128, bits=8, norm_dtype=torch.float16))
     arena = PackedPageArena.reserve(

@@ -111,11 +111,25 @@ def test_prepared_key_device_constants_are_cached_and_encode_into_writes_arena()
     source = torch.randn((1, 2, 256, 128), dtype=torch.float16)
     page_id = codec.encode_into(source, arena, 0, prepared=prepared)
     reference = codec.encode(source)
-    assert page_id == 0
+    assert page_id is None
+    assert arena.used_pages == 0
+    assert torch.equal(arena.key_indices[0].reshape(2 * 256, -1), reference.indices)
+    assert torch.equal(arena.key_norms[0].reshape(2 * 256), reference.norms)
+    with pytest.raises(TypeError):
+        arena.write_value_page(
+            value_indices=torch.zeros((2 * 256, 96), dtype=torch.int8),
+            value_mins=torch.zeros((2 * 256, 4), dtype=torch.float16),
+            value_scales=torch.zeros((2 * 256, 4), dtype=torch.float16),
+            page_id=0,
+        )
+    assert arena.used_pages == 0
+    arena.write_value_page(
+        value_indices=torch.zeros((2 * 256, 96), dtype=torch.uint8),
+        value_mins=torch.zeros((2 * 256, 4), dtype=torch.float16),
+        value_scales=torch.zeros((2 * 256, 4), dtype=torch.float16),
+        page_id=0,
+    )
     assert arena.used_pages == 1
-    page = arena.page_views(0)
-    assert torch.equal(page["key_indices"].reshape(2 * 256, -1), reference.indices)
-    assert torch.equal(page["key_norms"].reshape(2 * 256), reference.norms)
 
 
 def test_prepared_key_constants_reject_device_or_layout_mismatch() -> None:

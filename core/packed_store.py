@@ -167,6 +167,20 @@ class PackedKVBlockStore:
         self._arena = arena
         if arena is not None:
             self._validate_arena_layout(arena)
+            self._append_scratch_keys = torch.empty(
+                (
+                    1,
+                    arena.layout.num_kv_heads,
+                    arena.layout.page_tokens,
+                    arena.layout.head_dim,
+                ),
+                dtype=arena.kv_dtype,
+                device=arena.device,
+            )
+            self._append_scratch_values = torch.empty_like(self._append_scratch_keys)
+        else:
+            self._append_scratch_keys = None
+            self._append_scratch_values = None
         self._blocks: list[PackedKVBlock] = []
         self._pending_keys: torch.Tensor | None = None
         self._pending_values: torch.Tensor | None = None
@@ -267,6 +281,8 @@ class PackedKVBlockStore:
     def _append_arena(self, keys: torch.Tensor, values: torch.Tensor) -> None:
         """Append through reserved storage while keeping the legacy path intact."""
         assert self._arena is not None
+        assert self._append_scratch_keys is not None
+        assert self._append_scratch_values is not None
         old_tail_keys, old_tail_values = self._arena.tail_views()
         old_tail_tokens = self._arena.tail_length
         incoming_tokens = keys.shape[-2]
@@ -289,55 +305,58 @@ class PackedKVBlockStore:
             self._sequence_length = self._arena.sequence_length
             return
 
-        combined_keys = torch.empty(
-            (1, keys.shape[1], total_pending, keys.shape[-1]),
-            dtype=keys.dtype,
-            device=keys.device,
-        )
-        combined_values = torch.empty_like(combined_keys)
-        if old_tail_tokens:
-            combined_keys[..., :old_tail_tokens, :].copy_(old_tail_keys)
-            combined_values[..., :old_tail_tokens, :].copy_(old_tail_values)
-        combined_keys[..., old_tail_tokens:, :].copy_(keys)
-        combined_values[..., old_tail_tokens:, :].copy_(values)
-
         # Prepare the immutable key constants once for this device.  The old
         # payload API retains an unpack closure for reference attention; the
         # arena path only needs raw arrays and should not build those closures
         # for every historical page.
         prepared = self._key_codec.prepare_device(keys.device)
-        encoded: list[
-            tuple[
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-            ]
-        ] = []
-        for page_id in range(pages_to_flush):
-            start = page_id * self.block_size
-            stop = start + self.block_size
+
+        old_offset = 0
+        incoming_offset = 0
+        for _page_id in range(pages_to_flush):
+            old_available = old_tail_tokens - old_offset
+            old_take = min(old_available, self.block_size)
+            incoming_take = self.block_size - old_take
+            if incoming_take > incoming_tokens - incoming_offset:
+                raise RuntimeError("arena page accounting exceeded the pending append.")
+            if old_take:
+                page_keys = old_tail_keys[..., old_offset : old_offset + old_take, :]
+                page_values = old_tail_values[
+                    ..., old_offset : old_offset + old_take, :
+                ]
+                if incoming_take:
+                    self._append_scratch_keys[..., :old_take, :].copy_(page_keys)
+                    self._append_scratch_values[..., :old_take, :].copy_(page_values)
+                    self._append_scratch_keys[..., old_take:, :].copy_(
+                        keys[..., incoming_offset : incoming_offset + incoming_take, :]
+                    )
+                    self._append_scratch_values[..., old_take:, :].copy_(
+                        values[
+                            ..., incoming_offset : incoming_offset + incoming_take, :
+                        ]
+                    )
+                    page_keys = self._append_scratch_keys
+                    page_values = self._append_scratch_values
+            else:
+                page_keys = keys[
+                    ..., incoming_offset : incoming_offset + self.block_size, :
+                ]
+                page_values = values[
+                    ..., incoming_offset : incoming_offset + self.block_size, :
+                ]
             (
                 key_indices,
                 key_norms,
                 key_signs,
                 key_gamma,
-            ) = self._key_codec._encode_arrays(
-                combined_keys[..., start:stop, :], prepared=prepared
-            )
+            ) = self._key_codec._encode_arrays(page_keys, prepared=prepared)
             if key_signs is not None or key_gamma is not None:
                 raise UnsupportedCapabilityError(
                     "arena-backed storage does not support QJL key payloads yet."
                 )
             value_indices, value_mins, value_scales = self._value_codec._encode_arrays(
-                combined_values[..., start:stop, :]
+                page_values
             )
-            encoded.append(
-                (key_indices, key_norms, value_indices, value_mins, value_scales)
-            )
-        self._arena.clear_tail()
-        for key_indices, key_norms, value_indices, value_mins, value_scales in encoded:
             self._arena.append_encoded_page(
                 key_indices=key_indices,
                 key_norms=key_norms,
@@ -345,11 +364,45 @@ class PackedKVBlockStore:
                 value_mins=value_mins,
                 value_scales=value_scales,
             )
-        remainder_start = pages_to_flush * self.block_size
-        remainder_keys = combined_keys[..., remainder_start:, :]
-        remainder_values = combined_values[..., remainder_start:, :]
-        if remainder_keys.shape[-2]:
-            self._arena.append_tail(remainder_keys, remainder_values)
+            old_offset += old_take
+            incoming_offset += incoming_take
+
+        remainder_old = old_tail_tokens - old_offset
+        remainder_incoming = incoming_tokens - incoming_offset
+        self._arena.clear_tail()
+        if remainder_old and remainder_incoming:
+            remainder_tokens = remainder_old + remainder_incoming
+            self._append_scratch_keys[..., :remainder_old, :].copy_(
+                old_tail_keys[..., old_offset : old_offset + remainder_old, :]
+            )
+            self._append_scratch_values[..., :remainder_old, :].copy_(
+                old_tail_values[..., old_offset : old_offset + remainder_old, :]
+            )
+            self._append_scratch_keys[..., remainder_old:remainder_tokens, :].copy_(
+                keys[..., incoming_offset:, :]
+            )
+            self._append_scratch_values[..., remainder_old:remainder_tokens, :].copy_(
+                values[..., incoming_offset:, :]
+            )
+            self._arena.append_tail(
+                self._append_scratch_keys[..., :remainder_tokens, :],
+                self._append_scratch_values[..., :remainder_tokens, :],
+            )
+        elif remainder_old:
+            self._append_scratch_keys[..., :remainder_old, :].copy_(
+                old_tail_keys[..., old_offset : old_offset + remainder_old, :]
+            )
+            self._append_scratch_values[..., :remainder_old, :].copy_(
+                old_tail_values[..., old_offset : old_offset + remainder_old, :]
+            )
+            self._arena.append_tail(
+                self._append_scratch_keys[..., :remainder_old, :],
+                self._append_scratch_values[..., :remainder_old, :],
+            )
+        elif remainder_incoming:
+            self._arena.append_tail(
+                keys[..., incoming_offset:, :], values[..., incoming_offset:, :]
+            )
         self._sequence_length = self._arena.sequence_length
 
     @staticmethod

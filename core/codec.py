@@ -243,9 +243,7 @@ class KeyCodec:
         flat = keys.reshape(-1, self.layout.head_dim).float()
         norms = torch.linalg.vector_norm(flat, dim=-1, keepdim=True)
         rotated = (flat / (norms + 1e-8)) @ prepared.rotation.T
-        return torch.searchsorted(
-            prepared.boundaries[1:-1].contiguous(), rotated.contiguous()
-        ).to(torch.uint8)
+        return torch.searchsorted(prepared.boundaries[1:-1], rotated).to(torch.uint8)
 
     def rotate_reference_vectors(self, vectors: torch.Tensor) -> torch.Tensor:
         """Rotate fp16/bf16/fp32 query or decoded-key vectors into fp32 space."""
@@ -323,9 +321,9 @@ class KeyCodec:
         norms = torch.linalg.vector_norm(flat, dim=-1)
         unit = flat / (norms.unsqueeze(-1) + 1e-8)
         rotated = unit @ prepared.rotation.T
-        raw_indices = torch.searchsorted(
-            prepared.boundaries[1:-1].contiguous(), rotated.contiguous()
-        ).to(torch.uint8)
+        raw_indices = torch.searchsorted(prepared.boundaries[1:-1], rotated).to(
+            torch.uint8
+        )
         packed_indices = pack_indices(raw_indices, self.mse_bits)
         stored_norms = norms.to(self.layout.norm_dtype)
 
@@ -355,7 +353,7 @@ class KeyCodec:
         page_id: int,
         *,
         prepared: PreparedKeyCodecDevice,
-    ) -> int:
+    ) -> None:
         """Encode one complete key page directly into a reserved arena slot."""
         from core.packed_page_arena import PackedPageArena
 
@@ -379,7 +377,7 @@ class KeyCodec:
             keys, prepared=prepared
         )
         assert packed_signs is None and gamma is None
-        return destination.append_key_page(
+        destination.append_key_page(
             key_indices=packed_indices,
             key_norms=stored_norms,
             page_id=page_id,

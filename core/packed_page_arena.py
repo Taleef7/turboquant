@@ -140,6 +140,7 @@ class PackedPageArena:
         self.tail_values = tail_values
         self._used_pages = 0
         self._tail_length = 0
+        self._pending_key_page: int | None = None
 
     @classmethod
     def reserve(
@@ -260,6 +261,10 @@ class PackedPageArena:
             raise TypeError("page_id must be a built-in int.")
         if target != self._used_pages:
             raise ValueError("pages must be appended in chronological order.")
+        if self._pending_key_page is not None:
+            raise RuntimeError(
+                "complete the pending key page before appending another page."
+            )
         if target >= self.layout.page_capacity:
             raise OverflowError("packed page arena capacity is exhausted.")
         key_indices_view = self._page_tensor(
@@ -309,18 +314,20 @@ class PackedPageArena:
         key_norms: torch.Tensor,
         page_id: int | None = None,
     ) -> int:
-        """Append key arrays when the value arrays are produced separately.
+        """Write key arrays while keeping the page transactionally invisible.
 
         This is intentionally a small primitive for codecs that can write keys
-        directly into the arena.  The page becomes visible immediately; callers
-        that also produce values should call :meth:`write_value_page` before
-        exposing the store to readers.
+        directly into the arena.  ``used_pages`` advances only after
+        :meth:`write_value_page` validates and copies all value arrays, so a
+        failed value encode cannot expose a partially initialized page.
         """
         target = self._used_pages if page_id is None else page_id
         if type(target) is not int:  # noqa: E721
             raise TypeError("page_id must be a built-in int.")
         if target != self._used_pages:
             raise ValueError("pages must be appended in chronological order.")
+        if self._pending_key_page is not None:
+            raise RuntimeError("a key page is already pending value completion.")
         if target >= self.layout.page_capacity:
             raise OverflowError("packed page arena capacity is exhausted.")
         key_indices_view = self._page_tensor(
@@ -335,7 +342,7 @@ class PackedPageArena:
         )
         self.key_indices[target].copy_(key_indices_view)
         self.key_norms[target].copy_(key_norms_view)
-        self._used_pages += 1
+        self._pending_key_page = target
         return target
 
     def write_value_page(
@@ -349,8 +356,8 @@ class PackedPageArena:
         """Fill value arrays for an already appended key page."""
         if type(page_id) is not int:  # noqa: E721
             raise TypeError("page_id must be a built-in int.")
-        if not 0 <= page_id < self._used_pages:
-            raise IndexError("page_id is outside the used page range.")
+        if self._pending_key_page != page_id:
+            raise ValueError("value arrays must complete the pending key page.")
         value_indices_view = self._page_tensor(
             value_indices,
             "value_indices",
@@ -375,9 +382,13 @@ class PackedPageArena:
         self.value_indices[page_id].copy_(value_indices_view)
         self.value_mins[page_id].copy_(value_mins_view)
         self.value_scales[page_id].copy_(value_scales_view)
+        self._pending_key_page = None
+        self._used_pages += 1
 
     def append_tail(self, keys: torch.Tensor, values: torch.Tensor) -> None:
         """Copy raw K/V tokens into the next fixed-stride tail slots."""
+        if self._pending_key_page is not None:
+            raise RuntimeError("complete the pending key page before appending a tail.")
         expected_prefix = (1, self.layout.num_kv_heads)
         expected_suffix = (self.layout.head_dim,)
         for name, tensor in (("keys", keys), ("values", values)):
@@ -407,6 +418,10 @@ class PackedPageArena:
         self._tail_length = stop
 
     def clear_tail(self) -> None:
+        if self._pending_key_page is not None:
+            raise RuntimeError(
+                "complete the pending key page before clearing the tail."
+            )
         self._tail_length = 0
 
     def tail_views(self) -> tuple[torch.Tensor, torch.Tensor]:
