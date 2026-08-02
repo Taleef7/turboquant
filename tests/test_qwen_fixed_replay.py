@@ -208,6 +208,21 @@ def test_fixed_stream_and_quality_metrics_are_deterministic() -> None:
     }
 
 
+def test_quality_clamps_tiny_negative_kl_roundoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    import torch.nn.functional as F
+
+    from scripts.replay_qwen25_fixed_tokens import _quality
+
+    monkeypatch.setattr(
+        F,
+        "kl_div",
+        lambda *args, **kwargs: torch.tensor(-8e-9),
+    )
+    logits = [torch.tensor([[1.0, 0.0]])]
+    metrics = _quality(logits, logits)
+    assert metrics["kl_divergence"] == 0.0
+
+
 def test_direct_memory_uses_one_logical_formula_for_arena_store() -> None:
     profile = load_profile(ROOT / "configs" / "profiles" / "qwen25-7b-direct-v1.json")
     cache = PackedDynamicCache(profile, layer_count=1, maximum_sequence_length=640)

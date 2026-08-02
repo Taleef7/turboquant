@@ -576,13 +576,18 @@ def _quality(
     difference = (actual - base).abs()
     base_probability = base.softmax(dim=-1)
     kl = F.kl_div(actual.log_softmax(dim=-1), base_probability, reduction="batchmean")
+    kl_value = float(kl.item())
+    if math.isfinite(kl_value):
+        # KL is mathematically non-negative; tiny negative values can arise
+        # from the floating-point reduction and must not invalidate a row.
+        kl_value = max(0.0, kl_value)
     base_top1 = base.argmax(dim=-1)
     actual_top1 = actual.argmax(dim=-1)
     agreement = (base_top1 == actual_top1).float()
     return {
         "max_abs_logit": float(difference.max().item()),
         "mean_abs_logit": float(difference.mean().item()),
-        "kl_divergence": float(kl.item()),
+        "kl_divergence": kl_value,
         "top1_agreement": float(agreement.mean().item()),
         "greedy_agreement": bool(torch.equal(base_top1, actual_top1)),
     }
