@@ -1,10 +1,9 @@
-"""Independent packed-page attention states for the canonical Qwen2.5 layout.
+"""Atomic-free packed-page attention for the canonical Qwen2.5 layout.
 
-Task 4 deliberately stops at the page-state stage.  Each Triton program owns
-one ``(page, query_head)`` pair and writes an independent stable softmax state
-to preallocated workspace.  Chronological reduction and raw-tail merging are
-separate Task 5 work; this module therefore never performs atomics or silently
-falls back to PyTorch.
+The page-state launch computes one independent stable softmax state per
+``(page, query_head)``.  Task 5 adds a deterministic chronological reduction and
+a fixed-stride raw-tail merge.  All three launches write preallocated tensors;
+none allocates a tensor, uses atomics, or silently falls back to PyTorch.
 """
 
 from __future__ import annotations
@@ -41,6 +40,7 @@ _KEY_BITS = 8
 _VALUE_BITS = 6
 _VALUE_GROUP_SIZE = 32
 _GQA_RATIO = _QUERY_HEADS // _KV_HEADS
+_SUPPORTED_FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 @dataclass(frozen=True)
@@ -128,6 +128,34 @@ def _validate_workspace(
         raise TypeError("page_denominator must use torch.float32.")
     if workspace.page_numerator.dtype != torch.float32:
         raise TypeError("page_numerator must use torch.float32.")
+    if workspace.rotated_query.dtype != torch.float32:
+        raise TypeError("workspace.rotated_query must use torch.float32.")
+    if workspace.reduced_max.shape != (_QUERY_HEADS,):
+        raise ValueError("workspace.reduced_max must have shape [28].")
+    if workspace.reduced_denominator.shape != (_QUERY_HEADS,):
+        raise ValueError("workspace.reduced_denominator must have shape [28].")
+    if workspace.reduced_numerator.shape != (_QUERY_HEADS, _HEAD_DIM):
+        raise ValueError("workspace.reduced_numerator must have shape [28, 128].")
+    for name, tensor in (
+        ("reduced_max", workspace.reduced_max),
+        ("reduced_denominator", workspace.reduced_denominator),
+        ("reduced_numerator", workspace.reduced_numerator),
+    ):
+        if tensor.dtype != torch.float32:
+            raise TypeError(f"workspace.{name} must use torch.float32.")
+    if not all(
+        tensor.is_contiguous()
+        for tensor in (
+            workspace.rotated_query,
+            workspace.page_max,
+            workspace.page_denominator,
+            workspace.page_numerator,
+            workspace.reduced_max,
+            workspace.reduced_denominator,
+            workspace.reduced_numerator,
+        )
+    ):
+        raise ValueError("workspace tensors must be contiguous.")
 
 
 def _validate_arena(
@@ -262,6 +290,107 @@ if _TRITON_AVAILABLE:
             numerator,
         )
 
+    @triton.jit
+    def _qwen25_page_reduction_kernel(
+        page_max_ptr,
+        page_denominator_ptr,
+        page_numerator_ptr,
+        reduced_max_ptr,
+        reduced_denominator_ptr,
+        reduced_numerator_ptr,
+        USED_PAGES: tl.constexpr,
+    ):
+        """Merge page states in ascending page order for one query head."""
+        head = tl.program_id(0)
+        dims = tl.arange(0, 128)
+        merged_max = tl.full((), -float("inf"), dtype=tl.float32)
+        merged_denominator = tl.zeros((), dtype=tl.float32)
+        merged_numerator = tl.zeros((128,), dtype=tl.float32)
+
+        for page in tl.static_range(0, USED_PAGES):
+            state = page * 28 + head
+            page_maximum = tl.load(page_max_ptr + state)
+            page_denominator = tl.load(page_denominator_ptr + state)
+            page_numerator = tl.load(page_numerator_ptr + state * 128 + dims)
+            next_max = tl.maximum(merged_max, page_maximum)
+            previous_scale = tl.where(
+                merged_denominator > 0.0,
+                tl.exp(merged_max - next_max),
+                0.0,
+            )
+            page_scale = tl.exp(page_maximum - next_max)
+            merged_denominator = (
+                merged_denominator * previous_scale + page_denominator * page_scale
+            )
+            merged_numerator = (
+                merged_numerator * previous_scale + page_numerator * page_scale
+            )
+            merged_max = next_max
+
+        tl.store(reduced_max_ptr + head, merged_max)
+        tl.store(reduced_denominator_ptr + head, merged_denominator)
+        tl.store(reduced_numerator_ptr + head * 128 + dims, merged_numerator)
+
+    @triton.jit
+    def _qwen25_tail_merge_kernel(
+        rotated_query_ptr,
+        tail_keys_ptr,
+        tail_values_ptr,
+        reduced_max_ptr,
+        reduced_denominator_ptr,
+        reduced_numerator_ptr,
+        output_ptr,
+        tail_length,
+        tail_head_stride,
+        tail_token_stride,
+        output_head_stride,
+        output_dim_stride,
+        SCALE: tl.constexpr,
+        TAIL_CAPACITY: tl.constexpr,
+    ):
+        """Merge a fixed-stride raw tail after the reduced packed pages."""
+        head = tl.program_id(0)
+        kv_head = head // 7
+        dims = tl.arange(0, 128)
+        query = tl.load(rotated_query_ptr + head * 128 + dims)
+        merged_max = tl.load(reduced_max_ptr + head)
+        merged_denominator = tl.load(reduced_denominator_ptr + head)
+        merged_numerator = tl.load(reduced_numerator_ptr + head * 128 + dims)
+
+        for token in tl.range(0, TAIL_CAPACITY):
+            token_id = tl.full((), token, dtype=tl.int32)
+            active = token_id < tail_length
+            key_offsets = kv_head * tail_head_stride + token * tail_token_stride + dims
+            key = tl.load(tail_keys_ptr + key_offsets, mask=active, other=0.0)
+            score = tl.sum(query * key.to(tl.float32), axis=0) * SCALE
+            score = tl.where(active, score, -float("inf"))
+            next_max = tl.maximum(merged_max, score)
+            previous_scale = tl.where(
+                merged_denominator > 0.0,
+                tl.exp(merged_max - next_max),
+                0.0,
+            )
+            token_scale = tl.where(active, tl.exp(score - next_max), 0.0)
+            value_offsets = (
+                kv_head * tail_head_stride + token * tail_token_stride + dims
+            )
+            value = tl.load(
+                tail_values_ptr + value_offsets,
+                mask=active,
+                other=0.0,
+            ).to(tl.float32)
+            merged_denominator = merged_denominator * previous_scale + token_scale
+            merged_numerator = merged_numerator * previous_scale + value * token_scale
+            merged_max = next_max
+
+        normalized = tl.where(
+            merged_denominator > 0.0,
+            merged_numerator / merged_denominator,
+            0.0,
+        )
+        output_offsets = head * output_head_stride + dims * output_dim_stride
+        tl.store(output_ptr + output_offsets, normalized)
+
 
 def launch_qwen25_page_states(
     query: torch.Tensor,
@@ -317,4 +446,161 @@ def launch_qwen25_page_states(
     )
 
 
-__all__ = ["ParallelPageWorkspace", "launch_qwen25_page_states", "page_state_grid"]
+def launch_qwen25_page_reduction(
+    workspace: ParallelPageWorkspace,
+    *,
+    used_pages: int,
+) -> None:
+    """Merge page states chronologically with one program per query head."""
+    _require_triton_cuda()
+    if not isinstance(workspace, ParallelPageWorkspace):
+        raise TypeError("workspace must be a ParallelPageWorkspace.")
+    if type(used_pages) is not int:  # noqa: E721
+        raise TypeError("used_pages must be a built-in int.")
+    if used_pages < 0 or used_pages > workspace.page_max.shape[0]:
+        raise ValueError("used_pages must be within the workspace page capacity.")
+    device = workspace.rotated_query.device
+    _validate_workspace(workspace, device=device, used_pages=used_pages)
+    if used_pages == 0:
+        workspace.reduced_max.fill_(-float("inf"))
+        workspace.reduced_denominator.zero_()
+        workspace.reduced_numerator.zero_()
+        return
+    _qwen25_page_reduction_kernel[(_QUERY_HEADS,)](
+        workspace.page_max,
+        workspace.page_denominator,
+        workspace.page_numerator,
+        workspace.reduced_max,
+        workspace.reduced_denominator,
+        workspace.reduced_numerator,
+        USED_PAGES=used_pages,
+        num_warps=4,
+    )
+
+
+def _validate_tail(
+    tail_keys: torch.Tensor,
+    tail_values: torch.Tensor,
+    *,
+    device: torch.device,
+    tail_length: int,
+    tail_head_stride: int,
+    tail_token_stride: int,
+) -> int:
+    if not isinstance(tail_keys, torch.Tensor) or not isinstance(
+        tail_values, torch.Tensor
+    ):
+        raise TypeError("tail_keys and tail_values must be tensors.")
+    if tail_keys.device != device or tail_values.device != device:
+        raise ValueError("tail tensors must reside on the workspace device.")
+    if (
+        tail_keys.ndim != 4
+        or tail_keys.shape[0] != 1
+        or tail_keys.shape[1] != _KV_HEADS
+    ):
+        raise ValueError("tail tensors must have shape [1, 4, capacity, 128].")
+    if tail_keys.shape[-1] != _HEAD_DIM or tail_values.shape != tail_keys.shape:
+        raise ValueError(
+            "tail tensors must have matching [1, 4, capacity, 128] shapes."
+        )
+    if (
+        tail_keys.dtype not in _SUPPORTED_FLOAT_DTYPES
+        or tail_values.dtype != tail_keys.dtype
+    ):
+        raise TypeError(
+            "tail tensors must use fp16, bf16, or fp32 with matching dtypes."
+        )
+    if tail_keys.stride(-1) != 1 or tail_values.stride(-1) != 1:
+        raise ValueError("tail feature dimensions must have unit stride.")
+    if type(tail_length) is not int:  # noqa: E721
+        raise TypeError("tail_length must be a built-in int.")
+    if not 0 <= tail_length <= tail_keys.shape[-2]:
+        raise ValueError("tail_length must fit the supplied tail capacity.")
+    if type(tail_head_stride) is not int or type(tail_token_stride) is not int:  # noqa: E721
+        raise TypeError("tail strides must be built-in ints.")
+    if tail_head_stride != tail_keys.stride(
+        1
+    ) or tail_head_stride != tail_values.stride(1):
+        raise ValueError("tail_head_stride must match both tail tensor strides.")
+    if tail_token_stride != tail_keys.stride(
+        2
+    ) or tail_token_stride != tail_values.stride(2):
+        raise ValueError("tail_token_stride must match both tail tensor strides.")
+    return tail_keys.shape[-2]
+
+
+def launch_qwen25_tail_merge(
+    query: torch.Tensor,
+    tail_keys: torch.Tensor,
+    tail_values: torch.Tensor,
+    workspace: ParallelPageWorkspace,
+    *,
+    tail_length: int,
+    tail_head_stride: int,
+    tail_token_stride: int,
+    scale: float,
+    output: torch.Tensor,
+) -> None:
+    """Merge reduced pages and a raw fixed-stride tail into ``output``."""
+    _require_triton_cuda()
+    if not isinstance(workspace, ParallelPageWorkspace):
+        raise TypeError("workspace must be a ParallelPageWorkspace.")
+    device = workspace.rotated_query.device
+    query_2d, _ = _validate_query(query, device)
+    _validate_workspace(workspace, device=device, used_pages=0)
+    tail_capacity = _validate_tail(
+        tail_keys,
+        tail_values,
+        device=device,
+        tail_length=tail_length,
+        tail_head_stride=tail_head_stride,
+        tail_token_stride=tail_token_stride,
+    )
+    if (
+        not isinstance(scale, (float, int))
+        or isinstance(scale, bool)
+        or not math.isfinite(scale)
+    ):
+        raise ValueError("scale must be finite.")
+    if not isinstance(output, torch.Tensor) or output.device != device:
+        raise ValueError("output must be a tensor on the workspace device.")
+    if output.ndim == 2 and tuple(output.shape) == (_QUERY_HEADS, _HEAD_DIM):
+        output_2d = output
+    elif output.ndim == 4 and tuple(output.shape) == (1, _QUERY_HEADS, 1, _HEAD_DIM):
+        output_2d = output.view(_QUERY_HEADS, _HEAD_DIM)
+    else:
+        raise ValueError("output must have shape [28, 128] or [1, 28, 1, 128].")
+    if output.dtype not in _SUPPORTED_FLOAT_DTYPES:
+        raise TypeError("output must use fp16, bf16, or fp32.")
+    if output_2d.stride(-1) != 1:
+        raise ValueError("output feature dimension must have unit stride.")
+    if output_2d.stride(0) <= 0:
+        raise ValueError("output head stride must be positive.")
+    if workspace.rotated_query.data_ptr() == query_2d.data_ptr():
+        raise ValueError("workspace.rotated_query must not alias the raw query.")
+    _qwen25_tail_merge_kernel[(_QUERY_HEADS,)](
+        workspace.rotated_query,
+        tail_keys,
+        tail_values,
+        workspace.reduced_max,
+        workspace.reduced_denominator,
+        workspace.reduced_numerator,
+        output_2d,
+        tail_length,
+        tail_head_stride,
+        tail_token_stride,
+        output_2d.stride(0),
+        output_2d.stride(1),
+        SCALE=float(scale),
+        TAIL_CAPACITY=tail_capacity,
+        num_warps=4,
+    )
+
+
+__all__ = [
+    "ParallelPageWorkspace",
+    "launch_qwen25_page_reduction",
+    "launch_qwen25_page_states",
+    "launch_qwen25_tail_merge",
+    "page_state_grid",
+]

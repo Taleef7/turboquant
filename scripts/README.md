@@ -28,8 +28,13 @@ baseline. It uses deterministic synthetic Qwen2.5-shaped pages at 3, 7, 15,
 31, and 63 pages, with one cold/JIT launch, two warmups, and ten synchronized
 CUDA-event trials per row. The output is schema-v2 and explicitly labelled
 `diagnostic_only`; it records page-launch counters, allocator/workspace bytes,
-and a packed-reference parity check. These measurements are engineering
-diagnostics, not an end-to-end model or speed claim.
+and a packed-reference parity check. `serial` is the default reference,
+`page-state` measures independent page states, and `parallel` measures the
+complete four-launch path (query rotation, page states, chronological
+reduction, and fixed-stride tail merge). The parallel row reports reusable
+workspace bytes separately from packed arena capacity and runtime allocator
+bytes. These measurements are engineering diagnostics, not an end-to-end
+model or speed claim.
 The synthetic harness binds its identity to the Qwen2.5 architecture manifest;
 it does not load or hash model weight files.
 
@@ -40,6 +45,11 @@ python scripts/benchmark_parallel_page_attention.py \
   --output artifacts/parallel-page-baseline/manifest.json
 python scripts/validate_artifact.py \
   artifacts/parallel-page-baseline/manifest.json
+
+python scripts/benchmark_parallel_page_attention.py \
+  --implementations serial parallel \
+  --page-counts 3 7 15 31 63 \
+  --output artifacts/parallel-page-complete/manifest.json
 ```
 
 ## `reproduce_release.py`

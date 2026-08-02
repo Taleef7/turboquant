@@ -45,6 +45,8 @@ def _metrics(page_count: int) -> dict[str, object]:
         "memory": {
             "logical_payload_bytes": page_count * 100,
             "capacity_bytes": page_count * 100,
+            "tail_logical_bytes": 0,
+            "tail_capacity_bytes": 0,
             "runtime_bytes": 1024,
             "workspace_bytes": 1024,
             "unique_resident_bytes": page_count * 100 + 1024,
@@ -146,6 +148,61 @@ def test_page_state_contract_accepts_one_grid_launch_per_page_set() -> None:
     artifact["rows"] = rows
     result = validate_parallel_page_artifact(artifact)
     assert result.valid, result.errors
+
+
+def test_parallel_contract_requires_reduction_and_tail_launches() -> None:
+    artifact = _artifact()
+    artifact["artifact_id"] = "parallel-page-complete"
+    artifact["extensions"] = {
+        "implementation": "parallel",
+        "implementations": ["parallel"],
+    }
+    artifact["expected_row_ids"] = [
+        f"parallel-pages-{page_count}" for page_count in DEFAULT_PAGE_COUNTS
+    ]
+    rows = []
+    for row in artifact["rows"]:  # type: ignore[index]
+        row = copy.deepcopy(row)
+        row["row_id"] = row["row_id"].replace("serial-", "parallel-")
+        row["metrics"]["launch_counts"].update(  # type: ignore[index]
+            {"page": 1, "reduction": 1, "tail": 1, "allocation": 0}
+        )
+        rows.append(row)
+    artifact["rows"] = rows
+    result = validate_parallel_page_artifact(artifact)
+    assert result.valid, result.errors
+    rows[0]["metrics"]["launch_counts"]["reduction"] = 0  # type: ignore[index]
+    result = validate_parallel_page_artifact(artifact)
+    assert not result.valid
+    assert any("reduction" in error for error in result.errors)
+
+
+def test_mixed_contract_rejects_inconsistent_serial_parallel_tail_accounting() -> None:
+    artifact = _artifact()
+    parallel_rows = []
+    for row in artifact["rows"]:  # type: ignore[index]
+        row = copy.deepcopy(row)
+        row["row_id"] = row["row_id"].replace("serial-", "parallel-")
+        row["metrics"]["launch_counts"].update(  # type: ignore[index]
+            {"page": 1, "reduction": 1, "tail": 1, "allocation": 0}
+        )
+        row["metrics"]["memory"]["tail_logical_bytes"] = 256  # type: ignore[index]
+        row["metrics"]["memory"]["tail_capacity_bytes"] = 256  # type: ignore[index]
+        parallel_rows.append(row)
+    artifact["rows"] = artifact["rows"] + parallel_rows  # type: ignore[operator]
+    artifact["extensions"] = {
+        "implementation": "mixed",
+        "implementations": ["serial", "parallel"],
+    }
+    artifact["expected_row_ids"] = [
+        f"{implementation}-pages-{page_count}"
+        for implementation in ("serial", "parallel")
+        for page_count in DEFAULT_PAGE_COUNTS
+    ]
+    artifact["pass_state_counts"]["passed"] = len(artifact["expected_row_ids"])  # type: ignore[index]
+    result = validate_parallel_page_artifact(artifact)
+    assert not result.valid
+    assert any("tail logical-byte accounting" in error for error in result.errors)
 
 
 def test_page_state_workspace_bytes_include_all_reduction_buffers() -> None:

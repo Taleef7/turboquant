@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Measure the current serial packed-page decode path.
+"""Measure serial and page-parallel packed-page decode diagnostics.
 
 This is deliberately a diagnostic harness.  It uses deterministic synthetic
 Qwen2.5-shaped pages to isolate page-count overhead; it does not establish a
-model-quality, throughput, or memory claim.
+model-quality, end-to-end throughput, or model VRAM claim.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 
 DEFAULT_PAGE_COUNTS = (3, 7, 15, 31, 63)
-SUPPORTED_IMPLEMENTATIONS = ("serial", "page-state")
+SUPPORTED_IMPLEMENTATIONS = ("serial", "page-state", "parallel")
 COLD_JIT_RUNS = 1
 WARMUP_RUNS = 2
 MEASURED_TRIALS = 10
@@ -316,8 +316,63 @@ def _page_state_oracle(
     return page_max, page_denominator, page_numerator
 
 
+def _parallel_oracle(
+    blocks_cpu: tuple["PackedAttentionBlock", ...],
+    query_cpu: "torch.Tensor",
+    tail_cpu: tuple["torch.Tensor", "torch.Tensor"],
+    *,
+    scale: float,
+) -> "torch.Tensor":
+    """Return the chronological packed-page plus raw-tail float32 reference."""
+    import torch
+
+    page_max, page_denominator, page_numerator = _page_state_oracle(
+        blocks_cpu, query_cpu, scale=scale
+    )
+    output = torch.empty((QUERY_HEADS, HEAD_DIM), dtype=torch.float32)
+    for head in range(QUERY_HEADS):
+        maximum = page_max[0, head]
+        denominator = page_denominator[0, head]
+        numerator = page_numerator[0, head]
+        for page_id in range(1, len(blocks_cpu)):
+            next_max = torch.maximum(maximum, page_max[page_id, head])
+            old_scale = torch.exp(maximum - next_max)
+            page_scale = torch.exp(page_max[page_id, head] - next_max)
+            denominator = (
+                denominator * old_scale + page_denominator[page_id, head] * page_scale
+            )
+            numerator = (
+                numerator * old_scale + page_numerator[page_id, head] * page_scale
+            )
+            maximum = next_max
+        kv_head = head // 7
+        for token in range(tail_cpu[0].shape[1]):
+            score = (
+                torch.dot(query_cpu[head].float(), tail_cpu[0][kv_head, token].float())
+                * scale
+            )
+            next_max = torch.maximum(maximum, score)
+            old_scale = torch.exp(maximum - next_max)
+            token_scale = torch.exp(score - next_max)
+            denominator = denominator * old_scale + token_scale
+            numerator = (
+                numerator * old_scale
+                + tail_cpu[1][kv_head, token].float() * token_scale
+            )
+            maximum = next_max
+        output[head] = numerator / denominator
+    return output
+
+
 def _parallel_page_workspace_nbytes(workspace: object) -> int:
     """Count every allocated tensor in the page-state workspace exactly once."""
+    from core.parallel_page_workspace import (
+        parallel_page_workspace_nbytes,
+    )
+    from kernels.qwen25_parallel_page_attention import ParallelPageWorkspace
+
+    if isinstance(workspace, ParallelPageWorkspace):
+        return parallel_page_workspace_nbytes(workspace)
     tensors = (
         workspace.rotated_query,  # type: ignore[attr-defined]
         workspace.page_max,  # type: ignore[attr-defined]
@@ -440,6 +495,8 @@ def _run_page_state_row(page_count: int, *, seed: int) -> dict[str, object]:
             "memory": {
                 "logical_payload_bytes": cache_bytes,
                 "capacity_bytes": cache_bytes,
+                "tail_logical_bytes": 0,
+                "tail_capacity_bytes": 0,
                 "runtime_bytes": runtime_bytes,
                 "workspace_bytes": workspace_bytes,
                 "unique_resident_bytes": cache_bytes + workspace_bytes + runtime_bytes,
@@ -450,6 +507,210 @@ def _run_page_state_row(page_count: int, *, seed: int) -> dict[str, object]:
                 "top1_agreement": 1.0,
                 "repeat_bit_identical": bool(
                     torch.equal(repeated.cpu(), repeat_again.cpu())
+                ),
+            },
+            "diagnostic_only": True,
+        },
+        "sidecars": [],
+    }
+
+
+def _allocation_probe_parallel(
+    query: "torch.Tensor",
+    arena: object,
+    prepared: object,
+    workspace: object,
+    tail_keys: "torch.Tensor",
+    tail_values: "torch.Tensor",
+    output: "torch.Tensor",
+) -> int:
+    """Count Python tensor constructors around one warmed four-launch path."""
+    import torch
+    from kernels.qwen25_parallel_page_attention import (
+        launch_qwen25_page_reduction,
+        launch_qwen25_page_states,
+        launch_qwen25_tail_merge,
+    )
+
+    count = 0
+    with ExitStack() as stack:
+        for name in ("empty", "empty_like", "full", "zeros"):
+            original = getattr(torch, name)
+
+            def wrapped(*args: object, _original=original, **kwargs: object):
+                nonlocal count
+                count += 1
+                return _original(*args, **kwargs)
+
+            stack.enter_context(_patch_attribute(torch, name, wrapped))
+        launch_qwen25_page_states(
+            query,
+            arena,  # type: ignore[arg-type]
+            prepared,  # type: ignore[arg-type]
+            workspace,  # type: ignore[arg-type]
+            used_pages=arena.used_pages,  # type: ignore[attr-defined]
+            scale=1 / math.sqrt(HEAD_DIM),
+        )
+        launch_qwen25_page_reduction(
+            workspace,  # type: ignore[arg-type]
+            used_pages=arena.used_pages,  # type: ignore[attr-defined]
+        )
+        launch_qwen25_tail_merge(
+            query,
+            tail_keys,
+            tail_values,
+            workspace,  # type: ignore[arg-type]
+            tail_length=arena.tail_length,  # type: ignore[attr-defined]
+            tail_head_stride=tail_keys.stride(1),
+            tail_token_stride=tail_keys.stride(2),
+            scale=1 / math.sqrt(HEAD_DIM),
+            output=output,
+        )
+    torch.cuda.synchronize()
+    return count
+
+
+def _run_parallel_row(page_count: int, *, seed: int) -> dict[str, object]:
+    """Measure the complete four-launch page-state/reduction/tail diagnostic."""
+    import torch
+    from core.parallel_page_workspace import (
+        reserve_parallel_page_workspace,
+    )
+    from kernels.qwen25_parallel_page_attention import (
+        launch_qwen25_page_reduction,
+        launch_qwen25_page_states,
+        launch_qwen25_tail_merge,
+    )
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for the parallel page diagnostic")
+    device = torch.device("cuda")
+    arena, blocks_cpu, prepared = _synthetic_arena(page_count, seed=seed, device=device)
+    generator = torch.Generator(device="cpu").manual_seed(seed + 20_000 + page_count)
+    query_cpu = torch.randn(
+        (QUERY_HEADS, HEAD_DIM), generator=generator, dtype=torch.float16
+    )
+    tail_cpu = (
+        torch.randn(
+            (KV_HEADS, TAIL_TOKENS, HEAD_DIM),
+            generator=generator,
+            dtype=torch.float16,
+        ),
+        torch.randn(
+            (KV_HEADS, TAIL_TOKENS, HEAD_DIM),
+            generator=generator,
+            dtype=torch.float16,
+        ),
+    )
+    tail_keys = tail_cpu[0].unsqueeze(0).to(device)
+    tail_values = tail_cpu[1].unsqueeze(0).to(device)
+    arena.append_tail(tail_keys, tail_values)
+    query = query_cpu.to(device)
+    workspace = reserve_parallel_page_workspace(page_capacity=page_count, device=device)
+    workspace.rotated_query.copy_(query.float())
+    output = torch.empty((QUERY_HEADS, HEAD_DIM), device=device, dtype=torch.float32)
+    scale = 1 / math.sqrt(HEAD_DIM)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    baseline_allocated = int(torch.cuda.memory_allocated())
+
+    def launch_once() -> None:
+        launch_qwen25_page_states(
+            query,
+            arena,
+            prepared,
+            workspace,
+            used_pages=page_count,
+            scale=scale,
+        )
+        launch_qwen25_page_reduction(workspace, used_pages=page_count)
+        launch_qwen25_tail_merge(
+            query,
+            tail_keys,
+            tail_values,
+            workspace,
+            tail_length=TAIL_TOKENS,
+            tail_head_stride=tail_keys.stride(1),
+            tail_token_stride=tail_keys.stride(2),
+            scale=scale,
+            output=output,
+        )
+
+    launch_once()
+    torch.cuda.synchronize()
+    cold_output = output.clone()
+    launch_counts = {
+        "rotation": 1,
+        "page": 1,
+        "reduction": 1,
+        "tail": 1,
+        "fallback": 0,
+        "allocation": _allocation_probe_parallel(
+            query, arena, prepared, workspace, tail_keys, tail_values, output
+        ),
+    }
+    for _ in range(WARMUP_RUNS):
+        launch_once()
+    torch.cuda.synchronize()
+    samples: list[float] = []
+    for _ in range(MEASURED_TRIALS):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        launch_once()
+        end.record()
+        torch.cuda.synchronize()
+        samples.append(float(start.elapsed_time(end)))
+    launch_once()
+    torch.cuda.synchronize()
+    expected = _parallel_oracle(blocks_cpu, query_cpu, tail_cpu, scale=scale)
+    actual = output.detach().cpu()
+    error = (actual - expected).abs()
+    breakdown = arena.byte_breakdown(
+        workspace=_parallel_page_workspace_nbytes(workspace)
+    )
+    peak_allocated = int(torch.cuda.max_memory_allocated())
+    runtime_bytes = max(0, peak_allocated - baseline_allocated)
+    workspace_bytes = _parallel_page_workspace_nbytes(workspace)
+    return {
+        "row_id": f"parallel-pages-{page_count}",
+        "status": "passed",
+        "reason": None,
+        "identity": _identity(),
+        "metrics": {
+            "page_count": page_count,
+            "launch_counts": launch_counts,
+            "timing": {
+                "cuda_synchronized": True,
+                "cold_jit_runs": COLD_JIT_RUNS,
+                "warmup_runs": WARMUP_RUNS,
+                "measured_trials": MEASURED_TRIALS,
+                "cuda_event_ms": samples,
+                "p50_ms": _percentile(samples, 0.50),
+                "p95_ms": _percentile(samples, 0.95),
+                "p99_ms": _percentile(samples, 0.99),
+            },
+            "memory": {
+                "logical_payload_bytes": breakdown.logical_payload
+                + breakdown.tail_logical,
+                "capacity_bytes": breakdown.arena_capacity + breakdown.tail_capacity,
+                "tail_logical_bytes": breakdown.tail_logical,
+                "tail_capacity_bytes": breakdown.tail_capacity,
+                "runtime_bytes": runtime_bytes,
+                "workspace_bytes": workspace_bytes,
+                "unique_resident_bytes": breakdown.unique_resident + runtime_bytes,
+            },
+            "parity": {
+                "max_abs_error": float(error.max().item()),
+                "mean_abs_error": float(error.mean().item()),
+                "top1_agreement": float(
+                    (actual.argmax(dim=-1) == expected.argmax(dim=-1))
+                    .float()
+                    .mean()
+                    .item()
+                ),
+                "repeat_bit_identical": bool(
+                    torch.equal(cold_output.cpu(), output.cpu())
                 ),
             },
             "diagnostic_only": True,
@@ -658,14 +919,17 @@ def _run_serial_row(page_count: int, *, seed: int) -> dict[str, object]:
         torch.equal(cold_output.cpu(), repeated.cpu())
     )
     cache_bytes = _storage_bytes(blocks_device)
+    tail_bytes = sum(tensor.numel() * tensor.element_size() for tensor in tail)
     peak_allocated = int(torch.cuda.max_memory_allocated())
     runtime_bytes = max(0, peak_allocated - baseline_allocated)
     memory = {
-        "logical_payload_bytes": cache_bytes,
-        "capacity_bytes": cache_bytes,
+        "logical_payload_bytes": cache_bytes + tail_bytes,
+        "capacity_bytes": cache_bytes + tail_bytes,
+        "tail_logical_bytes": tail_bytes,
+        "tail_capacity_bytes": tail_bytes,
         "runtime_bytes": runtime_bytes,
         "workspace_bytes": runtime_bytes,
-        "unique_resident_bytes": cache_bytes + runtime_bytes,
+        "unique_resident_bytes": cache_bytes + tail_bytes + runtime_bytes,
     }
     return {
         "row_id": f"serial-pages-{page_count}",
@@ -720,7 +984,9 @@ def validate_parallel_page_artifact(artifact: Mapping[str, Any]) -> ValidationRe
         implementation not in SUPPORTED_IMPLEMENTATIONS
         for implementation in declared_implementations
     ):
-        errors.append("extensions implementations must be serial or page-state")
+        errors.append(
+            "extensions implementations must be serial, page-state, or parallel"
+        )
         declared_implementations = ("serial",)
     expected_ids = [
         f"{implementation}-pages-{count}"
@@ -728,7 +994,9 @@ def validate_parallel_page_artifact(artifact: Mapping[str, Any]) -> ValidationRe
         for count in DEFAULT_PAGE_COUNTS
     ]
     if artifact.get("expected_row_ids") != expected_ids:
-        errors.append("expected_row_ids must exactly declare serial page rows")
+        errors.append(
+            "expected_row_ids must exactly declare the requested implementation rows"
+        )
     if artifact.get("claims") not in ([], None):
         errors.append("diagnostic artifact cannot publish speed or memory claims")
     identity = artifact.get("identity")
@@ -752,7 +1020,7 @@ def validate_parallel_page_artifact(artifact: Mapping[str, Any]) -> ValidationRe
         "unsupported": 0,
         "unavailable": 0,
     }:
-        errors.append("pass_state_counts must describe five passed rows")
+        errors.append("pass_state_counts must describe all requested rows as passed")
     for row_id in expected_ids:
         row = rows_by_id.get(row_id)
         if not isinstance(row, Mapping):
@@ -777,23 +1045,29 @@ def validate_parallel_page_artifact(artifact: Mapping[str, Any]) -> ValidationRe
         else:
             page_count = metrics["page_count"]
             implementation = str(row_id).split("-pages-", 1)[0]
-            expected_counts = (
-                {
+            expected_counts = {
+                "serial": {
                     "rotation": 1,
                     "page": page_count,
                     "reduction": 0,
                     "tail": 1,
                     "fallback": 0,
-                }
-                if implementation == "serial"
-                else {
+                },
+                "page-state": {
                     "rotation": 1,
                     "page": 1,
                     "reduction": 0,
                     "tail": 0,
                     "fallback": 0,
-                }
-            )
+                },
+                "parallel": {
+                    "rotation": 1,
+                    "page": 1,
+                    "reduction": 1,
+                    "tail": 1,
+                    "fallback": 0,
+                },
+            }[implementation]
             for key, expected in expected_counts.items():
                 if counts.get(key) != expected:
                     errors.append(
@@ -802,11 +1076,12 @@ def validate_parallel_page_artifact(artifact: Mapping[str, Any]) -> ValidationRe
             if (
                 not isinstance(counts.get("allocation"), int)
                 or isinstance(counts.get("allocation"), bool)
-                or counts["allocation"] < (0 if implementation == "page-state" else 1)
+                or counts["allocation"]
+                < (0 if implementation in {"page-state", "parallel"} else 1)
             ):
                 errors.append(
                     f"row {row_id} launch_counts.allocation must be non-negative"
-                    if implementation == "page-state"
+                    if implementation in {"page-state", "parallel"}
                     else f"row {row_id} launch_counts.allocation must be positive"
                 )
         timing = metrics.get("timing")
@@ -869,6 +1144,8 @@ def validate_parallel_page_artifact(artifact: Mapping[str, Any]) -> ValidationRe
             fields = (
                 "logical_payload_bytes",
                 "capacity_bytes",
+                "tail_logical_bytes",
+                "tail_capacity_bytes",
                 "runtime_bytes",
                 "workspace_bytes",
                 "unique_resident_bytes",
@@ -884,16 +1161,18 @@ def validate_parallel_page_artifact(artifact: Mapping[str, Any]) -> ValidationRe
                 )
             elif (
                 memory["capacity_bytes"] < memory["logical_payload_bytes"]
+                or memory["tail_capacity_bytes"] < memory["tail_logical_bytes"]
+                or memory["logical_payload_bytes"] < memory["tail_logical_bytes"]
                 or memory["unique_resident_bytes"] < memory["capacity_bytes"]
             ):
                 errors.append(
-                    f"row {row_id} memory capacity/residency must cover logical payload"
+                    f"row {row_id} memory capacity/tail/residency must be consistent"
                 )
         parity = metrics.get("parity")
         implementation = str(row_id).split("-pages-", 1)[0]
         mean_tolerance = (
             PAGE_STATE_PARITY_MEAN_ABS_TOLERANCE
-            if implementation == "page-state"
+            if implementation in {"page-state", "parallel"}
             else PARITY_MEAN_ABS_TOLERANCE
         )
         max_error = parity.get("max_abs_error") if isinstance(parity, Mapping) else None
@@ -923,6 +1202,27 @@ def validate_parallel_page_artifact(artifact: Mapping[str, Any]) -> ValidationRe
                 f"{PARITY_MAX_ABS_TOLERANCE}, mean error <= {mean_tolerance}, "
                 "and exact top-1 agreement"
             )
+    comparable_tail_bytes: dict[str, set[int]] = {
+        implementation: set()
+        for implementation in ("serial", "parallel")
+        if implementation in declared_implementations
+    }
+    for row_id, row in rows_by_id.items():
+        implementation = str(row_id).split("-pages-", 1)[0]
+        if implementation not in comparable_tail_bytes:
+            continue
+        metrics = row.get("metrics")
+        memory = metrics.get("memory") if isinstance(metrics, Mapping) else None
+        if isinstance(memory, Mapping):
+            logical = memory.get("tail_logical_bytes")
+            capacity = memory.get("tail_capacity_bytes")
+            if isinstance(logical, int) and isinstance(capacity, int):
+                comparable_tail_bytes[implementation].add(logical)
+    present_tail_sets = [values for values in comparable_tail_bytes.values() if values]
+    if len(present_tail_sets) == 2 and present_tail_sets[0] != present_tail_sets[1]:
+        errors.append(
+            "serial and parallel rows must use the same explicit tail logical-byte accounting"
+        )
     return ValidationResult(not errors, tuple(errors))
 
 
@@ -943,7 +1243,11 @@ def build_artifact(
         )
     rows: list[dict[str, object]] = []
     for implementation in implementations:
-        runner = _run_serial_row if implementation == "serial" else _run_page_state_row
+        runner = {
+            "serial": _run_serial_row,
+            "page-state": _run_page_state_row,
+            "parallel": _run_parallel_row,
+        }[implementation]
         rows.extend(runner(page_count, seed=seed) for page_count in page_counts)
     source = _source_metadata()
     paper_reference = json.loads(
@@ -958,9 +1262,13 @@ def build_artifact(
     artifact = {
         "artifact_type": "parallel_page_attention_diagnostic",
         "schema_version": 2,
-        "artifact_id": "parallel-page-baseline"
-        if implementations == ("serial",)
-        else "parallel-page-state",
+        "artifact_id": (
+            "parallel-page-baseline"
+            if implementations == ("serial",)
+            else "parallel-page-complete"
+            if "parallel" in implementations
+            else "parallel-page-state"
+        ),
         "status": "partial" if source["dirty"] else "qualified",
         "diagnostic_only": True,
         "paper": paper,
