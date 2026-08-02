@@ -134,6 +134,24 @@ def test_validator_rejects_profile_and_parallel_dispatch_mutations() -> None:
     assert not result.valid
     assert any("parallel dispatch" in error for error in result.errors)
 
+
+def test_validator_rejects_model_fixture_provenance_mutation() -> None:
+    config = load_ablation_config()
+    artifact = _completed_fixture(config)
+    source = artifact["source_identity"]
+    source["model_fixture"] = {
+        "model_id": config["model_id"],
+        "snapshot_id": "wrong-revision",
+        "resolved_path": "/tmp/wrong-snapshot",
+        "manifest_sha256": "0" * 64,
+    }
+    for row in artifact["rows"]:
+        row["source_identity"] = source
+    result = validate_ablation_artifact(artifact, config)
+    assert not result.valid
+    assert any("model_fixture snapshot_id" in error for error in result.errors)
+    assert any("model_fixture manifest" in error for error in result.errors)
+
     artifact = _completed_fixture(config)
     artifact["profile_bindings"][1]["value_bits"] = 6
     result = validate_ablation_artifact(artifact, config)

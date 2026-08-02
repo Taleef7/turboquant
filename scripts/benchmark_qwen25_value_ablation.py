@@ -326,6 +326,19 @@ def validate_ablation_artifact(
                 errors.append(f"artifact source_identity {key} is invalid")
         if source.get("config_sha256") != sha256_file(config_path):
             errors.append("artifact source_identity config_sha256 is invalid")
+        fixture = source.get("model_fixture")
+        if fixture is not None:
+            if not isinstance(fixture, Mapping):
+                errors.append("artifact model_fixture identity is invalid")
+            else:
+                if fixture.get("model_id") != config["model_id"]:
+                    errors.append("artifact model_fixture model_id is invalid")
+                if fixture.get("snapshot_id") != config["model_revision"]:
+                    errors.append("artifact model_fixture snapshot_id is invalid")
+                if fixture.get("manifest_sha256") != config["fixture_manifest_sha256"]:
+                    errors.append("artifact model_fixture manifest is invalid")
+                if not isinstance(fixture.get("resolved_path"), str):
+                    errors.append("artifact model_fixture resolved_path is missing")
     rows = artifact.get("rows")
     expected = expected_row_ids(config)
     if not isinstance(rows, list) or [row.get("row_id") for row in rows] != expected:
