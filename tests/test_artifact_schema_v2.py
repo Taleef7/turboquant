@@ -13,6 +13,7 @@ import sys
 import pytest
 
 from scripts.benchmark_schema import validate_artifact, validate_v2_artifact
+import scripts.repro_utils as repro_utils
 from scripts.repro_utils import capture_source_metadata
 from tests.test_benchmark_schema import complete_matrix
 
@@ -531,3 +532,53 @@ def test_source_metadata_distinguishes_clean_and_dirty_repositories(
     assert clean == {"git_commit": clean["git_commit"], "dirty": False}
     assert len(clean["git_commit"]) == 40
     assert dirty == {"git_commit": clean["git_commit"], "dirty": True}
+
+
+def test_source_metadata_resolves_wsl_worktree_pointer_and_detached_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    subprocess.run(
+        ["git", "-C", repo, "config", "user.email", "tests@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", repo, "config", "user.name", "TurboQuant Tests"],
+        check=True,
+    )
+    tracked = repo / "tracked.txt"
+    tracked.write_text("clean\n", encoding="utf-8")
+    subprocess.run(["git", "-C", repo, "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "fixture"], check=True)
+    expected_commit = subprocess.check_output(
+        ["git", "-C", repo, "rev-parse", "HEAD"], text=True
+    ).strip()
+    subprocess.run(
+        ["git", "-C", repo, "worktree", "add", "-q", "-b", "fixture-wt", worktree],
+        check=True,
+    )
+
+    original_check_output = repro_utils.subprocess.check_output
+
+    def fail_native_worktree_git(command: list[str], *args: object, **kwargs: object):
+        if len(command) >= 3 and command[0] == "git" and command[1] == "-C":
+            raise subprocess.CalledProcessError(128, command)
+        return original_check_output(command, *args, **kwargs)
+
+    monkeypatch.setattr(
+        repro_utils.subprocess, "check_output", fail_native_worktree_git
+    )
+    clean = capture_source_metadata(worktree)
+    assert clean == {"git_commit": expected_commit, "dirty": False}
+
+    (worktree / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+    dirty = capture_source_metadata(worktree)
+    assert dirty == {"git_commit": expected_commit, "dirty": True}
+
+    subprocess.run(
+        ["git", "-C", worktree, "checkout", "-q", "--detach", "HEAD"], check=True
+    )
+    detached = capture_source_metadata(worktree)
+    assert detached == {"git_commit": expected_commit, "dirty": True}

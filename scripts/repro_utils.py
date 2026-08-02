@@ -7,6 +7,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import random
 import subprocess
 import sys
@@ -47,16 +48,62 @@ DIRECT_EVIDENCE_SOURCE_PATHS = (
 )
 
 
+def _worktree_git_dir(root: Path) -> Path | None:
+    """Resolve a worktree gitdir pointer across Windows and WSL path syntax."""
+    dot_git = root / ".git"
+    if dot_git.is_dir():
+        return dot_git
+    if not dot_git.is_file():
+        return None
+    try:
+        pointer = dot_git.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not pointer.lower().startswith("gitdir:"):
+        return None
+    raw_path = pointer.split(":", 1)[1].strip()
+    if re.match(r"^[A-Za-z]:[/\\]", raw_path):
+        if os.name == "nt":
+            candidate = Path(raw_path)
+        else:
+            candidate = (
+                Path("/mnt") / raw_path[0].lower() / raw_path[3:].replace("\\", "/")
+            )
+    else:
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+    return candidate.resolve()
+
+
+def _git_output(root: Path | None, args: list[str]) -> str:
+    """Run git normally, then retry via explicit worktree env when needed."""
+    command = ["git"]
+    if root is not None:
+        command.extend(["-C", str(root)])
+    command.extend(args)
+    try:
+        return subprocess.check_output(
+            command, stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        if root is None:
+            raise
+        git_dir = _worktree_git_dir(root)
+        if git_dir is None:
+            raise
+        env = os.environ.copy()
+        env["GIT_DIR"] = str(git_dir)
+        env["GIT_WORK_TREE"] = str(root)
+        fallback = ["git", *args]
+        return subprocess.check_output(
+            fallback, env=env, stderr=subprocess.DEVNULL, text=True
+        ).strip()
+
+
 def git_commit_sha(root: str | Path | None = None) -> str:
     try:
-        command = ["git"]
-        if root is not None:
-            command.extend(["-C", str(Path(root))])
-        command.extend(["rev-parse", "HEAD"])
-        out = subprocess.check_output(
-            command, stderr=subprocess.DEVNULL, text=True
-        )
-        return out.strip()
+        return _git_output(None if root is None else Path(root), ["rev-parse", "HEAD"])
     except Exception:
         return "unknown"
 
@@ -66,21 +113,11 @@ def capture_source_metadata(root: str | Path) -> dict[str, bool | str]:
     root_path = Path(root)
     commit = git_commit_sha(root_path)
     try:
-        status = subprocess.check_output(
-            [
-                "git",
-                "-C",
-                str(root_path),
-                "status",
-                "--porcelain",
-                "--untracked-files=normal",
-            ],
-            stderr=subprocess.DEVNULL,
-            text=True,
+        status = _git_output(
+            root_path, ["status", "--porcelain", "--untracked-files=normal"]
         )
     except (FileNotFoundError, subprocess.CalledProcessError):
         status = ""
-        commit = "unknown"
     return {"git_commit": commit, "dirty": bool(status.strip())}
 
 
