@@ -113,6 +113,21 @@ def test_parallel_capacity_rejects_overflow_before_mutating_arena() -> None:
     assert session.cache.sequence_length() == 383
 
 
+def test_parallel_path_fails_closed_without_cuda_instead_of_using_serial_fallback() -> (
+    None
+):
+    session = _parallel_session(maximum_sequence_length=383)
+    keys = torch.randn((1, 4, 2, 128), dtype=torch.float16)
+    with session._active("prefill"):
+        session.cache.update(keys, keys.clone(), 0)
+    with pytest.raises(UnsupportedCapabilityError, match="requires CUDA"):
+        session.packed_decode(
+            session.layers[0],
+            torch.randn((1, 28, 1, 128), dtype=torch.float16),
+            scale=1 / 128**0.5,
+        )
+
+
 def _reference_store(
     session: PackedAttentionSession,
     keys: torch.Tensor,
