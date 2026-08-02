@@ -50,6 +50,10 @@ from scripts.repro_utils import (  # noqa: E402
 
 
 CONFIG_PATH = ROOT / "configs" / "benchmarks" / "qwen25-fixed-warmup-v1.json"
+WARMUP_CONTEXT_ALLOWLIST = {
+    "qwen25-fixed-warmup-v1": [1024, 2048],
+    "qwen25-fixed-warmup-local-v2": [4096, 8192],
+}
 
 
 def load_warmup_config(path: str | Path = CONFIG_PATH) -> dict[str, Any]:
@@ -70,6 +74,13 @@ def load_warmup_config(path: str | Path = CONFIG_PATH) -> dict[str, Any]:
         or any(character not in "0123456789abcdef" for character in digest)
     ):
         errors.append("fixture_manifest_sha256 must be a lowercase SHA-256 digest")
+    name = payload.get("name")
+    expected_contexts = WARMUP_CONTEXT_ALLOWLIST.get(name)
+    if expected_contexts is None:
+        errors.append(
+            "name must select one of the predeclared fixed warmup configs: "
+            + ", ".join(WARMUP_CONTEXT_ALLOWLIST)
+        )
     contexts = payload.get("contexts")
     if (
         not isinstance(contexts, list)
@@ -78,6 +89,10 @@ def load_warmup_config(path: str | Path = CONFIG_PATH) -> dict[str, Any]:
         or contexts != sorted(set(contexts))
     ):
         errors.append("contexts must be a sorted list of unique positive built-in ints")
+    elif expected_contexts is not None and contexts != expected_contexts:
+        errors.append(
+            f"contexts must match the predeclared matrix for {name}: {expected_contexts}"
+        )
     if type(payload.get("stream_seed")) is not int:  # noqa: E721
         errors.append("stream_seed must be a built-in int")
     for key in ("warmup_tokens", "measured_decode_tokens", "repeats"):

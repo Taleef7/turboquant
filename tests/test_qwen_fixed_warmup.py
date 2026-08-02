@@ -153,6 +153,52 @@ def test_context_matrix_rejects_unsorted_or_non_positive_values(tmp_path: Path) 
             raise AssertionError(f"accepted invalid contexts: {contexts!r}")
 
 
+def test_context_matrix_allowlist_rejects_altered_v1_and_v2(tmp_path: Path) -> None:
+    for source, contexts in (
+        (CONFIG, [1024, 4096]),
+        (LOCAL_V2_CONFIG, [4096, 16384]),
+    ):
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        payload["contexts"] = contexts
+        candidate = tmp_path / f"{source.stem}-altered.json"
+        candidate.write_text(json.dumps(payload), encoding="utf-8")
+        try:
+            load_warmup_config(candidate)
+        except ValueError as exc:
+            assert "predeclared matrix" in str(exc)
+        else:
+            raise AssertionError(f"accepted altered matrix for {source.name}")
+
+
+def test_selected_v2_config_is_accepted_by_validator_cli(tmp_path: Path) -> None:
+    config = load_warmup_config(LOCAL_V2_CONFIG)
+    artifact_path = tmp_path / "warmup-v2.json"
+    artifact_path.write_text(
+        json.dumps(
+            build_unavailable_artifact(
+                config, config_path=LOCAL_V2_CONFIG, reason="missing fixture"
+            )
+        ),
+        encoding="utf-8",
+    )
+    validator = ROOT / "scripts" / "validate_qwen_fixed_warmup.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(validator),
+            "--config",
+            str(LOCAL_V2_CONFIG),
+            str(artifact_path),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '"valid": true' in result.stdout
+
+
 def test_unavailable_artifact_is_explicit_and_valid() -> None:
     config = load_warmup_config(CONFIG)
     artifact = build_unavailable_artifact(
