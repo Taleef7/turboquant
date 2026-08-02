@@ -602,17 +602,22 @@ def build_artifact(*, page_counts: tuple[int, ...], seed: int) -> dict[str, obje
         raise ValueError(f"Task 1 requires page counts exactly {DEFAULT_PAGE_COUNTS}")
     rows = [_run_serial_row(page_count, seed=seed) for page_count in page_counts]
     source = _source_metadata()
+    paper_reference = json.loads(
+        (ROOT / "docs" / "references" / "turboquant-2504.19874v1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    paper = {
+        key: paper_reference[key]
+        for key in ("paper_id", "source_url", "retrieved_at", "sha256")
+    }
     artifact = {
         "artifact_type": "parallel_page_attention_diagnostic",
         "schema_version": 2,
         "artifact_id": "parallel-page-baseline",
         "status": "partial" if source["dirty"] else "qualified",
         "diagnostic_only": True,
-        "paper": json.loads(
-            (ROOT / "docs" / "references" / "turboquant-2504.19874v1.json").read_text(
-                encoding="utf-8"
-            )
-        ),
+        "paper": paper,
         "source": source,
         "execution_class": _execution_class(),
         "identity": _identity(),
