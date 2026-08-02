@@ -30,6 +30,8 @@ CUDA-event trials per row. The output is schema-v2 and explicitly labelled
 `diagnostic_only`; it records page-launch counters, allocator/workspace bytes,
 and a packed-reference parity check. These measurements are engineering
 diagnostics, not an end-to-end model or speed claim.
+The synthetic harness binds its identity to the Qwen2.5 architecture manifest;
+it does not load or hash model weight files.
 
 ```bash
 python scripts/benchmark_parallel_page_attention.py \

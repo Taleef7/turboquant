@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import copy
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
 from scripts.benchmark_parallel_page_attention import (
     DEFAULT_PAGE_COUNTS,
     MEASURED_TRIALS,
     WARMUP_RUNS,
     validate_parallel_page_artifact,
 )
+from scripts.benchmark_schema import validate_artifact
 
 
 def _metrics(page_count: int) -> dict[str, object]:
@@ -151,3 +158,63 @@ def test_contract_rejects_non_diagnostic_win_claim() -> None:
     result = validate_parallel_page_artifact(artifact)
     assert not result.valid
     assert any("diagnostic" in error for error in result.errors)
+
+
+def test_documented_generic_validator_enforces_diagnostic_contract() -> None:
+    artifact = _artifact()
+    result = validate_artifact(artifact, repo_root=Path.cwd())
+    assert result.valid, result.errors
+    artifact["rows"][0]["metrics"]["launch_counts"]["fallback"] = 1  # type: ignore[index]
+    result = validate_artifact(artifact, repo_root=Path.cwd())
+    assert not result.valid
+    assert any("launch_counts.fallback" in error for error in result.errors)
+
+
+def test_documented_validate_artifact_cli_enforces_diagnostic_contract(
+    tmp_path: Path,
+) -> None:
+    artifact = _artifact()
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(artifact), encoding="utf-8")
+    command = [
+        sys.executable,
+        str(Path(__file__).parents[1] / "scripts" / "validate_artifact.py"),
+        str(path),
+        "--no-binding-check",
+    ]
+    valid = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert valid.returncode == 0, valid.stdout + valid.stderr
+    artifact["rows"][0]["metrics"]["launch_counts"]["fallback"] = 1  # type: ignore[index]
+    path.write_text(json.dumps(artifact), encoding="utf-8")
+    invalid = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert invalid.returncode != 0
+    assert "launch_counts.fallback" in invalid.stdout
+
+
+def test_synthetic_identity_uses_manifest_digest_without_weight_claim() -> None:
+    artifact = _artifact()
+    artifact["identity"]["model_manifest_sha256"] = artifact["identity"].pop(  # type: ignore[index]
+        "weights_sha256"
+    )
+    for row in artifact["rows"]:  # type: ignore[index]
+        row["identity"] = dict(artifact["identity"])  # type: ignore[index]
+    result = validate_artifact(artifact, repo_root=Path.cwd())
+    assert result.valid, result.errors
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("max_abs_error", float("inf")),
+        ("max_abs_error", 1.0),
+        ("mean_abs_error", float("inf")),
+        ("mean_abs_error", 1.0),
+        ("top1_agreement", 0.0),
+    ),
+)
+def test_contract_rejects_bad_parity(field: str, value: float) -> None:
+    artifact = _artifact()
+    artifact["rows"][0]["metrics"]["parity"][field] = value  # type: ignore[index]
+    result = validate_parallel_page_artifact(artifact)
+    assert not result.valid
+    assert any("parity" in error for error in result.errors)

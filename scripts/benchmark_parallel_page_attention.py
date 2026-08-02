@@ -33,6 +33,8 @@ DEFAULT_PAGE_COUNTS = (3, 7, 15, 31, 63)
 COLD_JIT_RUNS = 1
 WARMUP_RUNS = 2
 MEASURED_TRIALS = 10
+PARITY_MAX_ABS_TOLERANCE = 1e-2
+PARITY_MEAN_ABS_TOLERANCE = 1e-4
 HEAD_DIM = 128
 KV_HEADS = 4
 QUERY_HEADS = 28
@@ -138,7 +140,10 @@ def _identity() -> dict[str, str]:
     return {
         "model_id": "Qwen/Qwen2.5-7B-Instruct",
         "model_revision": "a09a35458c702b33eeacc393d103063234e8bc28",
-        "weights_sha256": _sha256(manifest_path),
+        # This harness never loads model weights.  Bind the synthetic fixture
+        # to the architecture manifest without mislabelling it as a weight
+        # digest.
+        "model_manifest_sha256": _sha256(manifest_path),
         "profile_id": str(profile["name"]),
         "profile_sha256": _sha256(profile_path),
         "kv_dtype": "float16",
@@ -585,14 +590,32 @@ def validate_parallel_page_artifact(artifact: Mapping[str, Any]) -> ValidationRe
                     f"row {row_id} memory capacity/residency must cover logical payload"
                 )
         parity = metrics.get("parity")
+        max_error = parity.get("max_abs_error") if isinstance(parity, Mapping) else None
+        mean_error = (
+            parity.get("mean_abs_error") if isinstance(parity, Mapping) else None
+        )
+        top1 = parity.get("top1_agreement") if isinstance(parity, Mapping) else None
         if (
             not isinstance(parity, Mapping)
             or parity.get("repeat_bit_identical") is not True
-            or not isinstance(parity.get("top1_agreement"), (float, int))
-            or not 0 <= parity["top1_agreement"] <= 1
+            or not isinstance(max_error, (float, int))
+            or isinstance(max_error, bool)
+            or not math.isfinite(max_error)
+            or max_error < 0
+            or max_error > PARITY_MAX_ABS_TOLERANCE
+            or not isinstance(mean_error, (float, int))
+            or isinstance(mean_error, bool)
+            or not math.isfinite(mean_error)
+            or mean_error < 0
+            or mean_error > PARITY_MEAN_ABS_TOLERANCE
+            or not isinstance(top1, (float, int))
+            or isinstance(top1, bool)
+            or top1 != 1.0
         ):
             errors.append(
-                f"row {row_id} parity must prove deterministic output and top-1 agreement"
+                f"row {row_id} parity must be deterministic with max error <= "
+                f"{PARITY_MAX_ABS_TOLERANCE}, mean error <= {PARITY_MEAN_ABS_TOLERANCE}, "
+                "and exact top-1 agreement"
             )
     return ValidationResult(not errors, tuple(errors))
 

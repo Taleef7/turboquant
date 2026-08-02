@@ -74,6 +74,7 @@ _V2_IDENTITY_KEYS = {
     "model_id",
     "model_revision",
     "weights_sha256",
+    "model_manifest_sha256",
     "profile_id",
     "profile_sha256",
     "kv_dtype",
@@ -748,8 +749,17 @@ def _validate_v2_identity(
     )
     for key in ("model_id", "model_revision", "profile_id", "kv_dtype"):
         _required_text(value, key, label=label, errors=errors)
-    for key in ("weights_sha256", "profile_sha256"):
-        _validate_sha256(value, key, label=label, errors=errors)
+    has_weights = "weights_sha256" in value
+    has_manifest = "model_manifest_sha256" in value
+    if has_weights == has_manifest:
+        errors.append(
+            f"{label} must provide exactly one of weights_sha256 or model_manifest_sha256"
+        )
+    elif has_weights:
+        _validate_sha256(value, "weights_sha256", label=label, errors=errors)
+    else:
+        _validate_sha256(value, "model_manifest_sha256", label=label, errors=errors)
+    _validate_sha256(value, "profile_sha256", label=label, errors=errors)
     _validate_extensions(value, label=label, errors=errors)
     return value
 
@@ -1215,9 +1225,23 @@ def validate_artifact(
                 False, (f"unsupported schema_version {version!r}",)
             )
         if _is_exact_schema_version(version, 2):
-            return validate_v2_artifact(
+            generic_result = validate_v2_artifact(
                 dict(artifact), repo_root=repo_root or Path.cwd()
             )
+            if artifact.get("artifact_type") == "parallel_page_attention_diagnostic":
+                # Keep the generic schema as the first layer, then apply the
+                # benchmark's strict launch/timing/parity contract. Import
+                # lazily so existing artifact types do not gain a module cycle.
+                from scripts.benchmark_parallel_page_attention import (
+                    validate_parallel_page_artifact,
+                )
+
+                diagnostic_result = validate_parallel_page_artifact(artifact)
+                return ValidationResult(
+                    generic_result.valid and diagnostic_result.valid,
+                    generic_result.errors + diagnostic_result.errors,
+                )
+            return generic_result
     kind = artifact.get("artifact_type")
     if kind == QUALITY_ARTIFACT_TYPE:
         return validate_quality_artifact(artifact, expected_binding)
