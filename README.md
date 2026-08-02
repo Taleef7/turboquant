@@ -126,6 +126,8 @@ quality gate passes. Use [the protocol](docs/BENCHMARK_PROTOCOL.md) to interpret
 
 - [Results](docs/RESULTS.md): current artifact-backed 8K result, 32K capacity
   stop, systems comparison, and retired invalid v4 history.
+- [Local long-context results](docs/LOCAL_LONG_CONTEXT_RESULTS.md): clean
+  Qwen2.5 4K/8K warmup artifact with quality, storage, timing, and limits.
 - [Codec reproduction](docs/REPRODUCTION.md): canonical local matrix, GloVe
   retrieval results, runtime conditions, and limitations.
 - [Claim ledger](docs/CLAIMS.md): safe statements with exact artifact/query
