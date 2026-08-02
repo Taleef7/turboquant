@@ -19,6 +19,7 @@ from scripts.benchmark_qwen25_fixed_warmup import (
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "configs" / "benchmarks" / "qwen25-fixed-warmup-v1.json"
+LOCAL_V2_CONFIG = ROOT / "configs" / "benchmarks" / "qwen25-fixed-warmup-local-v2.json"
 
 
 def _completed_fixture(config: dict) -> dict:
@@ -117,6 +118,39 @@ def test_config_declares_fixed_warmup_matrix() -> None:
         "2048-serial_direct",
         "2048-parallel_direct",
     ]
+
+
+def test_local_v2_config_declares_long_context_matrix() -> None:
+    config = load_warmup_config(LOCAL_V2_CONFIG)
+    assert config["contexts"] == [4096, 8192]
+    assert config["stream_seed"] == 26009
+    assert config["warmup_tokens"] == 1
+    assert config["measured_decode_tokens"] == 3
+    assert config["repeats"] == 3
+    assert expected_row_ids(config) == [
+        "4096-baseline",
+        "4096-packed_reference",
+        "4096-serial_direct",
+        "4096-parallel_direct",
+        "8192-baseline",
+        "8192-packed_reference",
+        "8192-serial_direct",
+        "8192-parallel_direct",
+    ]
+
+
+def test_context_matrix_rejects_unsorted_or_non_positive_values(tmp_path: Path) -> None:
+    payload = json.loads(CONFIG.read_text(encoding="utf-8"))
+    for contexts in ([2048, 1024], [1024, 1024], [0, 1024], [True, 1024]):
+        payload["contexts"] = contexts
+        candidate = tmp_path / "invalid-contexts.json"
+        candidate.write_text(json.dumps(payload), encoding="utf-8")
+        try:
+            load_warmup_config(candidate)
+        except ValueError as exc:
+            assert "contexts" in str(exc)
+        else:
+            raise AssertionError(f"accepted invalid contexts: {contexts!r}")
 
 
 def test_unavailable_artifact_is_explicit_and_valid() -> None:

@@ -70,8 +70,14 @@ def load_warmup_config(path: str | Path = CONFIG_PATH) -> dict[str, Any]:
         or any(character not in "0123456789abcdef" for character in digest)
     ):
         errors.append("fixture_manifest_sha256 must be a lowercase SHA-256 digest")
-    if payload.get("contexts") != [1024, 2048]:
-        errors.append("contexts must be the predeclared [1024, 2048] matrix")
+    contexts = payload.get("contexts")
+    if (
+        not isinstance(contexts, list)
+        or not contexts
+        or any(type(context) is not int or context < 1 for context in contexts)  # noqa: E721
+        or contexts != sorted(set(contexts))
+    ):
+        errors.append("contexts must be a sorted list of unique positive built-in ints")
     if type(payload.get("stream_seed")) is not int:  # noqa: E721
         errors.append("stream_seed must be a built-in int")
     for key in ("warmup_tokens", "measured_decode_tokens", "repeats"):
@@ -783,7 +789,7 @@ def main() -> int:
         cache_dir=args.cache_dir,
         model_path=args.model_path,
     )
-    validation = validate_warmup_artifact(artifact)
+    validation = validate_warmup_artifact(artifact, load_warmup_config(args.config))
     print(
         json.dumps(
             {

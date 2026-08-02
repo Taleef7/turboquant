@@ -66,6 +66,25 @@ python scripts/validate_qwen_fixed_warmup.py \
   artifacts/qwen25-fixed-warmup.json
 ```
 
+For a local long-context diagnostic, use the opt-in v2 matrix at 4,096 and
+8,192 prompt tokens. It keeps the same pinned fixture, v6 profile, fixed
+stream seed, four backends, repeats, and quality gates as v1; only the context
+matrix and config name differ. Pass the config explicitly to both commands so
+the validator checks the matching matrix:
+
+```bash
+python scripts/benchmark_qwen25_fixed_warmup.py \
+  --config configs/benchmarks/qwen25-fixed-warmup-local-v2.json \
+  --model-path /home/taleef/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
+  --output artifacts/qwen25-fixed-warmup-local-v2.json
+python scripts/validate_qwen_fixed_warmup.py \
+  --config configs/benchmarks/qwen25-fixed-warmup-local-v2.json \
+  artifacts/qwen25-fixed-warmup-local-v2.json
+```
+
+The v2 run is diagnostic-only and is not a replacement for the canonical v1
+artifact or its 1,024/2,048-token qualification matrix.
+
 ## `benchmark_parallel_page_attention.py`
 
 Runs the serial packed-page diagnostic used to freeze the page-attention
