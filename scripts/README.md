@@ -32,8 +32,10 @@ allocator peaks, timing, and source identity.  The artifact is always
 `diagnostic_only` with an empty claims list; a missing local fixture is written
 as eight explicit `unavailable` rows rather than silently changing the test.
 
-The default is local-only and does not download model weights.  The pinned
-WSL fixture can be selected explicitly with `--cache-dir`:
+The default is local-only and does not download model weights.  The pinned WSL
+fixture can be selected explicitly with `--model-path`; the runner requires
+the exact snapshot directory, validates the Qwen2.5-7B architecture, and
+checks the predeclared SHA-256 file-manifest digest before loading weights:
 
 ```bash
 python scripts/replay_qwen25_fixed_tokens.py \
