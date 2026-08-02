@@ -12,7 +12,7 @@ from core.capabilities import derive_model_capabilities, load_model_manifest
 from core.errors import UnsupportedCapabilityError
 from core.packed_store import PackedStoreRuntimeLayout, create_packed_kv_block_store
 from core.profiles import load_profile
-from core.qwen_adapter import PackedAttentionSession
+from core.qwen_adapter import PackedAttentionSession, qwen25_packed_attention
 from core.reference_attention import ReferenceAttentionLayout, packed_reference_decode
 
 
@@ -174,7 +174,15 @@ def test_parallel_decode_dispatch_reuses_workspace_and_arena_pointers(
         layer_idx: stores[layer_idx].arena.data_pointers() for layer_idx in (0, 1)
     }
 
-    actual0 = session.packed_decode(session.layers[0], query, scale=1 / 128**0.5)
+    with session._active("decode"):
+        actual0, _ = qwen25_packed_attention(
+            session.layers[0],
+            query,
+            keys[..., :1, :],
+            values[..., :1, :],
+            None,
+            scaling=1 / 128**0.5,
+        )
     workspace = session._parallel_workspace
     assert workspace is not None
     workspace_pointers = tuple(
