@@ -58,6 +58,7 @@ _V2_ARTIFACT_KEYS = {
     "schema_version",
     "artifact_id",
     "status",
+    "diagnostic_only",
     "paper",
     "source",
     "execution_class",

@@ -21,6 +21,25 @@ python scripts/run_direct_benchmark.py \
 The runner requires CUDA and does not itself establish a quality or Pareto
 claim.
 
+## `benchmark_parallel_page_attention.py`
+
+Runs the serial packed-page diagnostic used to freeze the page-attention
+baseline. It uses deterministic synthetic Qwen2.5-shaped pages at 3, 7, 15,
+31, and 63 pages, with one cold/JIT launch, two warmups, and ten synchronized
+CUDA-event trials per row. The output is schema-v2 and explicitly labelled
+`diagnostic_only`; it records page-launch counters, allocator/workspace bytes,
+and a packed-reference parity check. These measurements are engineering
+diagnostics, not an end-to-end model or speed claim.
+
+```bash
+python scripts/benchmark_parallel_page_attention.py \
+  --implementations serial \
+  --page-counts 3 7 15 31 63 \
+  --output artifacts/parallel-page-baseline/manifest.json
+python scripts/validate_artifact.py \
+  artifacts/parallel-page-baseline/manifest.json
+```
+
 ## `reproduce_release.py`
 
 Coordinates validator-first Qwen evidence legs. `quick` is a smoke workflow;
