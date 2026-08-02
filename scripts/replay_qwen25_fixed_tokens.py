@@ -16,6 +16,7 @@ from collections.abc import Mapping, Sequence
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 import sys
@@ -756,6 +757,9 @@ def run_replay(
         assert fixture is not None
         source = {**source, "model_fixture": fixture}
         artifact["source_identity"] = source
+    # PyTorch requires this before its first CUDA/cuBLAS operation for the
+    # deterministic algorithms requested by the replay contract.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     seed_everything(config["stream_seed"], deterministic=True)
     try:
         import torch
