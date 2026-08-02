@@ -43,6 +43,7 @@ class PhysicalByteBreakdown:
     metadata: int
     fp16_window: int
     padding: int
+    workspace: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -51,6 +52,7 @@ class PhysicalByteBreakdown:
             "metadata",
             "fp16_window",
             "padding",
+            "workspace",
         ):
             _require_int(getattr(self, name), name)
 
@@ -62,6 +64,7 @@ class PhysicalByteBreakdown:
             + self.metadata
             + self.fp16_window
             + self.padding
+            + self.workspace
         )
 
     @property
@@ -171,7 +174,7 @@ class PackedKVBlockStore:
                 (
                     1,
                     arena.layout.num_kv_heads,
-                    arena.layout.page_tokens,
+                    max(arena.layout.page_tokens, arena.layout.tail_capacity),
                     arena.layout.head_dim,
                 ),
                 dtype=arena.kv_dtype,
@@ -232,6 +235,10 @@ class PackedKVBlockStore:
         if keys.device != values.device or keys.dtype != values.dtype:
             raise ValueError("keys and values must have the same device and dtype.")
         if self._arena is not None:
+            if keys.shape[1] != self._arena.layout.num_kv_heads:
+                raise ValueError(
+                    "arena-backed appends must match the reserved head count."
+                )
             if keys.device != self._arena.device:
                 raise ValueError(
                     "arena-backed appends must stay on the reserved device."
@@ -300,6 +307,9 @@ class PackedKVBlockStore:
             raise OverflowError(
                 "arena tail capacity cannot retain a partial page before the next flush."
             )
+        remainder_tokens = total_pending - pages_to_flush * self.block_size
+        if remainder_tokens > self._append_scratch_keys.shape[-2]:
+            raise OverflowError("arena append scratch capacity is insufficient.")
         if pages_to_flush == 0:
             self._arena.append_tail(keys, values)
             self._sequence_length = self._arena.sequence_length
@@ -327,16 +337,20 @@ class PackedKVBlockStore:
                 if incoming_take:
                     self._append_scratch_keys[..., :old_take, :].copy_(page_keys)
                     self._append_scratch_values[..., :old_take, :].copy_(page_values)
-                    self._append_scratch_keys[..., old_take:, :].copy_(
+                    self._append_scratch_keys[
+                        ..., old_take : old_take + incoming_take, :
+                    ].copy_(
                         keys[..., incoming_offset : incoming_offset + incoming_take, :]
                     )
-                    self._append_scratch_values[..., old_take:, :].copy_(
+                    self._append_scratch_values[
+                        ..., old_take : old_take + incoming_take, :
+                    ].copy_(
                         values[
                             ..., incoming_offset : incoming_offset + incoming_take, :
                         ]
                     )
-                    page_keys = self._append_scratch_keys
-                    page_values = self._append_scratch_values
+                    page_keys = self._append_scratch_keys[..., : self.block_size, :]
+                    page_values = self._append_scratch_values[..., : self.block_size, :]
             else:
                 page_keys = keys[
                     ..., incoming_offset : incoming_offset + self.block_size, :
@@ -506,6 +520,15 @@ class PackedKVBlockStore:
                 metadata=metadata,
                 fp16_window=window_bytes,
                 padding=0,
+                workspace=(
+                    self._append_scratch_keys.numel()
+                    * self._append_scratch_keys.element_size()
+                    + self._append_scratch_values.numel()
+                    * self._append_scratch_values.element_size()
+                    if self._append_scratch_keys is not None
+                    and self._append_scratch_values is not None
+                    else 0
+                ),
             )
         key_payload = 0
         value_payload = 0

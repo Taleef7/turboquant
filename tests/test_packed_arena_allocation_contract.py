@@ -78,3 +78,17 @@ def test_8k_prefill_copies_only_final_arena_destinations(
     assert arena.tail_length == tail_tokens
     assert len(copies) == pages * 5 + 2
     assert sum(copies) == pages * page_bytes + tail_bytes
+    assert store.physical_nbytes().workspace == 2 * 4 * 383 * 128 * 2
+
+
+def test_tail_remainder_can_use_full_declared_capacity_after_boundary_flush() -> None:
+    store, arena = _make_store(page_capacity=2)
+    first = torch.randn((1, 4, 383, 128), dtype=torch.float16)
+    incoming = torch.randn((1, 4, 252, 128), dtype=torch.float16)
+
+    store.append(first, first + 1)
+    store.append(incoming, incoming + 1)
+
+    assert arena.used_pages == 1
+    assert arena.tail_length == 379
+    assert store.sequence_length() == 635
