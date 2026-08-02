@@ -288,6 +288,31 @@ def test_tail_merge_does_not_call_contiguous(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.gpu
+def test_tail_merge_rejects_nonpositive_supplied_stride() -> None:
+    _require_gpu_triton()
+    arena, _codec, prepared, query, workspace = _make_fixture(1, seed=8182)
+    launch_qwen25_page_states(
+        query, arena, prepared, workspace, used_pages=1, scale=1 / math.sqrt(128)
+    )
+    launch_qwen25_page_reduction(workspace, used_pages=1)
+    tail_keys = torch.randn((1, 4, 8, 128), device="cuda", dtype=torch.float16)
+    tail_values = torch.randn_like(tail_keys)
+    output = torch.empty((28, 128), device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="strides must be positive"):
+        launch_qwen25_tail_merge(
+            query,
+            tail_keys,
+            tail_values,
+            workspace,
+            tail_length=8,
+            tail_head_stride=0,
+            tail_token_stride=tail_keys.stride(2),
+            scale=1 / math.sqrt(128),
+            output=output,
+        )
+
+
+@pytest.mark.gpu
 def test_workspace_is_fixed_capacity_reusable_and_exactly_accounted() -> None:
     _require_gpu_triton()
     workspace = reserve_parallel_page_workspace(
