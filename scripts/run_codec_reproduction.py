@@ -1058,6 +1058,7 @@ def aggregate_product_comparisons(
     for contract in mse_contracts & product_contracts:
         for metric_name, _ in metric_paths:
             groups[(*contract, metric_name)]
+    paired_contracts = mse_contracts & product_contracts if specs else None
     for row in rows:
         if row.get("status") != "passed":
             continue
@@ -1078,6 +1079,8 @@ def aggregate_product_comparisons(
                     spec.get("nominal_total_bits"),
                     metric_name,
                 )
+                if paired_contracts is not None and key[:3] not in paired_contracts:
+                    continue
                 groups[key][spec["codec"]][spec["pair_id"]] = float(metric)
     result: list[dict[str, Any]] = []
     for key, codecs in sorted(groups.items()):
@@ -1751,7 +1754,9 @@ def _gpu_conditions() -> dict[str, object]:
             timeout=5,
         )
         unavailable["competing_compute_processes"] = [
-            line.strip() for line in processes.stdout.splitlines() if line.strip()
+            line.strip()
+            for line in processes.stdout.splitlines()
+            if line.strip() and line.split(",", 1)[0].strip() != str(os.getpid())
         ]
     except (
         FileNotFoundError,

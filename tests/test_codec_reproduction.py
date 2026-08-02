@@ -1327,6 +1327,52 @@ def test_across_seed_roster_emits_incomplete_groups_without_survivor_rows(
     )
 
 
+def test_product_comparisons_only_materialize_declared_paired_contracts() -> None:
+    runner = _runner()
+    specs = runner.build_row_specs(_config())
+
+    canonical_groups = runner.aggregate_product_comparisons(
+        [], seed=1729, iterations=10_000, specs=specs
+    )
+
+    assert len(canonical_groups) == 108
+    assert all(group["status"] == "incomplete" for group in canonical_groups)
+    assert {group["nominal_total_bits"] for group in canonical_groups} == {
+        2,
+        3,
+        4,
+    }
+
+    mse_only_rows = [
+        row
+        for row in _aggregate_synthetic_rows()
+        if row["extensions"]["row_spec"]["codec"] == "mse"
+    ]
+    mse_only_specs = [
+        {
+            "dataset": "synthetic",
+            "distribution": "sphere",
+            "dimension": 64,
+            "codec": "mse",
+            "nominal_total_bits": 1,
+        },
+        {
+            "dataset": "synthetic",
+            "distribution": "sphere",
+            "dimension": 64,
+            "codec": "product",
+            "nominal_total_bits": 2,
+        },
+    ]
+
+    assert (
+        runner.aggregate_product_comparisons(
+            mse_only_rows, seed=1729, iterations=10_000, specs=mse_only_specs
+        )
+        == []
+    )
+
+
 def test_tiny_artifact_claim_bridge_is_deterministic_and_ledger_resolvable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
