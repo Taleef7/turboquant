@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import subprocess
+import sys
 
 from scripts.benchmark_qwen25_fixed_warmup import (
     _stats,
@@ -197,3 +200,31 @@ def test_runner_fail_closes_mismatched_fixture_path(tmp_path: Path) -> None:
     assert artifact["status"] == "unavailable"
     assert all(row["status"] == "unavailable" for row in artifact["rows"])
     assert all("fixture rejected" in row["reason"] for row in artifact["rows"])
+
+
+def test_validator_cli_accepts_valid_artifact_and_rejects_missing_path(
+    tmp_path: Path,
+) -> None:
+    config = load_warmup_config(CONFIG)
+    artifact_path = tmp_path / "warmup.json"
+    artifact_path.write_text(json.dumps(_completed_fixture(config)), encoding="utf-8")
+    validator = ROOT / "scripts" / "validate_qwen_fixed_warmup.py"
+    valid = subprocess.run(
+        [sys.executable, str(validator), str(artifact_path)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert valid.returncode == 0, valid.stdout + valid.stderr
+    assert '"valid": true' in valid.stdout
+
+    missing = subprocess.run(
+        [sys.executable, str(validator), str(tmp_path / "missing.json")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert missing.returncode == 1
+    assert '"valid": false' in missing.stdout

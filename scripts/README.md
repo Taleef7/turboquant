@@ -62,6 +62,8 @@ the same pinned model fixture and strict quality gate as the replay:
 python scripts/benchmark_qwen25_fixed_warmup.py \
   --model-path /home/taleef/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28 \
   --output artifacts/qwen25-fixed-warmup.json
+python scripts/validate_qwen_fixed_warmup.py \
+  artifacts/qwen25-fixed-warmup.json
 ```
 
 ## `benchmark_parallel_page_attention.py`
