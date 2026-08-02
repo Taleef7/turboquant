@@ -217,6 +217,13 @@ class PackedKVBlockStore:
             raise ValueError("keys and values must match the configured num_kv_heads.")
         if keys.device != values.device or keys.dtype != values.dtype:
             raise ValueError("keys and values must have the same device and dtype.")
+        if self._arena is not None:
+            if keys.device != self._arena.device:
+                raise ValueError(
+                    "arena-backed appends must stay on the reserved device."
+                )
+            if keys.dtype != self._arena.kv_dtype:
+                raise TypeError("arena-backed appends must stay in the reserved dtype.")
         if self._pending_keys is not None and (
             self._pending_keys.shape[1] != keys.shape[1]
             or self._pending_keys.device != keys.device

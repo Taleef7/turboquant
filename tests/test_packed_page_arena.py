@@ -238,6 +238,50 @@ def test_store_arena_page_overflow_fails_before_mutation() -> None:
     assert arena.snapshot_state() == before
 
 
+def test_store_arena_dtype_mismatch_at_flush_fails_before_mutation() -> None:
+    arena = PackedPageArena.reserve(
+        make_layout(pages=2, tail=383),
+        device=torch.device("cpu"),
+        kv_dtype=torch.float16,
+    )
+    store = PackedKVBlockStore(
+        KeyCodec(KeyLayout(head_dim=128, bits=8, norm_dtype=torch.float16)),
+        ValueCodec(ValueLayout(head_dim=128, bits=6, group_size=32)),
+        fp16_window=128,
+        num_kv_heads=4,
+        arena=arena,
+    )
+    fp16 = torch.randn((1, 4, 383, 128), dtype=torch.float16)
+    store.append(fp16, fp16 + 1)
+    before = arena.snapshot_state()
+    bf16 = torch.randn((1, 4, 1, 128), dtype=torch.bfloat16)
+    with pytest.raises(TypeError):
+        store.append(bf16, bf16 + 1)
+    assert arena.snapshot_state() == before
+
+
+def test_store_arena_device_mismatch_at_flush_fails_before_mutation() -> None:
+    arena = PackedPageArena.reserve(
+        make_layout(pages=2, tail=383),
+        device=torch.device("cpu"),
+        kv_dtype=torch.float16,
+    )
+    store = PackedKVBlockStore(
+        KeyCodec(KeyLayout(head_dim=128, bits=8, norm_dtype=torch.float16)),
+        ValueCodec(ValueLayout(head_dim=128, bits=6, group_size=32)),
+        fp16_window=128,
+        num_kv_heads=4,
+        arena=arena,
+    )
+    fp16 = torch.randn((1, 4, 383, 128), dtype=torch.float16)
+    store.append(fp16, fp16 + 1)
+    before = arena.snapshot_state()
+    meta = torch.empty((1, 4, 1, 128), device="meta", dtype=torch.float16)
+    with pytest.raises(ValueError):
+        store.append(meta, meta)
+    assert arena.snapshot_state() == before
+
+
 def test_exact_capacity_append_succeeds_and_one_more_token_fails_before_mutation() -> (
     None
 ):
